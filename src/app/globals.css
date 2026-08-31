@@ -1,0 +1,156 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+
+  /* Brand — light blue, matched to the WorkLens logo mark */
+  --brand-950: #0c2c58;
+  --brand-900: #123f7d;
+  --brand-800: #144e9c;
+  --brand-700: #175fc0;
+  --brand-600: #1c7cdc;
+  --brand-500: #2f97ef;
+  --brand-400: #5db3f5;
+  --brand-100: #dcedfe;
+  --brand-50: #eff8ff;
+
+  /* Accent — the teal + green dots from the logo, used sparingly */
+  --accent-teal: #14b8a0;
+  --accent-teal-bg: #e3faf5;
+  --accent-green: #4caf50;
+  --accent-green-bg: #eaf7ea;
+
+  /* Neutrals */
+  --surface: #ffffff;
+  --page: #f6f9fd;
+  --border: #e2e8f1;
+  --border-strong: #ccd7e4;
+  --ink: #0b1220;
+  --ink-secondary: #4b5565;
+  --ink-muted: #8792a2;
+
+  /* Status (validated: good/warning/serious/critical) */
+  --status-good: #0ca30c;
+  --status-good-bg: #e7f7e7;
+  --status-good-border: #b9e6b9;
+  --status-warning: #c98500;
+  --status-warning-bg: #fdf2df;
+  --status-warning-border: #f6d99a;
+  --status-serious: #d15a2e;
+  --status-serious-bg: #fdece3;
+  --status-serious-border: #f3c1a6;
+  --status-critical: #d03b3b;
+  --status-critical-bg: #fbe7e7;
+  --status-critical-border: #f2bcbc;
+
+  /* Categorical (validated order, light) */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #4a3aa7;
+  --series-8: #e34948;
+}
+
+@theme inline {
+  --color-brand-950: var(--brand-950);
+  --color-brand-900: var(--brand-900);
+  --color-brand-800: var(--brand-800);
+  --color-brand-700: var(--brand-700);
+  --color-brand-600: var(--brand-600);
+  --color-brand-500: var(--brand-500);
+  --color-brand-400: var(--brand-400);
+  --color-brand-100: var(--brand-100);
+  --color-brand-50: var(--brand-50);
+
+  --color-accent-teal: var(--accent-teal);
+  --color-accent-teal-bg: var(--accent-teal-bg);
+  --color-accent-green: var(--accent-green);
+  --color-accent-green-bg: var(--accent-green-bg);
+
+  --color-surface: var(--surface);
+  --color-page: var(--page);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-ink: var(--ink);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+
+  --color-good: var(--status-good);
+  --color-good-bg: var(--status-good-bg);
+  --color-good-border: var(--status-good-border);
+  --color-warning: var(--status-warning);
+  --color-warning-bg: var(--status-warning-bg);
+  --color-warning-border: var(--status-warning-border);
+  --color-serious: var(--status-serious);
+  --color-serious-bg: var(--status-serious-bg);
+  --color-serious-border: var(--status-serious-border);
+  --color-critical: var(--status-critical);
+  --color-critical-bg: var(--status-critical-bg);
+  --color-critical-border: var(--status-critical-border);
+
+  --font-sans: var(--font-inter);
+}
+
+body {
+  background: var(--page);
+  color: var(--ink);
+}
+
+* {
+  border-color: var(--border);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.text-gradient-brand {
+  background-image: linear-gradient(90deg, var(--brand-500) 0%, var(--accent-green) 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.input {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  padding: 0.625rem 0.75rem;
+  font-size: 0.875rem;
+  color: var(--ink);
+}
+.input:focus {
+  outline: none;
+  border-color: var(--brand-500);
+  box-shadow: 0 0 0 3px rgba(42, 90, 160, 0.15);
+}
+
+@keyframes gentle-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.animate-float {
+  animation: gentle-float 5s ease-in-out infinite;
+}
