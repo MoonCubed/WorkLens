@@ -6,6 +6,7 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { CommentsThread } from "@/components/work/CommentsThread";
 import { useWorkLog } from "@/store/work-log-store";
 import { computeAbsenceImpact, type AbsenceImpact, type AffectedWorkItem, type CoverageCandidate, type RiskLevel } from "@/lib/absenceImpact";
+import { CAPACITY_THRESHOLDS } from "@/data/config";
 import { formatDisplayDate, toInputDateValue } from "@/lib/date";
 import type { Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
@@ -25,6 +26,7 @@ export function AbsenceSimulator({
   initialEmployeeId,
   initialStart,
   initialEnd,
+  preferredEmployeeId,
 }: {
   unitEmployees: Employee[];
   tickets: AssignedTicket[];
@@ -32,6 +34,9 @@ export function AbsenceSimulator({
   initialEmployeeId?: string;
   initialStart?: string;
   initialEnd?: string;
+  /** The peer the requesting employee nominated for the turnover — highlighted in the
+   * coverage lists as a recommendation; the supervisor still decides. */
+  preferredEmployeeId?: string;
 }) {
   const { assignTicketToEmployee } = useTickets();
   const { getEntry } = useWorkLog();
@@ -120,6 +125,7 @@ export function AbsenceSimulator({
     setConfirmed(true);
   }
 
+  const preferredEmployee = preferredEmployeeId ? unitEmployees.find((e) => e.id === preferredEmployeeId) : undefined;
   const primaryCandidate =
     impact && impact.primaryCandidateId ? unitEmployees.find((e) => e.id === impact.primaryCandidateId) : undefined;
   const urgentItems = impact ? impact.affectedWork.filter((i) => i.risk === "Critical" || i.risk === "High") : [];
@@ -190,6 +196,27 @@ export function AbsenceSimulator({
         <p className="rounded-lg border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-4 py-3 text-sm text-[var(--status-critical)]">
           {actionError}
         </p>
+      )}
+
+      {preferredEmployee && (
+        <Card>
+          <CardHeader
+            title="Preferred cover (from the employee's request)"
+            subtitle="A recommendation the employee coordinated — the supervisor still makes the final call."
+          />
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
+            <span className="font-medium text-ink">{preferredEmployee.name}</span>
+            <span className="text-ink-secondary">
+              Current utilization: <span className="font-medium text-ink">{preferredEmployee.currentUtilization}%</span>
+            </span>
+            {preferredEmployee.currentUtilization >= CAPACITY_THRESHOLDS.atRisk.max && (
+              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--status-critical)]">
+                <ShieldAlert className="h-3.5 w-3.5" />
+                Already at/above the {CAPACITY_THRESHOLDS.atRisk.max}% overload threshold
+              </span>
+            )}
+          </div>
+        </Card>
       )}
 
       {impact && !loading && (

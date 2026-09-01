@@ -2,6 +2,7 @@ import type { Department, Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
 import { getCapacityStatus } from "@/lib/capacity";
 import { ticketDueLabel, adhocDueLabel, seedTicketDueLabel } from "@/lib/due";
+import { todayStart, startOfWeek, weekOfYear } from "@/lib/date";
 
 export interface UnitSummary {
   employees: Employee[];
@@ -65,10 +66,16 @@ export function computeUnitSummary(unit: Department, employees: Employee[], tick
     (t) => t.assignedUnit === unit && t.status !== "Completed"
   ).length;
 
+  const forecastWeekStart = startOfWeek(todayStart());
   const forecast8Week = Array.from({ length: 8 }, (_, weekIdx) => {
     const values = unitEmployees.map((e) => e.forecast8Week[weekIdx] ?? e.currentUtilization);
     const avg = values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : 0;
-    return { week: `Week ${weekIdx + 1}`, utilization: avg };
+    const weekDate = new Date(
+      forecastWeekStart.getFullYear(),
+      forecastWeekStart.getMonth(),
+      forecastWeekStart.getDate() + weekIdx * 7
+    );
+    return { week: `Week ${weekOfYear(weekDate)}`, utilization: avg };
   });
 
   return {

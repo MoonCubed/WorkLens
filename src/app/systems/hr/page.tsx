@@ -2,11 +2,13 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, ChevronRight, Plus, Download, X } from "lucide-react";
+import { ArrowLeft, ChevronRight, Crown, Plus, Download, Trash2, X } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { SourceSystemHeader, SourceSystemNotice } from "@/components/systems/SourceSystemHeader";
 import { SystemPageShell } from "@/components/systems/SystemPageShell";
 import { ClickableRow } from "@/components/systems/ClickableRow";
+import { EmployeeLeaveCalendar } from "@/components/systems/EmployeeLeaveCalendar";
+import { DeleteEmployeeModal } from "@/components/systems/DeleteEmployeeModal";
 import { getSourceSystem } from "@/data/systems";
 import { IT_DEPARTMENTS } from "@/data/config";
 import type { Department, Employee, EmployeeLevel } from "@/data/types";
@@ -23,11 +25,6 @@ const AVAILABILITY_STYLES: Record<string, string> = {
 const LEVEL_STYLES: Record<EmployeeLevel, string> = {
   Supervisor: "bg-brand-50 border-brand-100 text-brand-700",
   Employee: "bg-brand-50/60 border-border-strong text-ink-secondary",
-};
-
-const LEAVE_STATUS_STYLES: Record<string, string> = {
-  Approved: "bg-[var(--status-good-bg)] border-[var(--status-good-border)] text-[var(--status-good)]",
-  Pending: "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning)]",
 };
 
 const SCHEDULE = "Full-time · Sun–Thu · 7:00 AM–4:00 PM";
@@ -134,18 +131,25 @@ function exportLeavesCsv(rows: LeaveRow[]) {
 
 export default function HrSystemPage() {
   const system = getSourceSystem("hr");
-  const { employees, addEmployee } = useEmployees();
+  const { employees, addEmployee, removeEmployee } = useEmployees();
   const { requests } = useHandoverRequests();
-  const [tab, setTab] = useState<"employees" | "leaves">("employees");
+  const [tab, setTab] = useState<"employees" | "leaves">("leaves");
   const [showAddForm, setShowAddForm] = useState(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [addError, setAddError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Employee | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const sorted = useMemo(
     () =>
       employees
         .filter((e) => (IT_DEPARTMENTS as readonly string[]).includes(e.department))
-        .sort((a, b) => a.name.localeCompare(b.name)),
+        // Supervisor(s) first, then everyone else alphabetically (unchanged).
+        .sort(
+          (a, b) =>
+            (a.level === "Supervisor" ? 0 : 1) - (b.level === "Supervisor" ? 0 : 1) ||
+            a.name.localeCompare(b.name)
+        ),
     [employees]
   );
 
@@ -215,20 +219,20 @@ export default function HrSystemPage() {
 
       <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1 w-fit">
         <button
-          onClick={() => setTab("employees")}
-          className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors ${
-            tab === "employees" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
-          }`}
-        >
-          Headcount
-        </button>
-        <button
           onClick={() => setTab("leaves")}
           className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors ${
             tab === "leaves" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
           }`}
         >
-          Leaves
+          Employee Calendar
+        </button>
+        <button
+          onClick={() => setTab("employees")}
+          className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors ${
+            tab === "employees" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+          }`}
+        >
+          Employee Information
         </button>
       </div>
 
@@ -238,7 +242,7 @@ export default function HrSystemPage() {
         </div>
       )}
 
-      {tab === "employees" ? (
+      {tab === "employees" && (
         <>
           <p className="text-sm text-ink-secondary">Central employee information used by WorkLens.</p>
 
@@ -265,12 +269,23 @@ export default function HrSystemPage() {
                 <tbody>
                   {sorted.map((e) => {
                     const availability = getAvailabilityStatus(e);
+                    const isSupervisor = e.level === "Supervisor";
                     return (
                       <ClickableRow key={e.id} href={`/systems/hr/${e.id}`}>
                         <td className="px-4 py-3 tabular text-ink-secondary whitespace-nowrap">{e.employeeIdNumber}</td>
                         <td className="px-4 py-3">
-                          <span className="font-medium text-ink group-hover:text-brand-700 group-hover:underline underline-offset-2">
-                            {e.name}
+                          <span className="inline-flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                            {isSupervisor && (
+                              <Crown className="h-3.5 w-3.5 shrink-0 text-brand-700" aria-hidden strokeWidth={2.25} />
+                            )}
+                            <span className="font-medium text-ink whitespace-nowrap group-hover:text-brand-700 group-hover:underline underline-offset-2">
+                              {e.name}
+                            </span>
+                            {isSupervisor && (
+                              <span className="rounded-full border border-brand-100 bg-brand-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-brand-700">
+                                Supervisor
+                              </span>
+                            )}
                           </span>
                         </td>
                         <td className="px-4 py-3">
@@ -299,7 +314,21 @@ export default function HrSystemPage() {
                           </span>
                         </td>
                         <td className="px-2 py-3">
-                          <ChevronRight className="h-4 w-4 text-ink-muted" />
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                setDeleteError(null);
+                                setDeleteTarget(e);
+                              }}
+                              aria-label={`Delete ${e.name}`}
+                              className="rounded-md p-1.5 text-ink-muted hover:bg-[var(--status-critical-bg)] hover:text-[var(--status-critical)]"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                            <ChevronRight className="h-4 w-4 text-ink-muted" />
+                          </div>
                         </td>
                       </ClickableRow>
                     );
@@ -314,61 +343,17 @@ export default function HrSystemPage() {
             capacity planning.
           </SourceSystemNotice>
         </>
-      ) : (
+      )}
+
+      {tab === "leaves" && (
         <>
           <p className="text-sm text-ink-secondary">
-            Leave requested by employees. Pending requests are awaiting the employee&rsquo;s supervisor to approve —
-            once approved, they&rsquo;re added to the calendar automatically.
+            Who is on leave and when, across IT Service Support &amp; Cybersecurity. Pending requests are awaiting the
+            employee&rsquo;s supervisor to approve — once approved, declined, or rescheduled, this calendar updates
+            automatically. Showing {leaveRows.length} leave record{leaveRows.length === 1 ? "" : "s"}.
           </p>
 
-          <Card>
-            <CardHeader
-              title="Leave Records"
-              subtitle={`${leaveRows.length} leave record${leaveRows.length === 1 ? "" : "s"} · IT Service Support & Cybersecurity`}
-            />
-            <div className="overflow-x-auto rounded-lg border border-border">
-              <table className="w-full min-w-[680px] border-collapse text-sm">
-                <thead>
-                  <tr className="border-b border-border bg-brand-50/60 text-left text-xs font-medium uppercase tracking-wide text-ink-secondary">
-                    <th className="px-4 py-3">Employee</th>
-                    <th className="px-4 py-3">Leave Type</th>
-                    <th className="px-4 py-3">Start Date</th>
-                    <th className="px-4 py-3">End Date</th>
-                    <th className="px-4 py-3">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {leaveRows.map((row) => (
-                    <tr key={row.key} className="border-b border-border last:border-0 hover:bg-brand-50/40 transition-colors">
-                      <td className="px-4 py-3">
-                        <Link
-                          href={`/systems/hr/${row.employeeId}`}
-                          className="font-medium text-ink hover:text-brand-700 hover:underline underline-offset-2"
-                        >
-                          {row.employeeName}
-                        </Link>
-                      </td>
-                      <td className="px-4 py-3 text-ink-secondary whitespace-nowrap">{row.type}</td>
-                      <td className="px-4 py-3 text-ink-secondary whitespace-nowrap">{row.start}</td>
-                      <td className="px-4 py-3 text-ink-secondary whitespace-nowrap">{row.end}</td>
-                      <td className="px-4 py-3">
-                        <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${LEAVE_STATUS_STYLES[row.status]}`}>
-                          {row.status}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                  {leaveRows.length === 0 && (
-                    <tr>
-                      <td colSpan={5} className="px-4 py-10 text-center text-sm text-ink-muted">
-                        No leave on record.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </Card>
+          <EmployeeLeaveCalendar leaves={leaveRows} employees={sorted} />
         </>
       )}
 
@@ -387,6 +372,31 @@ export default function HrSystemPage() {
               setShowAddForm(false);
             } catch {
               setAddError("Couldn't save this employee — check your connection and try again.");
+            }
+          }}
+        />
+      )}
+
+      {deleteTarget && (
+        <DeleteEmployeeModal
+          employee={deleteTarget}
+          employees={employees}
+          error={deleteError}
+          onClose={() => {
+            setDeleteError(null);
+            setDeleteTarget(null);
+          }}
+          onConfirm={async () => {
+            setDeleteError(null);
+            try {
+              await removeEmployee(deleteTarget.id);
+              setDeleteTarget(null);
+            } catch (err) {
+              setDeleteError(
+                err instanceof Error && err.message.includes("schema.sql")
+                  ? err.message
+                  : "Couldn't delete this employee — check your connection and try again."
+              );
             }
           }}
         />

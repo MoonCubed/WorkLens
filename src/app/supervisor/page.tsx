@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { Users, Gauge, CalendarClock, Ticket, AlertTriangle, ShieldAlert, ChevronRight, Ban, TrendingUp, X, CheckCircle2 } from "lucide-react";
+import { Users, Gauge, CalendarClock, Ticket, AlertTriangle, ShieldAlert, ChevronRight, Ban, TrendingUp, X, CheckCircle2, Inbox, Repeat2 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { KpiCard } from "@/components/ui/KpiCard";
 import { InfoTip } from "@/components/ui/InfoTip";
@@ -12,8 +12,10 @@ import { useTickets } from "@/store/tickets-store";
 import { useSupervisorSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useWorkLog } from "@/store/work-log-store";
+import { useHandoverRequests } from "@/store/handover-requests-store";
 import { computeDashboardSummary, type AttentionTone, type DashboardSummary } from "@/lib/dashboardSummary";
 import { todayLabel } from "@/lib/date";
+import { OVERLOAD_THRESHOLD, RECOMMENDED_CAPACITY } from "@/data/config";
 
 const ATTENTION_STYLES: Record<AttentionTone, { icon: typeof AlertTriangle; text: string; bg: string; border: string; label: string }> = {
   critical: { icon: AlertTriangle, text: "text-[var(--status-critical)]", bg: "bg-[var(--status-critical-bg)]", border: "border-[var(--status-critical-border)]", label: "🔴" },
@@ -28,15 +30,21 @@ export default function SupervisorDashboardPage() {
   const { tickets } = useTickets();
   const { employees } = useEmployees();
   const { getEntry } = useWorkLog();
+  const { requests: handoverRequests } = useHandoverRequests();
   const [openKpi, setOpenKpi] = useState<KpiKey | null>(null);
 
-  const summary = useMemo(() => computeDashboardSummary(unit, employees, tickets, getEntry), [unit, employees, tickets, getEntry]);
+  const summary = useMemo(
+    () => computeDashboardSummary(unit, employees, tickets, getEntry, handoverRequests),
+    [unit, employees, tickets, getEntry, handoverRequests]
+  );
 
+  // Completed work is deliberately absent — it drops out the moment a task's status
+  // flips to Completed, since workDelivery is recomputed from live status.
   const deliveryDistribution = [
-    { key: "completed", label: "Completed", value: summary.workDelivery.completed, color: "var(--status-good)" },
     { key: "inProgress", label: "In Progress", value: summary.workDelivery.inProgress, color: "var(--brand-600)" },
+    { key: "onHold", label: "On Hold", value: summary.workDelivery.onHold, color: "var(--border-strong)" },
     { key: "overdue", label: "Overdue", value: summary.workDelivery.overdue, color: "var(--status-critical)" },
-    { key: "unassigned", label: "Unassigned", value: summary.workDelivery.unassigned, color: "var(--border-strong)" },
+    { key: "unassigned", label: "Unassigned", value: summary.workDelivery.unassigned, color: "var(--status-warning)" },
   ];
 
   return (
@@ -48,6 +56,30 @@ export default function SupervisorDashboardPage() {
           Live view of your team&rsquo;s capacity, progress and delivery, as of {todayLabel()}. Click any metric for details.
         </p>
       </div>
+
+      {/* Notifications — things waiting on the supervisor. Update live with Supabase. */}
+      {(summary.unassignedCount > 0 || summary.pendingHandoverCount > 0) && (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {summary.unassignedCount > 0 && (
+            <NotificationCard
+              href="/supervisor/work"
+              icon={<Inbox className="h-4 w-4" />}
+              count={summary.unassignedCount}
+              label={`Task${summary.unassignedCount === 1 ? "" : "s"} Awaiting Assignment`}
+              detail="Unassigned tickets for your unit — pick an owner for each."
+            />
+          )}
+          {summary.pendingHandoverCount > 0 && (
+            <NotificationCard
+              href="/supervisor/handover"
+              icon={<Repeat2 className="h-4 w-4" />}
+              count={summary.pendingHandoverCount}
+              label={`Handover Request${summary.pendingHandoverCount === 1 ? "" : "s"}`}
+              detail="Leave / turnover requests from your team awaiting review."
+            />
+          )}
+        </div>
+      )}
 
       {/* KPI overview */}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
@@ -102,7 +134,8 @@ export default function SupervisorDashboardPage() {
 
       {openKpi && <KpiDetailModal kpi={openKpi} summary={summary} onClose={() => setOpenKpi(null)} />}
 
-      {/* Work Delivery */}
+      {/* Work Delivery — active work only; a task drops off the instant it's marked
+          Completed, since workDelivery is recomputed from live status. */}
       <Card>
         <CardHeader title="Work Delivery" subtitle="Are we actually getting the work done?" />
         <CapacityDistributionBar data={deliveryDistribution} />
@@ -117,8 +150,8 @@ export default function SupervisorDashboardPage() {
           currentLabelText="This period, team average"
         />
         <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-ink-muted">
-          <LegendDash color="var(--status-warning)" label="80% recommended capacity threshold" />
-          <LegendDash color="var(--status-critical)" label="95% overload threshold" />
+          <LegendDash color="var(--status-warning)" label={`${RECOMMENDED_CAPACITY}% recommended capacity threshold`} />
+          <LegendDash color="var(--status-critical)" label={`${OVERLOAD_THRESHOLD}% overload threshold`} />
         </div>
         <p className="mt-3 text-xs text-ink-muted border-t border-border pt-3">
           <span className="font-medium text-ink-secondary">Forecast</span> ≠ <span className="font-medium text-ink-secondary">What-If</span> —
@@ -163,23 +196,37 @@ export default function SupervisorDashboardPage() {
                 </div>
 
                 <div className="mt-3 flex items-center justify-between text-xs">
-                  <span className="text-ink-secondary">{row.capacity.utilization}% utilized</span>
+                  <span className="text-ink-secondary">
+                    {row.capacity.onLeave ? "On leave" : `${row.capacity.utilization}% utilized`}
+                  </span>
                   <span className="tabular font-medium text-ink">{row.capacity.availableHours}h available</span>
                 </div>
                 <div className="mt-1.5 h-1.5 rounded-full bg-brand-50 overflow-hidden">
-                  <div className={`h-full rounded-full ${row.status.dot}`} style={{ width: `${Math.min(100, row.capacity.utilization)}%` }} />
+                  <div
+                    className={`h-full rounded-full ${row.status.dot}`}
+                    style={{ width: `${row.capacity.onLeave ? 0 : Math.min(100, row.capacity.utilization)}%` }}
+                  />
                 </div>
 
                 <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                  <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium ${row.status.bg} ${row.status.border} ${row.status.text}`}>
-                    <span className={`h-1.5 w-1.5 rounded-full ${row.status.dot}`} />
-                    {row.status.label}
-                  </span>
-                  {row.onLeave && (
+                  {row.capacity.onLeave ? (
                     <span className="inline-flex items-center gap-1 rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-warning)]">
                       <CalendarClock className="h-3 w-3" />
-                      {row.onLeave === "Now" ? "On Leave" : "Upcoming Leave"}
+                      On Leave
                     </span>
+                  ) : (
+                    <>
+                      <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium ${row.status.bg} ${row.status.border} ${row.status.text}`}>
+                        <span className={`h-1.5 w-1.5 rounded-full ${row.status.dot}`} />
+                        {row.status.label}
+                      </span>
+                      {row.onLeave === "Upcoming" && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-warning)]">
+                          <CalendarClock className="h-3 w-3" />
+                          Upcoming Leave
+                        </span>
+                      )}
+                    </>
                   )}
                 </div>
               </Link>
@@ -222,6 +269,38 @@ export default function SupervisorDashboardPage() {
         </Card>
       )}
     </div>
+  );
+}
+
+function NotificationCard({
+  href,
+  icon,
+  count,
+  label,
+  detail,
+}: {
+  href: string;
+  icon: React.ReactNode;
+  count: number;
+  label: string;
+  detail: string;
+}) {
+  return (
+    <Link
+      href={href}
+      className="flex items-center gap-3.5 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-4 py-3.5 transition-colors hover:brightness-[0.98]"
+    >
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface text-[var(--status-warning)]">
+        {icon}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-semibold text-ink">
+          {count} {label}
+        </span>
+        <span className="block text-xs text-ink-secondary">{detail}</span>
+      </span>
+      <ChevronRight className="h-4 w-4 shrink-0 text-ink-muted" />
+    </Link>
   );
 }
 

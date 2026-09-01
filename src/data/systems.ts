@@ -40,13 +40,13 @@ export const SOURCE_SYSTEMS: SourceSystem[] = [
   },
   {
     key: "tickets",
-    name: "IT Ticket System",
+    name: "IT-Demand",
     subtitle: "Operational Support",
     dataProvided: ["Incidents", "Requests", "Priority", "Status", "Assigned Unit", "Estimated Effort", "Dates", "SLA"],
     status: "Connected",
     lastSync: "26 Aug 2026, 10:40 AM",
     href: "/systems/tickets",
-    openLabel: "Open IT Ticket System",
+    openLabel: "Open IT-Demand",
     accent: "amber",
   },
 ];

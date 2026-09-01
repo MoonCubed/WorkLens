@@ -7,6 +7,7 @@ import { HandoverRequestsProvider } from "@/store/handover-requests-store";
 import { CalendarEventsProvider } from "@/store/calendar-events-store";
 import { SkillsProvider } from "@/store/skills-store";
 import { TaskAdjustmentsProvider } from "@/store/task-adjustments-store";
+import { SkillChangeRequestsProvider } from "@/store/skill-change-requests-store";
 import { RootDataGate } from "@/components/layout/RootDataGate";
 import "./globals.css";
 
@@ -18,7 +19,7 @@ const inter = Inter({
 export const metadata: Metadata = {
   title: "WorkLens | All tasks in sight.",
   description:
-    "WorkLens connects HR and the IT Ticket System to answer: who is available, who has the right skills, and what happens if we assign new work.",
+    "WorkLens connects HR and IT-Demand to answer: who is available, who has the right skills, and what happens if we assign new work.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -32,7 +33,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                 <CalendarEventsProvider>
                   <SkillsProvider>
                     <TaskAdjustmentsProvider>
-                      <RootDataGate>{children}</RootDataGate>
+                      <SkillChangeRequestsProvider>
+                        <RootDataGate>{children}</RootDataGate>
+                      </SkillChangeRequestsProvider>
                     </TaskAdjustmentsProvider>
                   </SkillsProvider>
                 </CalendarEventsProvider>

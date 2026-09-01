@@ -166,7 +166,7 @@ function MiniStat({ label, value, tone }: { label: string; value: string; tone: 
 
 const SOURCE_CARDS = [
   { icon: Users, title: "HR", subtitle: "Employee & Skills", accent: "text-accent-teal bg-accent-teal-bg" },
-  { icon: Ticket, title: "IT Tickets", subtitle: "Operational Support", accent: "text-[var(--status-warning)] bg-[var(--status-warning-bg)]" },
+  { icon: Ticket, title: "IT-Demand", subtitle: "Operational Support", accent: "text-[var(--status-warning)] bg-[var(--status-warning-bg)]" },
 ];
 
 function ProblemSection() {

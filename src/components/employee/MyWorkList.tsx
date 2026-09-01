@@ -52,6 +52,9 @@ export function MyWorkList({ employee, assignedTickets }: { employee: Employee; 
       estimatedHours: ticketEffortForEmployee(t, employee.id),
       ticketId: t.id,
       ticketStatus: t.status,
+      ticketResolvedDate: t.resolvedDate,
+      ticketHoldStart: t.holdStartDate ?? null,
+      ticketHoldEnd: t.holdEndDate ?? null,
     })),
   ];
 
@@ -67,7 +70,7 @@ export function MyWorkList({ employee, assignedTickets }: { employee: Employee; 
           key={row.key}
           row={row}
           currentUserName={employee.name}
-          onUpdateTicketStatus={(id, status) => updateTicketStatus(id, status).catch(() => {})}
+          onUpdateTicketStatus={(id, status, hold) => updateTicketStatus(id, status, hold).catch(() => {})}
           onOpenDetails={row.ticketId ? (id) => setOpenTicketId(id) : undefined}
         />
       ))}
@@ -80,7 +83,7 @@ export function MyWorkList({ employee, assignedTickets }: { employee: Employee; 
           currentUserName={employee.name}
           currentEmployeeId={employee.id}
           onClose={() => setOpenTicketId(null)}
-          onUpdateStatus={(status) => updateTicketStatus(detailTicket.id, status).catch(() => setError("Couldn't update status — check your connection."))}
+          onUpdateStatus={(status, hold) => updateTicketStatus(detailTicket.id, status, hold).catch(() => setError("Couldn't update status — check your connection."))}
           onUpdatePriority={(priority) => updateTicketPriority(detailTicket.id, priority).catch(() => setError("Couldn't update priority — check your connection."))}
           onUpdateSkills={(skills) => updateTicketSkills(detailTicket.id, skills).catch(() => setError("Couldn't update skills — check your connection."))}
           onUpdateAssignees={(ids, split) => setTicketAssignees(detailTicket.id, ids, split).catch(() => setError("Couldn't update assignees — check your connection."))}

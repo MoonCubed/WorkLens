@@ -1,5 +1,6 @@
 import type { Department, Employee } from "@/data/types";
 import { todayStart, parseLooseDate } from "@/lib/date";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
 
 /** The one "Supervisor"-level employee in a department — new hires in that department
  * are linked to them as their supervisor by default. Data-driven off `level`, so
@@ -51,6 +52,6 @@ export function getAvailabilityStatus(employee: Employee): AvailabilityStatus {
     return today >= start && today <= end;
   });
   if (onLeaveNow) return "Unavailable";
-  if (employee.currentUtilization > 95) return "Limited";
+  if (employee.currentUtilization > OVERLOAD_THRESHOLD) return "Limited";
   return "Available";
 }

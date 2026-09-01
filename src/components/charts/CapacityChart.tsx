@@ -12,33 +12,32 @@ import {
   ReferenceLine,
 } from "recharts";
 import { ChevronLeft, ChevronRight } from "lucide-react";
-import { todayStart } from "@/lib/date";
+import { todayStart, startOfWeek, weekOfYear } from "@/lib/date";
+import { OVERLOAD_THRESHOLD, RECOMMENDED_CAPACITY } from "@/data/config";
 
 type Granularity = "weekly" | "monthly";
 
 interface Period {
   key: string;
   label: string;
+  /** Longer label for the "this period" line, e.g. "Week 36" / "Sep 2026". */
+  fullLabel: string;
   utilization: number;
   isCurrent: boolean;
 }
 
-function startOfWeek(d: Date): Date {
-  const c = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  c.setDate(c.getDate() - c.getDay());
-  return c;
-}
-
 /** Weekly periods: index 0 is the current week and its value is the live computed
  * utilization passed in; the rest come from the forward forecast. Each week carries
- * its own value — never the same number repeated. */
+ * its own value — never the same number repeated. Weeks use the app-wide Sunday-based
+ * 1–52 numbering (see `weekOfYear` in lib/date). */
 function weeklyPeriods(current: number, forecast: number[]): Period[] {
   const weekStart = startOfWeek(todayStart());
   return [current, ...forecast].map((utilization, i) => {
     const s = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + i * 7);
     return {
       key: `w-${i}`,
-      label: `${s.getDate()} ${s.toLocaleDateString("en-US", { month: "short" })}`,
+      label: `W${weekOfYear(s)}`,
+      fullLabel: `Week ${weekOfYear(s)}`,
       utilization: Math.round(utilization),
       isCurrent: i === 0,
     };
@@ -64,6 +63,7 @@ function monthlyPeriods(current: number, forecast: number[]): Period[] {
   return Array.from(buckets.entries()).map(([key, b]) => ({
     key: `m-${key}`,
     label: b.date.toLocaleDateString("en-US", { month: "short", year: "2-digit" }),
+    fullLabel: b.date.toLocaleDateString("en-US", { month: "long", year: "numeric" }),
     utilization: Math.round(b.sum / b.n),
     isCurrent: key === thisMonthKey,
   }));
@@ -151,7 +151,8 @@ export function CapacityChart({
 
       {currentPeriod && (
         <p className="mb-2 text-xs text-ink-muted">
-          {currentLabelText}: <span className="font-semibold text-ink">{currentPeriod.utilization}%</span> utilized
+          {currentLabelText} · {currentPeriod.fullLabel}:{" "}
+          <span className="font-semibold text-ink">{currentPeriod.utilization}%</span> utilized
         </p>
       )}
 
@@ -174,8 +175,8 @@ export function CapacityChart({
               ticks={[0, 40, 80, 120]}
               tickFormatter={(v: number) => `${v}%`}
             />
-            <ReferenceLine y={80} stroke="var(--status-warning)" strokeDasharray="3 3" strokeOpacity={0.6} />
-            <ReferenceLine y={95} stroke="var(--status-critical)" strokeDasharray="3 3" strokeOpacity={0.6} />
+            <ReferenceLine y={RECOMMENDED_CAPACITY} stroke="var(--status-warning)" strokeDasharray="3 3" strokeOpacity={0.6} />
+            <ReferenceLine y={OVERLOAD_THRESHOLD} stroke="var(--status-critical)" strokeDasharray="3 3" strokeOpacity={0.6} />
             <Tooltip
               cursor={{ stroke: "var(--border-strong)", strokeWidth: 1 }}
               contentStyle={TOOLTIP_STYLE}

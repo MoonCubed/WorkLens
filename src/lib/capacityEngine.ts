@@ -13,15 +13,22 @@
 import type { Employee, LeaveEvent, WorkflowStatus } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
 import type { TicketStatus } from "@/data/tickets";
-import { todayStart, parseLooseDate, getDueStatus } from "@/lib/date";
+import { todayStart, parseLooseDate, getDueStatus, startOfWeek } from "@/lib/date";
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
+import { availableCapacity } from "@/lib/capacity";
 
 export interface WorkLogLookup {
-  (key: string): { workflowStatus?: WorkflowStatus; progress?: number };
+  (key: string): {
+    workflowStatus?: WorkflowStatus;
+    progress?: number;
+    completedAt?: string | null;
+    holdStartDate?: string | null;
+    holdEndDate?: string | null;
+  };
 }
 
-/** A task is done once it's Completed on the ticket itself (the supervisor's or IT
- * Ticket System's call) OR the assignee has marked their personal tracking Completed —
+/** A task is done once it's Completed on the ticket itself (the supervisor's or
+ * IT-Demand's call) OR the assignee has marked their personal tracking Completed —
  * either should free up their capacity. Ad-hoc items have no system-of-record status of
  * their own, so only the work-log's Completed applies. */
 export function isItemComplete(workflowStatus: WorkflowStatus | undefined, ticketStatus?: TicketStatus): boolean {
@@ -57,22 +64,32 @@ export interface EmployeeCapacity {
   /** Contracted weekly hours from HR. */
   weeklyHours: number;
   /** Available working hours for the current week — `weeklyHours` reduced pro-rata
-   * for any approved leave days that fall in the week. This is the denominator for
-   * every utilization/availability figure in the app. */
+   * for any approved leave days that fall in the week, and forced to 0 while the
+   * employee is currently on leave. This is the denominator for every
+   * utilization/availability figure in the app. */
   workingHours: number;
   /** Remaining workload hours across active assigned work (progress and completion
-   * already applied). */
+   * already applied). On-hold work still counts — only Completed work is zeroed. */
   activeHours: number;
-  /** `workingHours − activeHours`, floored at 0 — spare capacity in hours. */
+  /** Spare capacity in hours — `workingHours − activeHours`, floored at 0, and
+   * exactly 0 while the employee is currently on leave. */
   availableHours: number;
-  /** `activeHours ÷ workingHours × 100`, rounded. */
+  /** `activeHours ÷ workingHours × 100`, rounded — the workload figure. Unaffected
+   * by leave (someone on leave can still have work assigned that needs covering). */
   utilization: number;
+  /** Availability as a percentage — `100 − utilization`, floored at 0, and exactly
+   * 0 while the employee is currently on leave (they are unavailable for assignment,
+   * not "100% free"). Use this, never `100 − utilization`, for any "available %". */
+  availablePercent: number;
+  /** True when an approved leave event covers today — the employee is unavailable. */
+  onLeave: boolean;
 }
 
 /** Working days (Sun–Thu; Fri/Sat are the weekend) in the calendar week that
- * contains `ref`. */
+ * contains `ref` — Sunday-based, matching the app-wide week scheme (`startOfWeek`
+ * in lib/date). */
 function currentWeekBounds(ref: Date): { start: Date; end: Date } {
-  const start = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate() - ref.getDay());
+  const start = startOfWeek(ref);
   const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6);
   return { start, end };
 }
@@ -124,16 +141,30 @@ export function computeEmployeeCapacity(employee: Employee, tickets: AssignedTic
 
   activeHours = Math.round(activeHours * 10) / 10;
   const weeklyHours = employee.weeklyHours || 40;
-  const workingHours = weeklyWorkingHours(employee);
-  // On leave the whole week: keep the ratio finite by falling back to contracted hours.
+  const onLeave = isCurrentlyOnLeave(employee);
+  // Currently on leave → no working hours and no availability, regardless of how the
+  // rest of the week looks. Otherwise it's the leave-adjusted weekly figure.
+  const workingHours = onLeave ? 0 : weeklyWorkingHours(employee);
+  // Keep the ratio finite when there are no working hours (full-week leave or an
+  // unusual schedule) by falling back to contracted hours for the denominator only.
   const denom = workingHours > 0 ? workingHours : weeklyHours;
+  const utilization = Math.round((activeHours / denom) * 100);
   return {
     weeklyHours,
     workingHours,
     activeHours,
-    availableHours: Math.max(0, Math.round((workingHours - activeHours) * 10) / 10),
-    utilization: Math.round((activeHours / denom) * 100),
+    availableHours: onLeave ? 0 : Math.max(0, Math.round((workingHours - activeHours) * 10) / 10),
+    utilization,
+    availablePercent: onLeave ? 0 : availableCapacity(utilization),
+    onLeave,
   };
+}
+
+/** The availability percentage to display for an employee wherever the app reads the
+ * synced `currentUtilization` field directly (rather than a full `EmployeeCapacity`).
+ * Zero while on leave; otherwise `100 − utilization`. */
+export function employeeAvailablePercent(employee: Employee): number {
+  return isCurrentlyOnLeave(employee) ? 0 : availableCapacity(employee.currentUtilization);
 }
 
 /** Resulting utilization if `extraHours` of new work were added to `employee` —
@@ -159,6 +190,11 @@ export interface EmployeeWorkItem {
   progress: number;
   remainingHours: number;
   ticketId?: string;
+  /** Set once the item is Completed — its completion date. Null otherwise. */
+  completedDate: string | null;
+  /** The hold window, when the item is On Hold. */
+  holdStart: string | null;
+  holdEnd: string | null;
 }
 
 /** Every active-or-completed work item on `employee`'s plate, in the same shape
@@ -182,6 +218,9 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
         progress: status === "Completed" ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
         remainingHours: itemRemainingHours(ticketEffortForEmployee(t, employee.id), status === "Completed", entry.progress),
         ticketId: t.id,
+        completedDate: status === "Completed" ? (t.resolvedDate ?? entry.completedAt ?? null) : null,
+        holdStart: status === "On Hold" ? (t.holdStartDate ?? entry.holdStartDate ?? null) : null,
+        holdEnd: status === "On Hold" ? (t.holdEndDate ?? entry.holdEndDate ?? null) : null,
       });
     });
 
@@ -196,6 +235,9 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
       status,
       progress: status === "Completed" ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
       remainingHours: itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress),
+      completedDate: status === "Completed" ? (entry.completedAt ?? null) : null,
+      holdStart: status === "On Hold" ? (entry.holdStartDate ?? null) : null,
+      holdEnd: status === "On Hold" ? (entry.holdEndDate ?? null) : null,
     });
   });
 

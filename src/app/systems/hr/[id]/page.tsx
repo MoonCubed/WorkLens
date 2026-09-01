@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
-import { ArrowLeft, CheckCircle2, Plus, X } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
+import { ArrowLeft, CheckCircle2, Plus, Trash2, X } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { SourceSystemNotice } from "@/components/systems/SourceSystemHeader";
 import { SystemPageShell } from "@/components/systems/SystemPageShell";
+import { DeleteEmployeeModal } from "@/components/systems/DeleteEmployeeModal";
 import { IT_DEPARTMENTS } from "@/data/config";
 import type { Department, EmployeeLevel, Skill, SkillLevel } from "@/data/types";
 import { getEmployeeEmail, getSupervisorName, type AvailabilityStatus } from "@/lib/hr";
@@ -19,7 +20,8 @@ const LEVEL_OPTIONS: EmployeeLevel[] = ["Employee", "Supervisor"];
 
 export default function HrEmployeeProfilePage() {
   const params = useParams<{ id: string }>();
-  const { employees, updateEmployee } = useEmployees();
+  const router = useRouter();
+  const { employees, updateEmployee, removeEmployee } = useEmployees();
   const employee = employees.find((e) => e.id === params.id);
 
   const [department, setDepartment] = useState<Department>(IT_DEPARTMENTS[0]);
@@ -31,6 +33,8 @@ export default function HrEmployeeProfilePage() {
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [showDelete, setShowDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [showAddSkill, setShowAddSkill] = useState(false);
   const [newSkillName, setNewSkillName] = useState("");
   const [newSkillLevel, setNewSkillLevel] = useState<Exclude<SkillLevel, "Expert">>("Beginner");
@@ -104,6 +108,20 @@ export default function HrEmployeeProfilePage() {
       setSaveError("Couldn't save — check your connection and try again.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleDelete() {
+    setDeleteError(null);
+    try {
+      await removeEmployee(employee!.id);
+      router.push("/systems/hr");
+    } catch (err) {
+      setDeleteError(
+        err instanceof Error && err.message.includes("schema.sql")
+          ? err.message
+          : "Couldn't delete this employee — check your connection and try again."
+      );
     }
   }
 
@@ -316,9 +334,46 @@ export default function HrEmployeeProfilePage() {
         {saveError && <span className="text-sm font-medium text-[var(--status-critical)]">{saveError}</span>}
       </div>
 
+      <Card className="border-[var(--status-critical-border)]">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-ink">Delete Employee</h3>
+            <p className="mt-0.5 text-xs text-ink-muted">
+              Permanently removes {employee.name} from the HR System and every WorkLens view. This can&rsquo;t be undone.
+            </p>
+            {deleteError && (
+              <p className="mt-1.5 text-xs font-medium text-[var(--status-critical)]">{deleteError}</p>
+            )}
+          </div>
+          <button
+            onClick={() => {
+              setDeleteError(null);
+              setShowDelete(true);
+            }}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-4 py-2 text-sm font-semibold text-[var(--status-critical)] hover:brightness-95"
+          >
+            <Trash2 className="h-4 w-4" />
+            Delete Employee
+          </button>
+        </div>
+      </Card>
+
       <SourceSystemNotice>
         The HR system is the source of employee information — WorkLens reflects these changes immediately.
       </SourceSystemNotice>
+
+      {showDelete && (
+        <DeleteEmployeeModal
+          employee={employee}
+          employees={employees}
+          error={deleteError}
+          onClose={() => {
+            setDeleteError(null);
+            setShowDelete(false);
+          }}
+          onConfirm={handleDelete}
+        />
+      )}
     </SystemPageShell>
   );
 }

@@ -2,16 +2,28 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { Search, ChevronRight, LayoutList, LayoutGrid } from "lucide-react";
+import { Search, ChevronRight, LayoutList, LayoutGrid, CalendarClock } from "lucide-react";
 import type { Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
-import { availableCapacity, getCapacityStatus } from "@/lib/capacity";
+import { getCapacityStatus } from "@/lib/capacity";
+import { employeeAvailablePercent, isCurrentlyOnLeave } from "@/lib/capacityEngine";
 import { getEmployeeWorkCounts, getEmployeeTasks } from "@/lib/unit-summary";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { CapacityBar } from "@/components/ui/ProgressBar";
 import { useSkills } from "@/store/skills-store";
 
-const STATUS_OPTIONS = ["Healthy", "At Risk", "Overloaded", "Critical"];
+const STATUS_OPTIONS = ["Healthy", "At Risk", "Overloaded", "Critical", "On Leave"];
+
+/** An "On Leave" pill for employees currently on approved leave — shown instead of a
+ * capacity status, since they have 0h / 0% available and aren't assignable. */
+function OnLeaveBadge() {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-warning)]">
+      <CalendarClock className="h-3 w-3" />
+      On Leave
+    </span>
+  );
+}
 
 export function TeamCapacityView({
   employees,
@@ -37,13 +49,17 @@ export function TeamCapacityView({
   }, [employees, skillNames]);
 
   const filtered = useMemo(() => {
-    return employees.filter((e) => {
-      const statusLabel = getCapacityStatus(e.currentUtilization).label;
+    const matched = employees.filter((e) => {
+      const onLeave = isCurrentlyOnLeave(e);
+      const statusLabel = onLeave ? "On Leave" : getCapacityStatus(e.currentUtilization).label;
       if (query && !e.name.toLowerCase().includes(query.toLowerCase())) return false;
       if (skill !== "all" && !e.skills.some((s) => s.name === skill)) return false;
       if (status !== "all" && statusLabel !== status) return false;
       return true;
     });
+    // Employees currently on leave sort to the bottom — they're unavailable for
+    // assignment, so a supervisor scanning for capacity sees available people first.
+    return [...matched].sort((a, b) => Number(isCurrentlyOnLeave(a)) - Number(isCurrentlyOnLeave(b)));
   }, [employees, query, skill, status]);
 
   return (
@@ -137,7 +153,8 @@ function TableView({
         </thead>
         <tbody>
           {employees.map((e) => {
-            const avail = availableCapacity(e.currentUtilization);
+            const onLeave = isCurrentlyOnLeave(e);
+            const avail = employeeAvailablePercent(e);
             const counts = getEmployeeWorkCounts(e);
             return (
               <tr key={e.id} className="border-b border-border last:border-0 hover:bg-brand-50/40 transition-colors">
@@ -168,12 +185,12 @@ function TableView({
                 <td className="px-4 py-3 tabular text-ink-secondary">{counts.activeTasks}</td>
                 <td className="px-4 py-3 tabular text-ink-secondary">{counts.tickets}</td>
                 <td className="px-4 py-3 w-36">
-                  <CapacityBar value={e.currentUtilization} />
+                  {onLeave ? <span className="text-xs text-ink-muted">On leave</span> : <CapacityBar value={e.currentUtilization} />}
                 </td>
-                <td className="px-4 py-3 tabular text-ink-secondary">{avail}%</td>
+                <td className="px-4 py-3 tabular text-ink-secondary">{onLeave ? "0h / 0%" : `${avail}%`}</td>
                 <td className="px-4 py-3 tabular text-ink-secondary">{e.futureCapacity}%</td>
                 <td className="px-4 py-3">
-                  <StatusBadge utilization={e.currentUtilization} />
+                  {onLeave ? <OnLeaveBadge /> : <StatusBadge utilization={e.currentUtilization} />}
                 </td>
                 <td className="px-2 py-3">
                   <Link href={`${detailBasePath}/${e.id}`}>
@@ -216,7 +233,8 @@ function CardGridView({
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
       {employees.map((e) => {
-        const avail = availableCapacity(e.currentUtilization);
+        const onLeave = isCurrentlyOnLeave(e);
+        const avail = employeeAvailablePercent(e);
         const tasks = getEmployeeTasks(e, tickets);
         const visibleTasks = tasks.slice(0, 4);
         return (
@@ -237,13 +255,15 @@ function CardGridView({
               <div className="flex-1">
                 <div className="flex items-center justify-between text-xs mb-1">
                   <span className="text-ink-secondary">Current Capacity</span>
-                  <span className="tabular font-medium text-ink">{e.currentUtilization}%</span>
+                  <span className="tabular font-medium text-ink">{onLeave ? "—" : `${e.currentUtilization}%`}</span>
                 </div>
-                <CapacityBar value={e.currentUtilization} showLabel={false} />
+                <CapacityBar value={onLeave ? 0 : e.currentUtilization} showLabel={false} />
               </div>
-              <StatusBadge utilization={e.currentUtilization} />
+              {onLeave ? <OnLeaveBadge /> : <StatusBadge utilization={e.currentUtilization} />}
             </div>
-            <p className="mt-1.5 text-xs text-ink-muted">{avail}% available capacity</p>
+            <p className="mt-1.5 text-xs text-ink-muted">
+              {onLeave ? "0h / 0% available — on leave" : `${avail}% available capacity`}
+            </p>
 
             <div className="mt-4 pt-3 border-t border-border">
               <p className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-secondary">

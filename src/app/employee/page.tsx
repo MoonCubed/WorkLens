@@ -7,8 +7,9 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { InfoTip } from "@/components/ui/InfoTip";
 import { CapacityChart } from "@/components/charts/CapacityChart";
 import { TaskDetailPanel } from "@/components/work/TaskDetailPanel";
-import { getDueStatus } from "@/lib/date";
+import { getDueStatus, todayStart, weekOfYear } from "@/lib/date";
 import { computeEmployeeWorkItems, computeEmployeeCapacity, type DisplayStatus } from "@/lib/capacityEngine";
+import { OVERLOAD_THRESHOLD, RECOMMENDED_CAPACITY } from "@/data/config";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useTickets } from "@/store/tickets-store";
@@ -34,8 +35,11 @@ export default function EmployeeDashboardPage() {
   const firstName = me.name.split(" ")[0];
   // One capacity calculation, shared by every number on this page.
   const capacity = useMemo(() => computeEmployeeCapacity(me, tickets, getEntry), [me, tickets, getEntry]);
-  const availPct = Math.max(0, 100 - capacity.utilization);
+  // Availability — 0% while on leave, never "100% free".
+  const availPct = capacity.availablePercent;
+  // The forecast entry three weeks out, labelled with the app-wide 1–52 week number.
   const week4 = me.forecast8Week[3] ?? capacity.utilization;
+  const week4Number = weekOfYear(new Date(todayStart().getFullYear(), todayStart().getMonth(), todayStart().getDate() + 21));
 
   const workItems = useMemo(() => computeEmployeeWorkItems(me, tickets, getEntry), [me, tickets, getEntry]);
   const activeWorkItems = workItems.filter((i) => i.status !== "Completed");
@@ -114,7 +118,7 @@ export default function EmployeeDashboardPage() {
           <Bell className="h-4 w-4 mt-0.5 shrink-0 text-[var(--status-warning)]" />
           <div className="text-sm text-ink">
             <p>
-              Your capacity is expected to reach <span className="font-semibold">{week4}%</span> in Week 4.
+              Your capacity is expected to reach <span className="font-semibold">{week4}%</span> in Week {week4Number}.
             </p>
             <p className="mt-1 text-ink-secondary">
               If you expect additional work, consider submitting a handover or capacity note.
@@ -187,8 +191,8 @@ export default function EmployeeDashboardPage() {
         <CardHeader title="Capacity Over Time" subtitle="Weekly or monthly — this period is live, the rest is forecast" />
         <CapacityChart current={capacity.utilization} forecast={me.forecast8Week} currentLabelText="This period" />
         <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-ink-muted">
-          <LegendDash color="var(--status-warning)" label="80% recommended capacity threshold" />
-          <LegendDash color="var(--status-critical)" label="95% overload threshold" />
+          <LegendDash color="var(--status-warning)" label={`${RECOMMENDED_CAPACITY}% recommended capacity threshold`} />
+          <LegendDash color="var(--status-critical)" label={`${OVERLOAD_THRESHOLD}% overload threshold`} />
         </div>
       </Card>
 
@@ -200,7 +204,7 @@ export default function EmployeeDashboardPage() {
           currentUserName={me.name}
           currentEmployeeId={me.id}
           onClose={() => setOpenTicketId(null)}
-          onUpdateStatus={(status) => updateTicketStatus(detailTicket.id, status).catch(() => setDetailError("Couldn't update status — check your connection and try again."))}
+          onUpdateStatus={(status, hold) => updateTicketStatus(detailTicket.id, status, hold).catch(() => setDetailError("Couldn't update status — check your connection and try again."))}
           onUpdatePriority={(priority) => updateTicketPriority(detailTicket.id, priority).catch(() => setDetailError("Couldn't update priority — check your connection and try again."))}
           onUpdateSkills={(skills) => updateTicketSkills(detailTicket.id, skills).catch(() => setDetailError("Couldn't update skills — check your connection and try again."))}
           onUpdateAssignees={(ids, split) => setTicketAssignees(detailTicket.id, ids, split).catch(() => setDetailError("Couldn't update assignees — check your connection and try again."))}

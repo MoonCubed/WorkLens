@@ -33,7 +33,7 @@ export default function SupervisorCalendarPage() {
   const items = useMemo(() => {
     const list: CalendarItem[] = [];
 
-    // Every ticket assigned to this unit, live from the IT Ticket System — not just
+    // Every ticket assigned to this unit, live from IT-Demand — not just
     // ones already routed to an employee, so nothing waiting in the queue is missed.
     unitTickets.forEach((t) => {
       const date = parseLooseDate(ticketDueLabel(t));

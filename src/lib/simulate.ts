@@ -1,5 +1,6 @@
 import type { Employee } from "@/data/types";
 import { getCapacityStatus } from "@/lib/capacity";
+import { isCurrentlyOnLeave } from "@/lib/capacityEngine";
 
 export interface ScenarioInput {
   name: string;
@@ -39,6 +40,8 @@ export function rankCandidates(
   limit = 3
 ): { employee: Employee; skillMatch: number }[] {
   return employees
+    // Someone currently on leave has 0 available capacity — never a candidate for new work.
+    .filter((employee) => !isCurrentlyOnLeave(employee))
     .map((employee) => ({ employee, skillMatch: computeSkillMatch(employee, requiredSkills) }))
     .filter((c) => c.skillMatch > 0)
     .sort((a, b) => b.skillMatch - a.skillMatch || a.employee.currentUtilization - b.employee.currentUtilization)

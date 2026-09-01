@@ -19,9 +19,12 @@ import { completionSortKey } from "@/lib/dashboardSummary";
 import { slaWindowLabel } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
 import { rankCandidatesForTicket, type TicketCandidate } from "@/lib/ticketMatch";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
 import type { Employee } from "@/data/types";
 
-const CAPACITY_WARN_THRESHOLD = 90;
+// Assigning work that would take someone past the overload threshold pauses for a
+// confirmation showing the resulting percentage.
+const CAPACITY_WARN_THRESHOLD = OVERLOAD_THRESHOLD;
 const INITIAL_ROWS = 5;
 
 export default function SupervisorWorkPage() {
@@ -132,7 +135,7 @@ export default function SupervisorWorkPage() {
       <div>
         <h1 className="text-2xl font-semibold text-ink tracking-tight">Tasks</h1>
         <p className="mt-1 text-sm text-ink-muted">
-          Incoming work for {unit}. Tickets arrive from the IT Ticket System assigned to your unit only — decide who
+          Incoming work for {unit}. Tickets arrive from IT-Demand assigned to your unit only — decide who
           on your team should handle each one.
         </p>
       </div>
@@ -418,7 +421,7 @@ export default function SupervisorWorkPage() {
           currentUserName={currentUserName}
           assigneeEditing={false}
           onClose={() => setOpenDetail(null)}
-          onUpdateStatus={(status) => updateTicketStatus(detailTicket.id, status).catch(() => setAssignError("Couldn't update status — check your connection and try again."))}
+          onUpdateStatus={(status, hold) => updateTicketStatus(detailTicket.id, status, hold).catch(() => setAssignError("Couldn't update status — check your connection and try again."))}
           onUpdatePriority={(priority) => updateTicketPriority(detailTicket.id, priority).catch(() => setAssignError("Couldn't update priority — check your connection and try again."))}
           onUpdateSkills={(skills) => updateTicketSkills(detailTicket.id, skills).catch(() => setAssignError("Couldn't update skills — check your connection and try again."))}
           onUpdateAssignees={(ids, split) => setTicketAssignees(detailTicket.id, ids, split).catch(() => setAssignError("Couldn't update assignees — check your connection and try again."))}

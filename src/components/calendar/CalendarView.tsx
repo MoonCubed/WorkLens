@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { ChevronLeft, ChevronRight, Plus, X } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { PriorityBadge } from "@/components/ui/StatusBadge";
-import { todayStart, todayLabel, toInputDateValue, formatDisplayDate } from "@/lib/date";
+import { todayStart, todayLabel, toInputDateValue, formatDisplayDate, startOfWeek, weekOfYear } from "@/lib/date";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -69,12 +69,6 @@ function sortItems(items: CalendarItem[]): CalendarItem[] {
 
 function dayKey(d: Date) {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-}
-
-function startOfWeek(d: Date) {
-  const copy = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  copy.setDate(copy.getDate() - copy.getDay());
-  return copy;
 }
 
 function isSameDay(a: Date, b: Date) {
@@ -154,7 +148,7 @@ export function CalendarView({
     view === "month"
       ? cursor.toLocaleDateString("en-US", { month: "long", year: "numeric" })
       : view === "week"
-        ? `Week of ${formatDisplayDate(startOfWeek(cursor))}`
+        ? `Week ${weekOfYear(startOfWeek(cursor))} · from ${formatDisplayDate(startOfWeek(cursor))}`
         : formatDisplayDate(cursor);
 
   return (

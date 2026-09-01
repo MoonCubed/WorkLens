@@ -18,7 +18,7 @@ The app is split into two conceptual layers, and the UI deliberately keeps them
 looking distinct:
 
 - **Enterprise Systems** (`/systems/*`) — mock source-of-truth systems an org already
-  has: an **HR System** (employee master data) and an **IT Ticket System**. Each has
+  has: an **HR System** (employee master data) and **IT-Demand**. Each has
   its own look, its own "Sync" affordance, and its own data. The demo is scoped to the
   IT Service Support and Cybersecurity units — HR only shows employees in those units,
   and tickets can only be routed to them.
@@ -27,7 +27,7 @@ looking distinct:
   the systems above.
 
 A core rule baked into the data model: **tickets are assigned to a unit, not a
-person.** The IT Ticket System only knows which team owns a piece of work; deciding
+person.** IT-Demand only knows which team owns a piece of work; deciding
 which employee on that team actually picks it up happens inside WorkLens, on the
 Supervisor **Tasks** page.
 
@@ -105,7 +105,7 @@ un-pauses it.
 
 | Area | Pages |
 |---|---|
-| Enterprise Systems | Gateway (`/`), HR System, IT Ticket System |
+| Enterprise Systems | Gateway (`/`), HR System, IT-Demand |
 | WorkLens | Landing page, Supervisor login, Employee login |
 | Supervisor | Dashboard, Team Capacity, Calendar, Tasks, What-If Simulator, Handover Planner |
 | Employee | Dashboard, My Work, My Skills, Handover Requests |

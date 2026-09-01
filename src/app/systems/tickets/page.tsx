@@ -62,7 +62,7 @@ export default function TicketSystemPage() {
       </Link>
 
       <SourceSystemHeader
-        system={{ ...system, name: "IT Ticket System", subtitle: "Operational Support & Service Requests" }}
+        system={{ ...system, name: "IT-Demand", subtitle: "Operational Support & Service Requests" }}
         actions={
           <div className="flex items-center gap-2">
             <button

@@ -12,9 +12,9 @@ function nowIso(): string {
 }
 
 // The one genuinely shared, cross-system store in this prototype: it's written to by
-// the IT Ticket System pages and read by WorkLens (Work queue, employee ticket lists),
+// the IT-Demand pages and read by WorkLens (Work queue, employee ticket lists),
 // which is exactly the "existing systems are the source, WorkLens consumes it" story —
-// a ticket created in the IT Ticket System becomes visible workload in WorkLens without
+// a ticket created in IT-Demand becomes visible workload in WorkLens without
 // a page reload. Assignment to a specific employee happens only on the WorkLens side.
 // Backed by Supabase so this is true across devices, not just across pages in one tab.
 const TABLE = "tickets";
@@ -33,7 +33,11 @@ interface TicketsContextValue {
   loading: boolean;
   error: string | null;
   addTicket: (ticket: Omit<AssignedTicket, "id" | "resolvedDate">) => Promise<void>;
-  updateTicketStatus: (id: string, status: TicketStatus) => Promise<void>;
+  /** Update a ticket's status. Completing it stamps `resolvedDate` (today) — the
+   * completion date shown across the app — and frees the item from every assignee's
+   * capacity; moving it back out of Completed clears that date. Setting it On Hold
+   * records the given hold window (start + expected end); any other status clears it. */
+  updateTicketStatus: (id: string, status: TicketStatus, hold?: { holdStartDate: string; holdEndDate: string }) => Promise<void>;
   updateTicketPriority: (id: string, priority: TicketPriority) => Promise<void>;
   updateTicketSkills: (id: string, relatedSkills: string[]) => Promise<void>;
   /** Sets the ticket's expected resolution date (an explicit deadline). */
@@ -74,11 +78,15 @@ export function TicketsProvider({ children }: { children: ReactNode }) {
   );
 
   const updateTicketStatus = useCallback(
-    async (id: string, status: TicketStatus) => {
+    async (id: string, status: TicketStatus, hold?: { holdStartDate: string; holdEndDate: string }) => {
       const current = tickets.find((t) => t.id === id);
       const patch: Partial<AssignedTicket> = {
         status,
-        resolvedDate: status === "Completed" ? (current?.resolvedDate ?? todayLabel()) : current?.resolvedDate,
+        // Completion date — set once on entering Completed, cleared on leaving it.
+        resolvedDate: status === "Completed" ? (current?.resolvedDate ?? todayLabel()) : null,
+        // Hold window — kept only while On Hold.
+        holdStartDate: status === "On Hold" ? (hold?.holdStartDate ?? current?.holdStartDate ?? null) : null,
+        holdEndDate: status === "On Hold" ? (hold?.holdEndDate ?? current?.holdEndDate ?? null) : null,
         activityAt: nowIso(),
       };
       const { error: updateError } = await supabase.from(TABLE).update(patch).eq("id", id);

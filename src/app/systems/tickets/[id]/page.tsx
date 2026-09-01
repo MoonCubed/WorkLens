@@ -15,6 +15,7 @@ import { useEmployees } from "@/store/employees-store";
 import { slaWindowLabel, isSlaDerived } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
 import { ticketEffortForEmployee } from "@/lib/capacityEngine";
+import { StatusChangeDialog, type HoldDates } from "@/components/work/StatusChangeDialog";
 
 const STATUS_OPTIONS: TicketStatus[] = TICKET_STATUS_OPTIONS;
 
@@ -27,13 +28,14 @@ export default function TicketDetailPage() {
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [pendingStatus, setPendingStatus] = useState<"Completed" | "On Hold" | null>(null);
 
   if (!ticket) {
     return (
       <SystemPageShell>
         <Link href="/systems/tickets" className="inline-flex items-center gap-1.5 text-sm text-ink-secondary hover:text-ink">
           <ArrowLeft className="h-4 w-4" />
-          Back to IT Ticket System
+          Back to IT-Demand
         </Link>
         <p className="text-sm text-ink-muted">Incident not found.</p>
       </SystemPageShell>
@@ -54,26 +56,36 @@ export default function TicketDetailPage() {
           .map((e) => (assignees.length > 1 ? `${e.name} (${ticketEffortForEmployee(ticket!, e.id)}h)` : e.name))
           .join(", ");
 
-  async function handleSave() {
-    if (currentStatus === ticket!.status) return;
+  async function commitStatus(next: TicketStatus, hold?: HoldDates) {
     setSaving(true);
     setSaveError(null);
     try {
-      await updateTicketStatus(ticket!.id, currentStatus);
+      await updateTicketStatus(ticket!.id, next, hold);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 2500);
     } catch {
       setSaveError("Couldn't save — check your connection and try again.");
     } finally {
       setSaving(false);
+      setPendingStatus(null);
     }
+  }
+
+  function handleSave() {
+    if (currentStatus === ticket!.status) return;
+    // Completing or holding pauses for the same confirmation the WorkLens views use.
+    if (currentStatus === "Completed" || currentStatus === "On Hold") {
+      setPendingStatus(currentStatus);
+      return;
+    }
+    commitStatus(currentStatus);
   }
 
   return (
     <SystemPageShell>
       <Link href="/systems/tickets" className="inline-flex items-center gap-1.5 text-sm text-ink-secondary hover:text-ink">
         <ArrowLeft className="h-4 w-4" />
-        Back to IT Ticket System
+        Back to IT-Demand
       </Link>
 
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -110,7 +122,14 @@ export default function TicketDetailPage() {
               : "The explicit resolution date set on this incident."
           }
         />
-        <Detail label="Resolved Date" value={ticket.resolvedDate ?? "—"} />
+        <Detail label="Completion Date" value={ticket.resolvedDate ?? "—"} />
+        {ticket.status === "On Hold" && (ticket.holdStartDate || ticket.holdEndDate) && (
+          <Detail
+            label="On Hold"
+            value={`${ticket.holdStartDate ?? "?"} – ${ticket.holdEndDate ?? "?"}`}
+            info="The hold period entered when this incident was put on hold. An on-hold incident still consumes the assignee's capacity."
+          />
+        )}
         <Detail label="Created By" value={ticket.createdBy} />
         <Detail label="Assigned By" value={ticket.assignedBy} />
         <Detail
@@ -128,38 +147,55 @@ export default function TicketDetailPage() {
 
       <Card>
         <CardHeader title="Status" subtitle="Update the incident's lifecycle status" />
-        <div className="flex flex-wrap items-center gap-3">
-          <select
-            value={currentStatus}
-            onChange={(e) => setStatus(e.target.value as TicketStatus)}
-            className="input max-w-[220px]"
-          >
-            {STATUS_OPTIONS.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
-          >
-            {saving ? "Saving…" : "Save Changes"}
-          </button>
-          {saved && (
-            <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--status-good)]">
-              <CheckCircle2 className="h-4 w-4" />
-              Saved
-            </span>
-          )}
-          {saveError && <span className="text-sm font-medium text-[var(--status-critical)]">{saveError}</span>}
-        </div>
+        {ticket.status === "Completed" ? (
+          <div className="flex items-center gap-2 rounded-lg border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-3.5 py-3 text-sm font-medium text-[var(--status-good)]">
+            <CheckCircle2 className="h-4 w-4" />
+            Completed{ticket.resolvedDate ? ` on ${ticket.resolvedDate}` : ""} — this incident is closed and its status
+            can no longer be changed.
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-3">
+            <select
+              value={currentStatus}
+              onChange={(e) => setStatus(e.target.value as TicketStatus)}
+              className="input max-w-[220px]"
+            >
+              {STATUS_OPTIONS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
+            >
+              {saving ? "Saving…" : "Save Changes"}
+            </button>
+            {saved && (
+              <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--status-good)]">
+                <CheckCircle2 className="h-4 w-4" />
+                Saved
+              </span>
+            )}
+            {saveError && <span className="text-sm font-medium text-[var(--status-critical)]">{saveError}</span>}
+          </div>
+        )}
       </Card>
 
       <SourceSystemNotice>
         This incident is assigned to a unit only. Employee assignment happens later, inside WorkLens.
       </SourceSystemNotice>
+
+      {pendingStatus && (
+        <StatusChangeDialog
+          target={pendingStatus}
+          itemTitle={ticket.title}
+          onCancel={() => setPendingStatus(null)}
+          onConfirm={(hold) => commitStatus(pendingStatus, hold)}
+        />
+      )}
     </SystemPageShell>
   );
 }

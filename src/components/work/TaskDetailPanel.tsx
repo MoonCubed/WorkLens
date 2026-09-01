@@ -1,9 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { X } from "lucide-react";
+import { Lock, X } from "lucide-react";
 import { CommentsThread } from "@/components/work/CommentsThread";
 import { SkillSelect } from "@/components/skills/SkillSelect";
+import { StatusChangeDialog, type HoldDates } from "@/components/work/StatusChangeDialog";
 import type { AssignedTicket } from "@/store/tickets-store";
 import type { Employee } from "@/data/types";
 import { TICKET_STATUS_OPTIONS, type TicketStatus, type TicketPriority } from "@/data/tickets";
@@ -50,7 +51,9 @@ export function TaskDetailPanel({
    * Candidates, so the panel only shows who is assigned. Defaults to true. */
   assigneeEditing?: boolean;
   onClose: () => void;
-  onUpdateStatus: (status: TicketStatus) => void;
+  /** Completing or holding a ticket routes through a confirmation first; `hold`
+   * carries the hold window when the target status is "On Hold". */
+  onUpdateStatus: (status: TicketStatus, hold?: HoldDates) => void;
   onUpdatePriority: (priority: TicketPriority) => void;
   onUpdateSkills: (skills: string[]) => void;
   onUpdateAssignees: (employeeIds: string[], effortSplit?: Record<string, number>) => void;
@@ -64,6 +67,7 @@ export function TaskDetailPanel({
   const availableToAdd = employees.filter((e) => !assigneeIds.includes(e.id));
 
   const [skillDraft, setSkillDraft] = useState("");
+  const [pendingStatus, setPendingStatus] = useState<"Completed" | "On Hold" | null>(null);
   const [addAssigneeId, setAddAssigneeId] = useState("");
   const [splitHours, setSplitHours] = useState<number>(() =>
     assigneeIds.length === 2 ? ticketEffortForEmployee(ticket, assigneeIds[0]) : 0
@@ -125,17 +129,31 @@ export function TaskDetailPanel({
         <div className="flex flex-wrap items-center gap-3 mb-4">
           <label className="flex items-center gap-2 text-xs">
             <span className="font-medium uppercase tracking-wide text-ink-secondary">Status</span>
-            <select
-              value={ticket.status}
-              onChange={(e) => onUpdateStatus(e.target.value as TicketStatus)}
-              className="input max-w-[160px]"
-            >
-              {TICKET_STATUS_OPTIONS.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
+            {ticket.status === "Completed" ? (
+              <span
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-2.5 py-2 font-medium text-[var(--status-good)]"
+                title="A completed task is locked and can't be reopened."
+              >
+                <Lock className="h-3.5 w-3.5" />
+                Completed
+              </span>
+            ) : (
+              <select
+                value={ticket.status}
+                onChange={(e) => {
+                  const next = e.target.value as TicketStatus;
+                  if (next === "Completed" || next === "On Hold") setPendingStatus(next);
+                  else onUpdateStatus(next);
+                }}
+                className="input max-w-[160px]"
+              >
+                {TICKET_STATUS_OPTIONS.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
           <label className="flex items-center gap-2 text-xs">
             <span className="font-medium uppercase tracking-wide text-ink-secondary">Priority</span>
@@ -162,10 +180,17 @@ export function TaskDetailPanel({
           <Detail label="Raised" value={ticket.raisedDate} />
           <Detail label="Estimated" value={`${ticket.estimatedHours}h`} />
           <Detail label="SLA" value={slaWindowLabel(ticket.priority)} />
-          <Detail label="Due" value={slaDerived ? `${dueLabel} (SLA)` : dueLabel} />
+          {ticket.status === "Completed" ? (
+            <Detail label="Completion Date" value={ticket.resolvedDate ?? "—"} />
+          ) : (
+            <Detail label="Due" value={slaDerived ? `${dueLabel} (SLA)` : dueLabel} />
+          )}
           <Detail label="Assigned Unit" value={ticket.assignedUnit} />
           <Detail label="Created By" value={ticket.createdBy} />
           <Detail label="Assigned By" value={ticket.assignedBy} />
+          {ticket.status === "On Hold" && (ticket.holdStartDate || ticket.holdEndDate) && (
+            <Detail label="On Hold" value={`${ticket.holdStartDate ?? "?"} – ${ticket.holdEndDate ?? "?"}`} />
+          )}
         </div>
 
         <div className="mt-6">
@@ -295,6 +320,18 @@ export function TaskDetailPanel({
           )}
         </div>
       </div>
+
+      {pendingStatus && (
+        <StatusChangeDialog
+          target={pendingStatus}
+          itemTitle={ticket.title}
+          onCancel={() => setPendingStatus(null)}
+          onConfirm={(hold) => {
+            onUpdateStatus(pendingStatus, hold);
+            setPendingStatus(null);
+          }}
+        />
+      )}
     </div>
   );
 }

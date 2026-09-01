@@ -18,7 +18,10 @@ import { useWorkLog } from "@/store/work-log-store";
 import { getDepartmentSupervisor } from "@/lib/hr";
 import { computeEmployeeCapacity, ticketEffortForEmployee } from "@/lib/capacityEngine";
 import { ticketDueLabel, seedTicketDueLabel, adhocDueLabel } from "@/lib/due";
+import type { TicketStatus } from "@/data/tickets";
 import { useTickets } from "@/store/tickets-store";
+import { useSkillChangeRequests } from "@/store/skill-change-requests-store";
+import type { HoldDates } from "@/components/work/StatusChangeDialog";
 
 const SKILL_LEVELS: SkillLevel[] = ["Beginner", "Intermediate", "Advanced", "Expert"];
 
@@ -26,8 +29,10 @@ export default function EmployeeDetailsPage() {
   const params = useParams<{ id: string }>();
   const { employees, updateEmployee } = useEmployees();
   const employee = employees.find((e) => e.id === params.id);
-  const { tickets } = useTickets();
+  const { tickets, updateTicketStatus } = useTickets();
   const { getEntry } = useWorkLog();
+  const { requests: skillChangeRequests } = useSkillChangeRequests();
+  const pendingSkillChanges = skillChangeRequests.filter((r) => r.employeeId === params.id && r.status === "Pending");
   const { unit } = useSupervisorSession();
   const currentUserName = getDepartmentSupervisor(unit, employees)?.name ?? "Supervisor";
   const [skillDraft, setSkillDraft] = useState("");
@@ -90,8 +95,19 @@ export default function EmployeeDetailsPage() {
       priority: t.priority,
       deadline: ticketDueLabel(t),
       estimatedHours: ticketEffortForEmployee(t, employee.id),
+      ticketId: t.id,
+      ticketStatus: t.status,
+      ticketResolvedDate: t.resolvedDate,
+      ticketHoldStart: t.holdStartDate ?? null,
+      ticketHoldEnd: t.holdEndDate ?? null,
     })),
   ];
+  // The supervisor can move a ticket's lifecycle status from this page too — same
+  // shared field the employee and IT-Demand edit.
+  const updateTicketStatusSafe = (id: string, status: TicketStatus, hold?: HoldDates) =>
+    updateTicketStatus(id, status, hold).catch(() =>
+      setSkillError("Couldn't update the task status — check your connection and try again.")
+    );
   const adhocRows: WorkRow[] = employee.adhoc.map((a) => ({
     key: `${employee.id}:${a.id}`,
     title: a.name,
@@ -127,7 +143,14 @@ export default function EmployeeDetailsPage() {
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <StatusBadge utilization={capacity.utilization} />
+          {capacity.onLeave ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-warning)]">
+              <Repeat2 className="h-3 w-3" />
+              On Leave
+            </span>
+          ) : (
+            <StatusBadge utilization={capacity.utilization} />
+          )}
           <Link
             href={`/supervisor/handover?employee=${employee.id}`}
             className="inline-flex items-center gap-2 rounded-lg border border-border-strong bg-surface px-3.5 py-2 text-sm font-medium text-ink hover:bg-brand-50"
@@ -154,15 +177,25 @@ export default function EmployeeDetailsPage() {
         <Card>
           <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Available Capacity</p>
           <p className="mt-1.5 text-2xl font-semibold text-ink tabular">
-            {Math.max(0, 100 - capacity.utilization)}%{" "}
+            {capacity.availablePercent}%{" "}
             <span className="text-base font-normal text-ink-muted">· {capacity.availableHours}h</span>
           </p>
+          {capacity.onLeave && <p className="mt-1 text-xs text-[var(--status-warning)]">Currently on leave — unavailable for assignment</p>}
         </Card>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader title="Skills" subtitle="Editable — changes reflect in the HR System too" />
+          {pendingSkillChanges.length > 0 && (
+            <Link
+              href="/supervisor/skills"
+              className="mb-3 flex items-center justify-between gap-2 rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs font-medium text-[var(--status-warning)] hover:brightness-[0.98]"
+            >
+              {pendingSkillChanges.length} skill change{pendingSkillChanges.length === 1 ? "" : "s"} from {employee.name.split(" ")[0]} awaiting review
+              <ArrowLeft className="h-3.5 w-3.5 rotate-180" />
+            </Link>
+          )}
           <div className="space-y-3.5">
             {employee.skills.map((s) => (
               <div key={s.name} className="flex items-center justify-between gap-4">
@@ -234,7 +267,12 @@ export default function EmployeeDetailsPage() {
             ) : (
               <div className="space-y-3">
                 {ticketRows.map((row) => (
-                  <WorkItemRow key={row.key} row={row} currentUserName={currentUserName} />
+                  <WorkItemRow
+                    key={row.key}
+                    row={row}
+                    currentUserName={currentUserName}
+                    onUpdateTicketStatus={updateTicketStatusSafe}
+                  />
                 ))}
               </div>
             )}

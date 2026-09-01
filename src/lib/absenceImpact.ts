@@ -265,7 +265,8 @@ function coverageCandidatesForItem(
       return {
         employee: c.employee,
         utilization: c.employee.currentUtilization,
-        availableCapacity: c.availableCapacity,
+        // On leave during the window → no availability to offer.
+        availableCapacity: onLeave ? 0 : c.availableCapacity,
         projectedCapacity: c.projectedCapacity,
         skillMatch: c.skillMatch,
         matchedSkills: c.matchedSkills,

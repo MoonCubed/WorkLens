@@ -19,6 +19,7 @@ interface EmployeesContextValue {
   error: string | null;
   addEmployee: (employee: Employee) => Promise<void>;
   updateEmployee: (id: string, patch: Partial<Employee>) => Promise<void>;
+  removeEmployee: (id: string) => Promise<void>;
 }
 
 const EmployeesContext = createContext<EmployeesContextValue | null>(null);
@@ -44,9 +45,24 @@ export function EmployeesProvider({ children }: { children: ReactNode }) {
     [refetch]
   );
 
+  const removeEmployee = useCallback(
+    async (id: string) => {
+      // `.select()` returns the rows actually deleted — an empty result means the
+      // row was filtered out by RLS (the DB is missing the employees delete policy
+      // from supabase/schema.sql), which Postgres reports without an error.
+      const { data, error: deleteError } = await supabase.from(TABLE).delete().eq("id", id).select();
+      if (deleteError) throw deleteError;
+      if (!data || data.length === 0) {
+        throw new Error("Delete was blocked by the database — apply the latest supabase/schema.sql.");
+      }
+      await refetch();
+    },
+    [refetch]
+  );
+
   const value = useMemo(
-    () => ({ employees, loading, error, addEmployee, updateEmployee }),
-    [employees, loading, error, addEmployee, updateEmployee]
+    () => ({ employees, loading, error, addEmployee, updateEmployee, removeEmployee }),
+    [employees, loading, error, addEmployee, updateEmployee, removeEmployee]
   );
 
   return <EmployeesContext.Provider value={value}>{children}</EmployeesContext.Provider>;

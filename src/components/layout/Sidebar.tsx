@@ -6,7 +6,13 @@ import { Building2, Home } from "lucide-react";
 import { EMPLOYEE_NAV, SUPERVISOR_NAV } from "./nav-config";
 import { Logo } from "@/components/ui/Logo";
 
-export function Sidebar({ role }: { role: "supervisor" | "employee" }) {
+export function Sidebar({
+  role,
+  badges,
+}: {
+  role: "supervisor" | "employee";
+  badges?: Record<string, number>;
+}) {
   const pathname = usePathname();
   const items = role === "supervisor" ? SUPERVISOR_NAV : EMPLOYEE_NAV;
 
@@ -25,7 +31,12 @@ export function Sidebar({ role }: { role: "supervisor" | "employee" }) {
           </p>
           <div className="space-y-0.5">
             {items.map((item) => (
-              <NavLink key={item.href} item={item} active={pathname === item.href} />
+              <NavLink
+                key={item.href}
+                item={item}
+                active={pathname === item.href}
+                badge={badges?.[item.href] ?? 0}
+              />
             ))}
           </div>
         </div>
@@ -55,9 +66,11 @@ export function Sidebar({ role }: { role: "supervisor" | "employee" }) {
 function NavLink({
   item,
   active,
+  badge,
 }: {
   item: { label: string; href: string; icon: (typeof SUPERVISOR_NAV)[number]["icon"] };
   active: boolean;
+  badge: number;
 }) {
   const Icon = item.icon;
   return (
@@ -70,7 +83,15 @@ function NavLink({
       }`}
     >
       <Icon className="h-4 w-4 shrink-0" strokeWidth={1.75} />
-      {item.label}
+      <span className="flex-1">{item.label}</span>
+      {badge > 0 && (
+        <span
+          className="ml-auto inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-brand-600 px-1 text-[10px] font-semibold leading-none text-white"
+          aria-label={`${badge} pending`}
+        >
+          {badge}
+        </span>
+      )}
     </Link>
   );
 }

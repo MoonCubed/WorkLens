@@ -1,9 +1,11 @@
 -- WorkLens shared backend schema.
 --
--- Run this once in the Supabase project's SQL editor (Database > SQL Editor >
--- New query). Safe to re-run: tables use IF NOT EXISTS, policies are dropped
--- and recreated, and the realtime publication grant is wrapped to ignore
--- "already added" errors.
+-- Run this in the Supabase project's SQL editor (Database > SQL Editor > New
+-- query). Works on a brand-new database and is safe to re-run: tables use
+-- IF NOT EXISTS, columns use ADD COLUMN IF NOT EXISTS, policies are dropped and
+-- recreated, legacy-data migrations that reference columns a fresh install never
+-- had are wrapped to swallow "does not exist", and the realtime publication
+-- grant ignores "already added" errors.
 --
 -- Column names intentionally match the app's existing TypeScript field names
 -- exactly (camelCase, quoted) rather than the usual snake_case Postgres
@@ -54,12 +56,20 @@ create table if not exists tickets (
   "slaHours" numeric,
   "expectedResolutionDate" text,
   "resolvedDate" text,
+  "holdStartDate" text,
+  "holdEndDate" text,
   "createdBy" text,
   "assignedBy" text,
   "relatedSkills" jsonb,
   "createdAt" timestamptz not null default now(),
   "updatedAt" timestamptz not null default now()
 );
+
+-- Projects/tickets set to "On Hold" now capture the hold window (start + expected
+-- end) so the pause is visible in the task details and capacity can reason about it.
+-- Completion is recorded on "resolvedDate" (set the moment status becomes Completed).
+alter table tickets add column if not exists "holdStartDate" text;
+alter table tickets add column if not exists "holdEndDate" text;
 
 -- Migration for projects that already ran an earlier version of this file, before a
 -- ticket could be shared by 2 employees — adds "assignedEmployeeIds" (a list) and
@@ -73,14 +83,12 @@ where "assignedEmployeeId" is not null and "assignedEmployeeIds" = '[]'::jsonb;
 
 -- Task statuses are now just In Progress / On Hold / Completed. Collapse any earlier
 -- values (Open, Resolved, Closed, Blocked, Not Started, Queued) onto the new set.
+-- (The matching work_log_entries collapse runs after that table is created, below.)
 -- Safe to re-run.
 alter table tickets add column if not exists "effortSplit" jsonb;
 alter table tickets add column if not exists "activityAt" text;
 update tickets set status = 'Completed' where status in ('Resolved', 'Closed');
 update tickets set status = 'In Progress' where status not in ('In Progress', 'On Hold', 'Completed');
-update work_log_entries set "workflowStatus" = 'On Hold' where "workflowStatus" = 'Blocked';
-update work_log_entries set "workflowStatus" = 'In Progress'
-  where "workflowStatus" is not null and "workflowStatus" not in ('In Progress', 'On Hold', 'Completed');
 
 -- Migration for projects that already ran an earlier version of this file (the
 -- CREATE TABLE above only applies to a fresh install) — adds the "level" column
@@ -98,7 +106,13 @@ update employees set "level" = 'Supervisor'
 -- drop the NOT NULL constraint so it stops rejecting new employee inserts on
 -- projects that ran an earlier version of this file. The column itself is
 -- left in place rather than dropped, since it may still hold historical data.
-alter table employees alter column title drop not null;
+-- (Wrapped so a fresh install, where the column never existed, doesn't error.)
+do $$
+begin
+  alter table employees alter column title drop not null;
+exception
+  when undefined_column then null;
+end $$;
 
 update employees set "supervisorId" = 'ahmed-al-hassan' where department = 'Data & Analytics' and id <> 'ahmed-al-hassan';
 update employees set "supervisorId" = 'saad-al-dawsari' where department = 'Digital Solutions' and id <> 'saad-al-dawsari';
@@ -120,7 +134,8 @@ create table if not exists handover_requests (
   "affectedWork" jsonb not null default '[]',
   status text not null,
   "submittedAt" text,
-  "leaveType" text not null default 'Annual Leave',
+  "leaveType" text not null default 'Leave',
+  "preferredEmployeeId" text,
   "createdAt" timestamptz not null default now()
 );
 
@@ -128,13 +143,22 @@ create table if not exists handover_requests (
 -- leaveType existed on handover_requests (every request now doubles as a leave
 -- request — approving it on the supervisor's Handover page adds a matching entry to
 -- the employee's leaveEvents). Safe to re-run.
-alter table handover_requests add column if not exists "leaveType" text not null default 'Annual Leave';
+alter table handover_requests add column if not exists "leaveType" text not null default 'Leave';
+-- The handover workflow's leave type is now always just "Leave"; the employee explains
+-- the reason in the required justification ("note"). They can also nominate a
+-- "preferredEmployeeId" they've pre-coordinated the turnover with — a recommendation
+-- only; the supervisor still makes the final assignment.
+alter table handover_requests add column if not exists "preferredEmployeeId" text;
+alter table handover_requests alter column "leaveType" set default 'Leave';
 
 create table if not exists work_log_entries (
   "employeeId" text not null,
   "itemId" text not null,
   "workflowStatus" text,
   progress integer,
+  "completedAt" text,
+  "holdStartDate" text,
+  "holdEndDate" text,
   comments jsonb not null default '[]',
   "updatedAt" timestamptz not null default now(),
   primary key ("employeeId", "itemId")
@@ -145,6 +169,20 @@ create table if not exists work_log_entries (
 -- calculations use this (0-100, employee-logged) to compute remaining work hours per
 -- item. Safe to re-run.
 alter table work_log_entries add column if not exists progress integer;
+-- "completedAt": the date the assignee marked this item Completed — stored so the
+-- completion date survives a refresh and is visible in every view. Cleared if the item
+-- is moved back out of Completed. "holdStartDate" / "holdEndDate": the hold window when
+-- an item is set to On Hold.
+alter table work_log_entries add column if not exists "completedAt" text;
+alter table work_log_entries add column if not exists "holdStartDate" text;
+alter table work_log_entries add column if not exists "holdEndDate" text;
+
+-- Collapse any earlier workflowStatus values (Blocked, Not Started, ...) onto the
+-- current set. Runs here, after the table is guaranteed to exist; a no-op on a fresh
+-- (empty) database.
+update work_log_entries set "workflowStatus" = 'On Hold' where "workflowStatus" = 'Blocked';
+update work_log_entries set "workflowStatus" = 'In Progress'
+  where "workflowStatus" is not null and "workflowStatus" not in ('In Progress', 'On Hold', 'Completed');
 
 -- Migration for projects that already ran an earlier version of this file — the old
 -- "notes" (employee-private) and "messages" (employee-to-supervisor) columns are
@@ -154,18 +192,24 @@ alter table work_log_entries add column if not exists progress integer;
 -- they were previously always rendered); the old columns are left in place afterwards
 -- rather than dropped, since they may still hold historical data. Safe to re-run.
 alter table work_log_entries add column if not exists comments jsonb not null default '[]';
-update work_log_entries
-set comments = (
-  select coalesce(jsonb_agg(elem), '[]'::jsonb)
-  from (
-    select jsonb_build_object('text', n->>'text', 'at', n->>'at', 'author', 'Employee') as elem
-    from jsonb_array_elements(coalesce(notes, '[]'::jsonb)) as n
-    union all
-    select jsonb_build_object('text', m->>'text', 'at', m->>'at', 'author', 'Employee') as elem
-    from jsonb_array_elements(coalesce(messages, '[]'::jsonb)) as m
-  ) merged
-)
-where comments = '[]'::jsonb and (jsonb_array_length(coalesce(notes, '[]'::jsonb)) > 0 or jsonb_array_length(coalesce(messages, '[]'::jsonb)) > 0);
+-- Wrapped so a fresh install, where "notes" / "messages" never existed, doesn't error.
+do $$
+begin
+  update work_log_entries
+  set comments = (
+    select coalesce(jsonb_agg(elem), '[]'::jsonb)
+    from (
+      select jsonb_build_object('text', n->>'text', 'at', n->>'at', 'author', 'Employee') as elem
+      from jsonb_array_elements(coalesce(notes, '[]'::jsonb)) as n
+      union all
+      select jsonb_build_object('text', m->>'text', 'at', m->>'at', 'author', 'Employee') as elem
+      from jsonb_array_elements(coalesce(messages, '[]'::jsonb)) as m
+    ) merged
+  )
+  where comments = '[]'::jsonb and (jsonb_array_length(coalesce(notes, '[]'::jsonb)) > 0 or jsonb_array_length(coalesce(messages, '[]'::jsonb)) > 0);
+exception
+  when undefined_column then null;
+end $$;
 
 -- The central skills catalogue — one shared list every skill picker in the app
 -- selects from (employee skills, ticket skill requirements, What-If, filters).
@@ -213,14 +257,32 @@ create table if not exists task_adjustment_requests (
   "submittedAt" text not null
 );
 
+-- Skill-change requests — an employee's edits to their own skills (add / remove /
+-- change level) are NOT written straight to the official HR skill record. Each edit
+-- becomes a pending request the supervisor reviews (Supervisor -> Skills); only on
+-- approval is the employee's skills list actually updated.
+create table if not exists skill_change_requests (
+  id text primary key,
+  "employeeId" text not null,
+  kind text not null,                    -- 'add' | 'remove' | 'update'
+  "skillName" text not null,
+  "skillLevel" text,                     -- target level for 'add' / 'update'
+  "previousLevel" text,                  -- current level for 'remove' / 'update'
+  status text not null default 'Pending', -- 'Pending' | 'Approved' | 'Rejected'
+  "submittedAt" text not null,
+  "reviewedAt" text,
+  "createdAt" timestamptz not null default now()
+);
+
 -- ============================================================================
 -- Row Level Security
 --
 -- This is a prototype with no real per-user login (both "supervisor" and
 -- "employee" sign-in are identity pickers, not authentication), so policies
 -- are intentionally permissive: anyone with the anon key (i.e. anyone with the
--- deployed URL) can read and write every table. There is no delete policy —
--- the app never deletes rows. See the README for this tradeoff.
+-- deployed URL) can read and write every table. The only delete policy is on
+-- `employees` (the HR System can remove a person from the master dataset);
+-- every other table is insert/update-only. See the README for this tradeoff.
 -- ============================================================================
 
 alter table employees enable row level security;
@@ -230,19 +292,25 @@ alter table work_log_entries enable row level security;
 alter table calendar_events enable row level security;
 alter table skills enable row level security;
 alter table task_adjustment_requests enable row level security;
+alter table skill_change_requests enable row level security;
 
 -- RLS policies alone aren't enough — Postgres also requires the base table-level
 -- privilege grant. New tables don't always inherit Supabase's default grants for
 -- anon/authenticated, which surfaces as "permission denied for table X" even with
 -- correct RLS policies in place. Grant explicitly so this isn't environment-dependent.
-grant select, insert, update on employees, tickets, handover_requests, work_log_entries, calendar_events, skills, task_adjustment_requests to anon, authenticated;
+grant select, insert, update on employees, tickets, handover_requests, work_log_entries, calendar_events, skills, task_adjustment_requests, skill_change_requests to anon, authenticated;
+-- The HR System is the one place allowed to remove a person from the master
+-- dataset, so employees (alone) also needs the delete privilege + policy.
+grant delete on employees to anon, authenticated;
 
 drop policy if exists "anon select" on employees;
 drop policy if exists "anon insert" on employees;
 drop policy if exists "anon update" on employees;
+drop policy if exists "anon delete" on employees;
 create policy "anon select" on employees for select to anon, authenticated using (true);
 create policy "anon insert" on employees for insert to anon, authenticated with check (true);
 create policy "anon update" on employees for update to anon, authenticated using (true) with check (true);
+create policy "anon delete" on employees for delete to anon, authenticated using (true);
 
 drop policy if exists "anon select" on tickets;
 drop policy if exists "anon insert" on tickets;
@@ -289,13 +357,30 @@ create policy "anon select" on task_adjustment_requests for select to anon, auth
 create policy "anon insert" on task_adjustment_requests for insert to anon, authenticated with check (true);
 create policy "anon update" on task_adjustment_requests for update to anon, authenticated using (true) with check (true);
 
+drop policy if exists "anon select" on skill_change_requests;
+drop policy if exists "anon insert" on skill_change_requests;
+drop policy if exists "anon update" on skill_change_requests;
+create policy "anon select" on skill_change_requests for select to anon, authenticated using (true);
+create policy "anon insert" on skill_change_requests for insert to anon, authenticated with check (true);
+create policy "anon update" on skill_change_requests for update to anon, authenticated using (true) with check (true);
+
 -- ============================================================================
 -- Realtime — lets other devices see writes without a manual refresh.
 -- ============================================================================
 
 do $$
 begin
-  alter publication supabase_realtime add table employees, tickets, handover_requests, work_log_entries, calendar_events, skills, task_adjustment_requests;
+  alter publication supabase_realtime add table employees, tickets, handover_requests, work_log_entries, calendar_events, skills, task_adjustment_requests, skill_change_requests;
+exception
+  when duplicate_object then null;
+end $$;
+
+-- Added separately so projects that already published the earlier table set (which
+-- makes the combined ALTER above abort with duplicate_object before it reaches the
+-- new table) still get skill_change_requests onto the realtime publication.
+do $$
+begin
+  alter publication supabase_realtime add table skill_change_requests;
 exception
   when duplicate_object then null;
 end $$;

@@ -1,6 +1,6 @@
-// Mock response shape for the IT Ticket System's API, e.g. GET /api/tickets.
+// Mock response shape for IT-Demand's API, e.g. GET /api/tickets.
 //
-// Tickets are assigned to a UNIT, not an employee — the IT Ticket System only knows
+// Tickets are assigned to a UNIT, not an employee — IT-Demand only knows
 // which team owns the work. WorkLens is where a supervisor decides which employee on
 // that team actually picks it up (see the tickets store for that bridge).
 
@@ -22,7 +22,13 @@ export interface Ticket {
   estimatedHours: number;
   slaHours: number;
   expectedResolutionDate: string;
+  /** Set the moment status becomes "Completed" — the item's completion date, shown
+   * across every view and cleared if it's moved back out of Completed. */
   resolvedDate: string | null;
+  /** The hold window, captured when status is set to "On Hold" (both "26 Aug 2026"
+   * style). An on-hold ticket still consumes capacity — it is not completed. */
+  holdStartDate?: string | null;
+  holdEndDate?: string | null;
   createdBy: string;
   assignedBy: string;
   /** Skills this ticket calls for, when the category makes that clear — used to suggest

@@ -26,7 +26,7 @@ export const KPI_EXPLAINERS: Record<string, KpiExplainer> = {
     example: "2 employees with annual leave covering 26 Aug = 2 on leave",
   },
   openTickets: {
-    meaning: "Tickets from the IT Ticket System assigned to this unit that aren't completed yet.",
+    meaning: "Tickets from IT-Demand assigned to this unit that aren't completed yet.",
     calculation: "Count of synced tickets where Assigned Unit = this unit and Status is not Completed",
     example: "5 in progress + 2 on hold = 7 open tickets",
   },

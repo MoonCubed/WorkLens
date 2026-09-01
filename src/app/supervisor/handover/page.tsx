@@ -12,6 +12,9 @@ import { useSupervisorSession } from "@/store/session-store";
 import { getDepartmentSupervisor, getUnitTeam } from "@/lib/hr";
 import { findLeaveOverlaps, countWorkingDays } from "@/lib/absenceImpact";
 import { parseLooseDate } from "@/lib/date";
+import { isCurrentlyOnLeave, projectedUtilization } from "@/lib/capacityEngine";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
+import { useWorkLog } from "@/store/work-log-store";
 
 function nextLeaveId(existing: LeaveEvent[]): string {
   const numbers = existing.map((l) => Number(l.id.replace("l", ""))).filter((n) => !Number.isNaN(n));
@@ -24,7 +27,8 @@ export default function HandoverPlannerPage() {
   const { employees, updateEmployee } = useEmployees();
   const { requests, markReviewed } = useHandoverRequests();
   const { tickets } = useTickets();
-  const [review, setReview] = useState<{ employeeId: string; start: string; end: string } | null>(null);
+  const { getEntry } = useWorkLog();
+  const [review, setReview] = useState<{ employeeId: string; start: string; end: string; preferredId?: string | null } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const unitEmployees = useMemo(() => getUnitTeam(unit, employees), [employees, unit]);
@@ -39,7 +43,7 @@ export default function HandoverPlannerPage() {
     if (!employee) return;
     const leave: LeaveEvent = {
       id: nextLeaveId(employee.leaveEvents),
-      type: r.leaveType ?? "Annual Leave",
+      type: "Leave",
       start: r.startDate,
       end: r.endDate,
       status: "Approved",
@@ -96,15 +100,61 @@ export default function HandoverPlannerPage() {
               const overlaps =
                 reqStart && reqEnd ? findLeaveOverlaps(r.employeeId, reqStart, reqEnd, unitEmployees, pending) : [];
               const workingDays = reqStart && reqEnd ? countWorkingDays(reqStart, reqEnd) : null;
+
+              // Preferred cover: show their current utilization, and what taking on the
+              // absentee's assigned ticket workload would do to it — flag if that tips
+              // them over the overload threshold. It's a recommendation, not a decision.
+              const preferred = r.preferredEmployeeId
+                ? employees.find((e) => e.id === r.preferredEmployeeId)
+                : undefined;
+              const transferHours = tickets
+                .filter((t) => (t.assignedEmployeeIds ?? []).includes(r.employeeId) && t.status !== "Completed")
+                .reduce((sum, t) => sum + (t.estimatedHours || 0), 0);
+              const preferredProjected = preferred
+                ? projectedUtilization(preferred, tickets, getEntry, transferHours)
+                : null;
+              const preferredOverloaded = preferredProjected !== null && preferredProjected >= OVERLOAD_THRESHOLD;
+
               return (
                 <li key={r.id} className="flex flex-wrap items-start justify-between gap-3 py-3.5">
                   <div>
                     <p className="text-sm font-medium text-ink">{employee?.name ?? r.employeeId}</p>
                     <p className="text-xs text-ink-muted mt-0.5">
-                      {r.leaveType ?? "Leave"} · {r.startDate} – {r.endDate}
+                      Leave · {r.startDate} – {r.endDate}
                       {workingDays !== null && ` · ${workingDays} working day${workingDays === 1 ? "" : "s"}`}
                     </p>
                     {r.note && <p className="text-xs text-ink-secondary mt-1 italic">&ldquo;{r.note}&rdquo;</p>}
+
+                    {preferred && (
+                      <div
+                        className={`mt-2 rounded-lg border px-3 py-2 text-xs ${
+                          preferredOverloaded
+                            ? "border-[var(--status-critical-border)] bg-[var(--status-critical-bg)]"
+                            : "border-brand-100 bg-brand-50/60"
+                        }`}
+                      >
+                        <p className="font-medium text-ink">
+                          Preferred cover: {preferred.name}
+                          {isCurrentlyOnLeave(preferred) ? " (currently on leave)" : ""}
+                        </p>
+                        <p className="mt-0.5 text-ink-secondary">
+                          Currently <span className="font-medium text-ink">{preferred.currentUtilization}%</span> utilized
+                          {preferredProjected !== null && (
+                            <> · ~<span className="font-medium text-ink">{preferredProjected}%</span> if they cover this work</>
+                          )}
+                        </p>
+                        {preferredOverloaded && (
+                          <p className="mt-1 flex items-start gap-1.5 font-medium text-[var(--status-critical)]">
+                            <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                            Assigning the work to {preferred.name.split(" ")[0]} would take them past the{" "}
+                            {OVERLOAD_THRESHOLD}% overload threshold.
+                          </p>
+                        )}
+                        <p className="mt-1 text-ink-muted">
+                          Recommendation only — use Review to compare candidates before assigning.
+                        </p>
+                      </div>
+                    )}
                     {overlaps.length > 0 && (
                       <div className="mt-1.5 flex items-start gap-1.5 text-xs text-[var(--status-warning)]">
                         <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
@@ -122,7 +172,7 @@ export default function HandoverPlannerPage() {
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <button
-                      onClick={() => setReview({ employeeId: r.employeeId, start: r.startDate, end: r.endDate })}
+                      onClick={() => setReview({ employeeId: r.employeeId, start: r.startDate, end: r.endDate, preferredId: r.preferredEmployeeId })}
                       className="rounded-lg border border-border-strong bg-surface px-3 py-2 text-xs font-medium text-ink hover:bg-brand-50"
                     >
                       Review
@@ -155,6 +205,7 @@ export default function HandoverPlannerPage() {
         initialEmployeeId={review?.employeeId}
         initialStart={review?.start}
         initialEnd={review?.end}
+        preferredEmployeeId={review?.preferredId ?? undefined}
       />
     </div>
   );

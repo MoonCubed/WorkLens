@@ -26,6 +26,37 @@ export function parseLooseDate(value: string): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+// ============================================================================
+// Weeks — one Sunday-based scheme used everywhere in WorkLens. Sunday is the first
+// day of a week; weeks are numbered 1–52 within the calendar year. Every chart,
+// forecast, calendar and capacity calculation that talks about "weeks" goes through
+// these two helpers so nothing can drift onto a different (e.g. Monday-based, or
+// ISO-8601) system.
+// ============================================================================
+
+/** The Sunday that starts the week containing `date` (time zeroed, local). */
+export function startOfWeek(date: Date): Date {
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  d.setDate(d.getDate() - d.getDay());
+  return d;
+}
+
+/** Calendar week number (1–52) for `date`, Sunday-based. Week 1 is the week that
+ * contains 1 January; each later week begins on a Sunday. The trailing few days of
+ * a 53-week year fold into week 52 so the value always stays within 1–52. */
+export function weekOfYear(date: Date): number {
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const jan1 = new Date(d.getFullYear(), 0, 1);
+  const dayOfYear = Math.round((d.getTime() - jan1.getTime()) / 86_400_000) + 1;
+  const week = Math.ceil((dayOfYear + jan1.getDay()) / 7);
+  return Math.min(52, Math.max(1, week));
+}
+
+/** "W36"-style short week label, for chart axes. */
+export function weekLabel(date: Date): string {
+  return `W${weekOfYear(date)}`;
+}
+
 const SHORT_MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];

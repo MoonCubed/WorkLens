@@ -10,6 +10,7 @@ import {
   Tooltip,
   ReferenceLine,
 } from "recharts";
+import { OVERLOAD_THRESHOLD, RECOMMENDED_CAPACITY } from "@/data/config";
 
 export function CapacityForecastChart({ data }: { data: { week: string; utilization: number }[] }) {
   return (
@@ -33,8 +34,8 @@ export function CapacityForecastChart({ data }: { data: { week: string; utilizat
             ticks={[0, 40, 80, 120]}
             tickFormatter={(v: number) => `${v}%`}
           />
-          <ReferenceLine y={80} stroke="var(--status-warning)" strokeDasharray="3 3" strokeOpacity={0.6} />
-          <ReferenceLine y={95} stroke="var(--status-critical)" strokeDasharray="3 3" strokeOpacity={0.6} />
+          <ReferenceLine y={RECOMMENDED_CAPACITY} stroke="var(--status-warning)" strokeDasharray="3 3" strokeOpacity={0.6} />
+          <ReferenceLine y={OVERLOAD_THRESHOLD} stroke="var(--status-critical)" strokeDasharray="3 3" strokeOpacity={0.6} />
           <Tooltip
             cursor={{ stroke: "var(--border-strong)", strokeWidth: 1 }}
             contentStyle={{

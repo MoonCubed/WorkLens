@@ -19,8 +19,8 @@ export interface TicketCandidate {
 }
 
 /** Skills mentioned by name in the ticket's title/description — a fallback for tickets
- * without an explicit `relatedSkills` tag (e.g. ones raised through the IT Ticket
- * System's own "New Ticket" form). */
+ * without an explicit `relatedSkills` tag (e.g. ones raised through IT-Demand's own
+ * "New Ticket" form). */
 function extractRequiredSkillsFromText(ticket: Pick<Ticket, "title" | "description">, employees: Employee[]): string[] {
   const text = `${ticket.title} ${ticket.description}`.toLowerCase();
   const allSkills = new Set<string>();
@@ -29,7 +29,8 @@ function extractRequiredSkillsFromText(ticket: Pick<Ticket, "title" | "descripti
 }
 
 /** Ranks a unit's employees for a ticket by skill match, then by available capacity —
- * used for the Work queue's "Suggested" employee. */
+ * used for the Work queue's "Suggested" employee. Employees currently on leave are
+ * excluded entirely: they have 0 available capacity and can't pick up new work. */
 export function rankCandidatesForTicket(employees: Employee[], ticket: Ticket, limit = 3): TicketCandidate[] {
   const requiredSkills =
     ticket.relatedSkills && ticket.relatedSkills.length > 0
@@ -37,6 +38,7 @@ export function rankCandidatesForTicket(employees: Employee[], ticket: Ticket, l
       : extractRequiredSkillsFromText(ticket, employees);
 
   return employees
+    .filter((employee) => !isCurrentlyOnLeave(employee))
     .map((employee) => {
       const skillMatch = computeSkillMatch(employee, requiredSkills);
       const matchedSkillLevels = employee.skills.filter((s) =>

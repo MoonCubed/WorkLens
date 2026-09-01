@@ -3,15 +3,13 @@
 import { useState } from "react";
 import { CheckCircle2, Clock } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
-import type { LeaveEvent } from "@/data/types";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useHandoverRequests } from "@/store/handover-requests-store";
+import { getUnitTeam } from "@/lib/hr";
 import { todayLabel, toInputDateValue, formatDisplayDate } from "@/lib/date";
 
 const TODAY_INPUT = toInputDateValue(todayLabel());
-
-const LEAVE_TYPES: LeaveEvent["type"][] = ["Annual Leave", "Sick Leave", "Training", "Public Holiday"];
 
 export default function HandoverRequestsPage() {
   const { employeeId } = useEmployeeSession();
@@ -19,11 +17,11 @@ export default function HandoverRequestsPage() {
   const me = employees.find((e) => e.id === employeeId) ?? employees[0];
   const { requests, submitRequest } = useHandoverRequests();
 
-  const [leaveType, setLeaveType] = useState<LeaveEvent["type"]>(LEAVE_TYPES[0]);
   const [note, setNote] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [affected, setAffected] = useState<string[]>([]);
+  const [preferredEmployeeId, setPreferredEmployeeId] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -33,14 +31,24 @@ export default function HandoverRequestsPage() {
     ...me.adhoc.map((a) => a.name),
   ];
 
+  // Peers the employee could nominate to take over — same unit, not themselves.
+  const peers = getUnitTeam(me.department, employees).filter((e) => e.id !== me.id);
+  const nameFor = (id: string) => employees.find((e) => e.id === id)?.name ?? id;
+
   const myRequests = requests.filter((r) => r.employeeId === me.id);
 
   function toggleAffected(item: string) {
     setAffected((prev) => (prev.includes(item) ? prev.filter((i) => i !== item) : [...prev, item]));
   }
 
+  const canSubmit = !!startDate && !!endDate && !!note.trim() && !submitting;
+
   async function handleSubmit() {
     if (!startDate || !endDate || submitting) return;
+    if (!note.trim()) {
+      setSubmitError("A justification is required.");
+      return;
+    }
     if (new Date(`${endDate}T00:00:00`) < new Date(`${startDate}T00:00:00`)) {
       setSubmitError("End date can't be before the start date.");
       return;
@@ -50,18 +58,19 @@ export default function HandoverRequestsPage() {
     try {
       await submitRequest({
         employeeId: me.id,
-        note,
+        note: note.trim(),
         startDate: formatDisplayDate(new Date(`${startDate}T00:00:00`)),
         endDate: formatDisplayDate(new Date(`${endDate}T00:00:00`)),
         affectedWork: affected,
-        leaveType,
+        leaveType: "Leave",
+        preferredEmployeeId: preferredEmployeeId || null,
       });
       setSubmitted(true);
       setNote("");
       setStartDate("");
       setEndDate("");
       setAffected([]);
-      setLeaveType(LEAVE_TYPES[0]);
+      setPreferredEmployeeId("");
       window.setTimeout(() => setSubmitted(false), 3000);
     } catch {
       setSubmitError("Couldn't submit this request — check your connection and try again.");
@@ -83,13 +92,7 @@ export default function HandoverRequestsPage() {
         <CardHeader title="Report Unavailability" subtitle="e.g. “I will be unavailable from 10–17 September.”" />
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="Leave Type">
-            <select value={leaveType} onChange={(e) => setLeaveType(e.target.value as LeaveEvent["type"])} className="input">
-              {LEAVE_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
+            <input value="Leave" disabled className="input opacity-60" />
           </Field>
           <Field label="Start Date">
             <input
@@ -111,9 +114,38 @@ export default function HandoverRequestsPage() {
           </Field>
         </div>
         <div className="mt-4">
-          <Field label="Reason / Note">
-            <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2} className="input resize-none" />
+          <Field label="Justification">
+            <textarea
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              rows={3}
+              required
+              placeholder="Why you need this leave — and if you've already coordinated cover with someone, say so here."
+              className="input resize-none"
+            />
           </Field>
+          <p className="mt-1 text-xs text-ink-muted">Required.</p>
+        </div>
+
+        <div className="mt-4">
+          <Field label="Preferred Employee for Turnover (optional)">
+            <select
+              value={preferredEmployeeId}
+              onChange={(e) => setPreferredEmployeeId(e.target.value)}
+              className="input"
+            >
+              <option value="">No preference — supervisor decides</option>
+              {peers.map((e) => (
+                <option key={e.id} value={e.id}>
+                  {e.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <p className="mt-1 text-xs text-ink-muted">
+            A recommendation only — your supervisor still makes the final assignment and will check the person&rsquo;s
+            capacity first.
+          </p>
         </div>
 
         {workOptions.length > 0 && (
@@ -144,7 +176,7 @@ export default function HandoverRequestsPage() {
         <div className="mt-5 flex items-center gap-4">
           <button
             onClick={handleSubmit}
-            disabled={!startDate || !endDate || submitting}
+            disabled={!canSubmit}
             className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-50"
           >
             {submitting ? "Submitting…" : "Submit Handover Request"}
@@ -183,6 +215,9 @@ export default function HandoverRequestsPage() {
                   </span>
                 </div>
                 {r.note && <p className="mt-1 text-xs text-ink-secondary italic">&ldquo;{r.note}&rdquo;</p>}
+                {r.preferredEmployeeId && (
+                  <p className="mt-1 text-xs text-ink-muted">Preferred cover: {nameFor(r.preferredEmployeeId)}</p>
+                )}
                 {r.affectedWork.length > 0 && (
                   <p className="mt-1 text-xs text-ink-muted">Affected: {r.affectedWork.join(", ")}</p>
                 )}

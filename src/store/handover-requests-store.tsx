@@ -10,17 +10,22 @@ const TABLE = "handover_requests";
 export interface HandoverRequest {
   id: string;
   employeeId: string;
+  /** The employee's justification for the leave/handover — required on every request.
+   * (Stored in the `note` column.) */
   note: string;
   startDate: string;
   endDate: string;
   affectedWork: string[];
   status: "Pending Supervisor Review" | "Reviewed";
   submittedAt: string;
-  /** The kind of leave this unavailability represents — every request submitted from
-   * the employee portal carries one, so a handover request doubles as a leave request:
-   * approving it (see the supervisor's Handover page) adds a matching entry to the
-   * employee's `leaveEvents`, which is what the calendar and HR's Leaves tab read from. */
+  /** The handover workflow uses the single generic type "Leave"; approving a request
+   * (see the supervisor's Handover page) adds a matching "Leave" entry to the
+   * employee's `leaveEvents`, which is what the calendar and HR's Employee Calendar
+   * read from. */
   leaveType: LeaveEvent["type"];
+  /** An optional peer the employee has already coordinated the turnover with — a
+   * recommendation for the supervisor, never an automatic assignment. */
+  preferredEmployeeId?: string | null;
 }
 
 interface HandoverRequestsContextValue {

@@ -47,7 +47,9 @@ export interface AdhocItem {
 
 export interface LeaveEvent {
   id: string;
-  type: "Annual Leave" | "Public Holiday" | "Training" | "Sick Leave";
+  /** New handover/leave requests use the single generic type "Leave"; the other
+   * values only still appear on older seeded leave records. */
+  type: "Leave" | "Annual Leave" | "Public Holiday" | "Training" | "Sick Leave";
   start: string;
   end: string;
   /** Missing on older/seeded records — treat as already approved (historical data).

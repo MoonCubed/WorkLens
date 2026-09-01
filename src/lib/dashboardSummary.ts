@@ -15,7 +15,7 @@ import {
   type DisplayStatus,
   type DeliveryBucket,
 } from "@/lib/capacityEngine";
-import { parseLooseDate } from "@/lib/date";
+import { parseLooseDate, todayStart, startOfWeek, weekOfYear } from "@/lib/date";
 import { getCapacityStatus, type CapacityStatus } from "@/lib/capacity";
 import { CAPACITY_THRESHOLDS } from "@/data/config";
 import { getDueStatus } from "@/lib/date";
@@ -33,6 +33,8 @@ export interface UnitWorkItem {
   bucket: DeliveryBucket;
   progress?: number;
   ticketId?: string;
+  /** The completion date, once the item is Completed. */
+  completedDate: string | null;
 }
 
 export interface EmployeeCapacityRow {
@@ -62,6 +64,10 @@ export interface DashboardSummary {
   openTicketsCount: number;
   overdueWorkCount: number;
   atRiskCount: number;
+  /** Unit tickets that still have no owner — the "N Tasks Awaiting Assignment" count. */
+  unassignedCount: number;
+  /** Handover requests awaiting this supervisor's review — the "N Handover Requests" count. */
+  pendingHandoverCount: number;
   employeeCapacities: EmployeeCapacityRow[];
   /** Drill-down lists behind each KPI card — all reflect the state as of today. */
   onLeaveToday: { employee: Employee; leave: LeaveEvent }[];
@@ -69,7 +75,10 @@ export interface DashboardSummary {
   overdueItems: UnitWorkItem[];
   atRiskItems: UnitWorkItem[];
   workItems: UnitWorkItem[];
-  workDelivery: { completed: number; overdue: number; inProgress: number; unassigned: number };
+  /** Work Delivery counts — active (non-Completed) work only, so a task drops out
+   * the moment it's marked Completed. Overdue takes priority over On Hold when an
+   * item is both (a passed due date is the more urgent signal). */
+  workDelivery: { inProgress: number; onHold: number; overdue: number; unassigned: number };
   /** Tickets completed most recently (newest first) — powers the supervisor's
    * "task completed" indicator. */
   recentlyCompleted: AssignedTicket[];
@@ -112,6 +121,7 @@ function buildUnitWorkItems(unitEmployees: Employee[], tickets: AssignedTicket[]
           bucket: deliveryBucket(status, dueDate),
           progress: entry.progress,
           ticketId: t.id,
+          completedDate: status === "Completed" ? (t.resolvedDate ?? entry.completedAt ?? null) : null,
         });
       });
 
@@ -128,6 +138,7 @@ function buildUnitWorkItems(unitEmployees: Employee[], tickets: AssignedTicket[]
         remainingHours: itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress),
         status,
         bucket: deliveryBucket(status, dueDate),
+        completedDate: status === "Completed" ? (entry.completedAt ?? null) : null,
         progress: entry.progress,
       });
     });
@@ -160,24 +171,36 @@ function dedupeByTicket(items: UnitWorkItem[]): UnitWorkItem[] {
   return order.map((id) => byIdentity.get(id)!);
 }
 
-export function computeDashboardSummary(unit: Department, employees: Employee[], tickets: AssignedTicket[], getEntry: WorkLogLookup): DashboardSummary {
+export function computeDashboardSummary(
+  unit: Department,
+  employees: Employee[],
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  handoverRequests: { employeeId: string; status: string }[] = []
+): DashboardSummary {
   // The supervisor owns the team's capacity — they are not a team member and are
   // excluded from every count, capacity total and progress figure here.
   const unitEmployees = getUnitTeam(unit, employees);
   const workItems = buildUnitWorkItems(unitEmployees, tickets, getEntry);
   const uniqueItems = dedupeByTicket(workItems);
 
-  const employeeCapacities: EmployeeCapacityRow[] = unitEmployees.map((employee) => {
-    const capacity = computeEmployeeCapacity(employee, tickets, getEntry);
-    const activeItems = workItems.filter((i) => i.employeeId === employee.id && i.status !== "Completed").length;
-    return {
-      employee,
-      capacity,
-      status: getCapacityStatus(capacity.utilization),
-      activeItems,
-      onLeave: isCurrentlyOnLeave(employee) ? "Now" : isOnUpcomingLeave(employee) ? "Upcoming" : null,
-    };
-  });
+  const employeeCapacities: EmployeeCapacityRow[] = unitEmployees
+    .map((employee) => {
+      const capacity = computeEmployeeCapacity(employee, tickets, getEntry);
+      const activeItems = workItems.filter((i) => i.employeeId === employee.id && i.status !== "Completed").length;
+      return {
+        employee,
+        capacity,
+        status: getCapacityStatus(capacity.utilization),
+        activeItems,
+        onLeave: (isCurrentlyOnLeave(employee) ? "Now" : isOnUpcomingLeave(employee) ? "Upcoming" : null) as
+          | "Now"
+          | "Upcoming"
+          | null,
+      };
+    })
+    // Employees currently on leave sort to the bottom — they're unavailable for assignment.
+    .sort((a, b) => Number(a.capacity.onLeave) - Number(b.capacity.onLeave));
   const capacityByEmployee = new Map(employeeCapacities.map((r) => [r.employee.id, r]));
 
   const totalAvailableHours = Math.round(employeeCapacities.reduce((sum, r) => sum + r.capacity.availableHours, 0) * 10) / 10;
@@ -222,14 +245,24 @@ export function computeDashboardSummary(unit: Department, employees: Employee[],
 
   const activeItems = workItems.filter((i) => i.status !== "Completed");
 
+  // Work Delivery — active (non-Completed) work only, split into the same categories
+  // as the underlying item status, plus Unassigned. A completed item is excluded the
+  // moment its status flips, since `uniqueItems` is recomputed from live status on
+  // every render. Overdue takes priority over On Hold — a passed due date is the more
+  // urgent thing to surface, whether or not the item is also paused.
+  const overdueCount = uniqueItems.filter((i) => i.bucket === "Overdue").length;
+  const onHoldCount = uniqueItems.filter((i) => i.status === "On Hold" && i.bucket !== "Overdue").length;
+  const inProgressCount = uniqueItems.filter((i) => i.status === "In Progress" && i.bucket !== "Overdue").length;
+  const unassignedCount = openTickets.filter((t) => (t.assignedEmployeeIds ?? []).length === 0).length;
   const workDelivery = {
-    completed: uniqueItems.filter((i) => i.bucket === "Completed").length,
-    overdue: uniqueItems.filter((i) => i.bucket === "Overdue").length,
-    inProgress: uniqueItems.filter((i) => i.bucket === "In Progress").length,
-    // Unit tickets that still have no owner — visible on the Work Delivery view so a
-    // supervisor can see work that hasn't been picked up at all.
-    unassigned: openTickets.filter((t) => (t.assignedEmployeeIds ?? []).length === 0).length,
+    inProgress: inProgressCount,
+    onHold: onHoldCount,
+    overdue: overdueCount,
+    unassigned: unassignedCount,
   };
+  const pendingHandoverCount = handoverRequests.filter(
+    (r) => r.status === "Pending Supervisor Review" && unitEmployees.some((e) => e.id === r.employeeId)
+  ).length;
 
   const attentionItems: AttentionItem[] = [];
   const itemHref = (i: UnitWorkItem) => (i.ticketId ? `/systems/tickets/${i.ticketId}` : `/supervisor/people/${i.employeeId}`);
@@ -297,10 +330,17 @@ export function computeDashboardSummary(unit: Department, employees: Employee[],
       })
     );
 
+  const forecastWeekStart = startOfWeek(todayStart());
   const forecast8Week = Array.from({ length: 8 }, (_, weekIdx) => {
     const values = unitEmployees.map((e) => e.forecast8Week[weekIdx] ?? e.currentUtilization);
     const avg = values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : 0;
-    return { week: `Week ${weekIdx + 1}`, utilization: avg };
+    // App-wide Sunday-based 1–52 week numbering.
+    const weekDate = new Date(
+      forecastWeekStart.getFullYear(),
+      forecastWeekStart.getMonth(),
+      forecastWeekStart.getDate() + weekIdx * 7
+    );
+    return { week: `Week ${weekOfYear(weekDate)}`, utilization: avg };
   });
 
   const teamUtilization = employeeCapacities.length
@@ -322,6 +362,8 @@ export function computeDashboardSummary(unit: Department, employees: Employee[],
     openTickets,
     overdueItems,
     atRiskItems,
+    unassignedCount,
+    pendingHandoverCount,
     workItems: activeItems,
     workDelivery,
     recentlyCompleted,
