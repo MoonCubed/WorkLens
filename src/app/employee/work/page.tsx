@@ -19,21 +19,21 @@ export default function MyWorkPage() {
       <div>
         <h1 className="text-2xl font-semibold text-ink tracking-tight">My Tasks</h1>
         <p className="mt-1 text-sm text-ink-muted">
-          What&rsquo;s planned each day, your active work, and everything you&rsquo;ve completed.
+          Your active work, what&rsquo;s scheduled day by day this week, and everything you&rsquo;ve completed.
         </p>
       </div>
 
       <Card>
-        <CardHeader
-          title="Daily Tasks"
-          subtitle="Each task's estimated effort spread evenly across the working days until its deadline"
-        />
-        <DailyTasks employee={me} workingDays={10} />
+        <CardHeader title="Active Tasks" subtitle="In Progress, On Hold and Overdue work assigned to you" />
+        <MyWorkList employee={me} assignedTickets={assignedTickets} section="active" />
       </Card>
 
       <Card>
-        <CardHeader title="Active Tasks" subtitle="In Progress, On Hold and Overdue work assigned to you" />
-        <MyWorkList employee={me} assignedTickets={assignedTickets} section="active" />
+        <CardHeader
+          title="Daily Tasks"
+          subtitle="Your scheduled work for this week — each task's effort spread evenly across the working days until its deadline"
+        />
+        <DailyTasks employee={me} />
       </Card>
 
       <Card>

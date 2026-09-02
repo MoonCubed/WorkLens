@@ -9,14 +9,14 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { SkillLevelBar } from "@/components/ui/ProgressBar";
 import { SkillSelect } from "@/components/skills/SkillSelect";
 import { AssignedTaskStatusChart } from "@/components/charts/AssignedTaskStatusChart";
-import { DailyTasks } from "@/components/employee/DailyTasks";
+import { WeeklyCapacityChart } from "@/components/charts/WeeklyCapacityChart";
 import { WorkItemRow, type WorkRow } from "@/components/work/WorkItemRow";
 import type { SkillLevel } from "@/data/types";
 import { useEmployees } from "@/store/employees-store";
 import { useSupervisorSession } from "@/store/session-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { getDepartmentSupervisor } from "@/lib/hr";
-import { computeEmployeeCapacity, ticketEffortForEmployee } from "@/lib/capacityEngine";
+import { computeEmployeeCapacity, computeEmployeeWeeklyCapacity, ticketEffortForEmployee } from "@/lib/capacityEngine";
 import { ticketDueLabel, seedTicketDueLabel, adhocDueLabel } from "@/lib/due";
 import type { TicketStatus } from "@/data/tickets";
 import { useTickets } from "@/store/tickets-store";
@@ -122,6 +122,8 @@ export default function EmployeeDetailsPage() {
   // work, and the leave-adjusted available hours for the week (same formula as
   // every other capacity figure in the app).
   const capacity = computeEmployeeCapacity(employee, tickets, getEntry);
+  // Week-by-week capacity — the supervisor's primary capacity view for this person.
+  const weeklyCapacity = computeEmployeeWeeklyCapacity(employee, tickets, getEntry, 8);
   const initials = employee.name.split(" ").map((n) => n[0]).slice(0, 2).join("");
 
   return (
@@ -260,10 +262,10 @@ export default function EmployeeDetailsPage() {
 
       <Card>
         <CardHeader
-          title="Daily Plan"
-          subtitle="Estimated effort spread evenly across working days until each deadline"
+          title="Weekly Capacity"
+          subtitle="Planned capacity week by week, from task deadlines and estimated effort. Use ← → to move between weeks."
         />
-        <DailyTasks employee={employee} workingDays={6} />
+        <WeeklyCapacityChart points={weeklyCapacity} />
       </Card>
 
       <div>

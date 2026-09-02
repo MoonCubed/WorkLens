@@ -65,7 +65,7 @@ export default function EmployeeDashboardPage() {
     <div className="max-w-6xl space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-ink tracking-tight">Good morning, {firstName}</h1>
-        <p className="mt-1 text-sm text-ink-muted">Here&rsquo;s your current capacity and what&rsquo;s planned for today.</p>
+        <p className="mt-1 text-sm text-ink-muted">Your active work, and what&rsquo;s scheduled day by day this week.</p>
       </div>
 
       {detailError && (
@@ -73,6 +73,51 @@ export default function EmployeeDashboardPage() {
           {detailError}
         </p>
       )}
+
+      <Card>
+        <CardHeader title="Active Tasks" subtitle="In Progress, On Hold and Overdue work assigned to you" />
+        {activeWorkItems.length === 0 ? (
+          <p className="text-sm text-ink-muted py-4">No active work assigned right now.</p>
+        ) : (
+          <ul className="divide-y divide-border">
+            {activeWorkItems.map((item) => (
+              <li
+                key={item.key}
+                onClick={item.ticketId ? () => setOpenTicketId(item.ticketId!) : undefined}
+                onKeyDown={(e) => item.ticketId && e.key === "Enter" && setOpenTicketId(item.ticketId!)}
+                role={item.ticketId ? "button" : undefined}
+                tabIndex={item.ticketId ? 0 : undefined}
+                className={`flex flex-wrap items-center justify-between gap-3 py-3 ${
+                  item.ticketId ? "cursor-pointer rounded-lg px-2 -mx-2 outline-none hover:bg-brand-50/40 focus:bg-brand-50/40 transition-colors" : ""
+                }`}
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-ink truncate">{item.title}</p>
+                  <p className="text-xs text-ink-muted mt-0.5">
+                    {item.type} · Due {item.dueDate ?? "No deadline"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <span className="tabular text-xs text-ink-secondary">{item.progress}%</span>
+                  {(() => {
+                    const label = activeStatusLabel(item.status, item.dueDate);
+                    return (
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[label]}`}>
+                        {label}
+                      </span>
+                    );
+                  })()}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card>
+        <CardHeader title="Daily Tasks" subtitle="Your scheduled work for this week — each task's effort spread evenly across the working days until its deadline" />
+        <DailyTasks employee={me} onOpenTicket={(id) => setOpenTicketId(id)} />
+      </Card>
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
         <Card className="flex flex-col items-center justify-center text-center py-6">
@@ -135,11 +180,6 @@ export default function EmployeeDashboardPage() {
       )}
 
       <Card>
-        <CardHeader title="Today's Plan" subtitle="Tasks scheduled for today, from your deadlines and estimated effort" />
-        <DailyTasks employee={me} todayOnly onOpenTicket={(id) => setOpenTicketId(id)} />
-      </Card>
-
-      <Card>
         <CardHeader
           title="Workload Breakdown"
           subtitle={`This week · ${capacity.workingHours}h available${
@@ -162,46 +202,6 @@ export default function EmployeeDashboardPage() {
             </div>
           ))}
         </div>
-      </Card>
-
-      <Card>
-        <CardHeader title="My Work" subtitle="Your currently assigned tickets and ad-hoc items" />
-        {activeWorkItems.length === 0 ? (
-          <p className="text-sm text-ink-muted py-4">No active work assigned right now.</p>
-        ) : (
-          <ul className="divide-y divide-border">
-            {activeWorkItems.map((item) => (
-              <li
-                key={item.key}
-                onClick={item.ticketId ? () => setOpenTicketId(item.ticketId!) : undefined}
-                onKeyDown={(e) => item.ticketId && e.key === "Enter" && setOpenTicketId(item.ticketId!)}
-                role={item.ticketId ? "button" : undefined}
-                tabIndex={item.ticketId ? 0 : undefined}
-                className={`flex flex-wrap items-center justify-between gap-3 py-3 ${
-                  item.ticketId ? "cursor-pointer rounded-lg px-2 -mx-2 outline-none hover:bg-brand-50/40 focus:bg-brand-50/40 transition-colors" : ""
-                }`}
-              >
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-ink truncate">{item.title}</p>
-                  <p className="text-xs text-ink-muted mt-0.5">
-                    {item.type} · Due {item.dueDate ?? "No deadline"}
-                  </p>
-                </div>
-                <div className="flex items-center gap-3 shrink-0">
-                  <span className="tabular text-xs text-ink-secondary">{item.progress}%</span>
-                  {(() => {
-                    const label = activeStatusLabel(item.status, item.dueDate);
-                    return (
-                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[label]}`}>
-                        {label}
-                      </span>
-                    );
-                  })()}
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
       </Card>
 
       {detailTicket && (

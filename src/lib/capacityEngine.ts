@@ -22,6 +22,9 @@ import {
   dateKey,
   dateFromKey,
   isWorkingDay,
+  weekOfYear,
+  weekLabel,
+  weekRangeLabel,
 } from "@/lib/date";
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import { availableCapacity } from "@/lib/capacity";
@@ -419,29 +422,27 @@ function currentWeekBounds(ref: Date): { start: Date; end: Date } {
   return { start, end };
 }
 
-/** Approved-leave working days that fall within `employee`'s current week. */
-export function leaveWorkingDaysThisWeek(employee: Employee): number {
-  const { start, end } = currentWeekBounds(todayStart());
-  const ranges = employee.leaveEvents
-    .filter((l) => l.status !== "Pending")
-    .map((l) => ({ s: parseLooseDate(l.start), e: parseLooseDate(l.end) }))
-    .filter((r): r is { s: Date; e: Date } => !!r.s && !!r.e);
-  let days = 0;
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const day = d.getDay();
-    if (day === 5 || day === 6) continue;
-    if (ranges.some((r) => d >= r.s && d <= r.e)) days += 1;
-  }
-  return days;
-}
-
-/** Available working hours for `employee` this week — contracted weekly hours minus
- * the pro-rata hours lost to approved leave that falls in the week. The single
- * source of truth for the capacity denominator. */
-export function weeklyWorkingHours(employee: Employee): number {
+/** Available working hours for `employee` in the Sunday-based week containing
+ * `weekRef` — contracted weekly hours minus the pro-rata hours lost to approved leave
+ * that falls in the week. The single source of truth for the capacity denominator,
+ * for the current week and any future week alike. */
+export function weeklyWorkingHoursForWeek(employee: Employee, weekRef: Date): number {
   const weekly = employee.weeklyHours || 40;
   const perDay = weekly / 5;
-  return Math.max(0, Math.round((weekly - leaveWorkingDaysThisWeek(employee) * perDay) * 10) / 10);
+  const { start, end } = currentWeekBounds(weekRef);
+  const leaveDays = leaveWorkingDaysBetween(employee, start, end);
+  return Math.max(0, Math.round((weekly - leaveDays * perDay) * 10) / 10);
+}
+
+/** Approved-leave working days in `employee`'s current week. */
+export function leaveWorkingDaysThisWeek(employee: Employee): number {
+  const { start, end } = currentWeekBounds(todayStart());
+  return leaveWorkingDaysBetween(employee, start, end);
+}
+
+/** Available working hours for `employee` this week. */
+export function weeklyWorkingHours(employee: Employee): number {
+  return weeklyWorkingHoursForWeek(employee, todayStart());
 }
 
 /** Every ticket assigned to `employee` (live tickets-store data) plus their seed ad-hoc
@@ -481,6 +482,124 @@ export function computeEmployeeCapacity(employee: Employee, tickets: AssignedTic
  * Zero while on leave; otherwise `100 − utilization`. */
 export function employeeAvailablePercent(employee: Employee): number {
   return isCurrentlyOnLeave(employee) ? 0 : availableCapacity(employee.currentUtilization);
+}
+
+// ============================================================================
+// Weekly capacity — the SAME evenly-distributed task schedule as the Daily view,
+// rolled up per Sunday-based week. This is the supervisor's primary capacity view:
+// "how is my team's workload changing week by week?" — not a forecast, just the
+// planned distribution of today's tasks against their deadlines.
+// ============================================================================
+
+export interface WeeklyCapacityPoint {
+  /** 1–52, Sunday-based (see `weekOfYear`). */
+  weekNumber: number;
+  weekStart: Date;
+  /** Saturday. */
+  weekEnd: Date;
+  /** "W36". */
+  label: string;
+  /** "Aug 30 – Sep 5". */
+  rangeLabel: string;
+  /** Deadline-driven task hours landing in this week. */
+  scheduledHours: number;
+  /** Leave-adjusted available working hours for this week. */
+  workingHours: number;
+  /** `scheduledHours ÷ workingHours × 100`, rounded. */
+  utilization: number;
+  /** Spare hours — `workingHours − scheduledHours`, floored at 0. */
+  availableHours: number;
+  /** Active items with at least one scheduled hour in this week. */
+  taskCount: number;
+  isCurrent: boolean;
+}
+
+function scheduledHoursInWeek(schedule: EmployeeSchedule, weekStart: Date, weekEnd: Date): { hours: number; taskCount: number } {
+  let hours = 0;
+  let taskCount = 0;
+  schedule.activeItems.forEach((item) => {
+    const inWeek = item.workingDayKeys.filter((k) => {
+      const d = dateFromKey(k);
+      return d >= weekStart && d <= weekEnd;
+    }).length;
+    if (inWeek > 0) {
+      hours += item.dailyHours * inWeek;
+      taskCount += 1;
+    }
+  });
+  return { hours: Math.round(hours * 10) / 10, taskCount };
+}
+
+/** `weeks` consecutive weeks starting from the week containing `from` (default: this
+ * week), each with the deadline-driven scheduled hours and resulting capacity %. */
+export function computeEmployeeWeeklyCapacity(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  weeks = 8,
+  from: Date = todayStart()
+): WeeklyCapacityPoint[] {
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
+  const base = startOfWeek(from);
+  const thisWeekStart = startOfWeek(todayStart()).getTime();
+
+  return Array.from({ length: weeks }, (_, i) => {
+    const weekStart = new Date(base.getFullYear(), base.getMonth(), base.getDate() + i * 7);
+    const { start, end } = currentWeekBounds(weekStart);
+    const { hours, taskCount } = scheduledHoursInWeek(schedule, start, end);
+    const workingHours = weeklyWorkingHoursForWeek(employee, weekStart);
+    const denom = workingHours > 0 ? workingHours : employee.weeklyHours || 40;
+    return {
+      weekNumber: weekOfYear(weekStart),
+      weekStart: start,
+      weekEnd: end,
+      label: weekLabel(weekStart),
+      rangeLabel: weekRangeLabel(weekStart),
+      scheduledHours: hours,
+      workingHours,
+      utilization: Math.round((hours / denom) * 100),
+      availableHours: Math.max(0, Math.round((workingHours - hours) * 10) / 10),
+      taskCount,
+      isCurrent: start.getTime() === thisWeekStart,
+    };
+  });
+}
+
+/** Team weekly capacity — the mean of each team member's weekly utilization, week by
+ * week. `employees` should already be the unit team (supervisor excluded). */
+export function computeTeamWeeklyCapacity(
+  employees: Employee[],
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  weeks = 8,
+  from: Date = todayStart()
+): (WeeklyCapacityPoint & { memberCount: number })[] {
+  const perEmployee = employees.map((e) => computeEmployeeWeeklyCapacity(e, tickets, getEntry, weeks, from));
+  const base = startOfWeek(from);
+  const thisWeekStart = startOfWeek(todayStart()).getTime();
+
+  return Array.from({ length: weeks }, (_, i) => {
+    const weekStart = new Date(base.getFullYear(), base.getMonth(), base.getDate() + i * 7);
+    const { start, end } = currentWeekBounds(weekStart);
+    const rows = perEmployee.map((series) => series[i]).filter(Boolean);
+    const scheduledHours = Math.round(rows.reduce((s, r) => s + r.scheduledHours, 0) * 10) / 10;
+    const workingHours = Math.round(rows.reduce((s, r) => s + r.workingHours, 0) * 10) / 10;
+    const utilization = rows.length ? Math.round(rows.reduce((s, r) => s + r.utilization, 0) / rows.length) : 0;
+    return {
+      weekNumber: weekOfYear(weekStart),
+      weekStart: start,
+      weekEnd: end,
+      label: weekLabel(weekStart),
+      rangeLabel: weekRangeLabel(weekStart),
+      scheduledHours,
+      workingHours,
+      utilization,
+      availableHours: Math.max(0, Math.round((workingHours - scheduledHours) * 10) / 10),
+      taskCount: rows.reduce((s, r) => s + r.taskCount, 0),
+      memberCount: rows.length,
+      isCurrent: start.getTime() === thisWeekStart,
+    };
+  });
 }
 
 /** Resulting utilization if `extraWeeklyHours` of new weekly load were added to

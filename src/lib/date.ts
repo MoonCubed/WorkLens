@@ -89,6 +89,13 @@ export function startOfWeek(date: Date): Date {
   return d;
 }
 
+/** The Saturday that ends the week containing `date` (time zeroed, local) — the
+ * Sunday-based week is Sunday → Saturday. */
+export function endOfWeek(date: Date): Date {
+  const start = startOfWeek(date);
+  return new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6);
+}
+
 /** Calendar week number (1–52) for `date`, Sunday-based. Week 1 is the week that
  * contains 1 January; each later week begins on a Sunday. The trailing few days of
  * a 53-week year fold into week 52 so the value always stays within 1–52. */
@@ -108,6 +115,15 @@ export function weekLabel(date: Date): string {
 const SHORT_MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/** Compact date-range label for the Sunday-based week containing `weekStart`, e.g.
+ * "Aug 30 – Sep 5". No year — pair it with the week number. */
+export function weekRangeLabel(weekStart: Date): string {
+  const start = startOfWeek(weekStart);
+  const end = endOfWeek(weekStart);
+  const fmt = (d: Date) => `${SHORT_MONTHS[d.getMonth()]} ${d.getDate()}`;
+  return `${fmt(start)} – ${fmt(end)}`;
+}
 
 /** Formats a Date (e.g. from a native `<input type="date">`) to match the
  * "26 Aug 2026" style used throughout the app's seed data. (Not using

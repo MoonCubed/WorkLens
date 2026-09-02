@@ -13,6 +13,8 @@ import { useEmployees } from "@/store/employees-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { useHandoverRequests } from "@/store/handover-requests-store";
 import { computeDashboardSummary, type AttentionTone, type DashboardSummary } from "@/lib/dashboardSummary";
+import { computeTeamWeeklyCapacity } from "@/lib/capacityEngine";
+import { WeeklyCapacityChart } from "@/components/charts/WeeklyCapacityChart";
 import { todayLabel } from "@/lib/date";
 
 const ATTENTION_STYLES: Record<AttentionTone, { icon: typeof AlertTriangle; text: string; bg: string; border: string; label: string }> = {
@@ -34,6 +36,13 @@ export default function SupervisorDashboardPage() {
   const summary = useMemo(
     () => computeDashboardSummary(unit, employees, tickets, getEntry, handoverRequests),
     [unit, employees, tickets, getEntry, handoverRequests]
+  );
+
+  // Team capacity week by week — from the same evenly-distributed task schedule that
+  // drives every capacity number. The supervisor's primary capacity view.
+  const weeklyCapacity = useMemo(
+    () => computeTeamWeeklyCapacity(summary.unitEmployees, tickets, getEntry, 8),
+    [summary.unitEmployees, tickets, getEntry]
   );
 
   // Completed work is deliberately absent — it drops out the moment a task's status
@@ -138,6 +147,17 @@ export default function SupervisorDashboardPage() {
         <CardHeader title="Work Delivery" subtitle="Are we actually getting the work done?" />
         <CapacityDistributionBar data={deliveryDistribution} />
       </Card>
+
+      {/* Weekly Capacity — the supervisor's primary capacity view. */}
+      {summary.employeeCapacities.length > 0 && (
+        <Card>
+          <CardHeader
+            title="Team Weekly Capacity"
+            subtitle="Planned capacity week by week, from task deadlines and estimated effort. Use ← → to move between weeks."
+          />
+          <WeeklyCapacityChart points={weeklyCapacity} />
+        </Card>
+      )}
 
       {/* Team Capacity at a Glance */}
       <div>
