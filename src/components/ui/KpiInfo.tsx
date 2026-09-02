@@ -16,9 +16,9 @@ export const KPI_EXPLAINERS: Record<string, KpiExplainer> = {
     example: "6 employees in IT Service Support = 6 team members",
   },
   availableCapacity: {
-    meaning: "Remaining working capacity across the whole team after accounting for each person's active workload.",
-    calculation: "Sum across the team of (Weekly Working Hours − Active Remaining Work Hours)",
-    example: "3 employees each with 8h available = 24h available, 20% of total capacity",
+    meaning: "Working hours across the team not already committed to this week's planned task work.",
+    calculation: "Sum across the team of (Weekly Working Hours − Hours planned this week from task deadlines)",
+    example: "3 employees each with 8h free = 24h available, 20% of total capacity",
   },
   onLeave: {
     meaning: "Employees on approved leave today. Leave starting later shows under Attention Required.",
@@ -41,9 +41,9 @@ export const KPI_EXPLAINERS: Record<string, KpiExplainer> = {
     example: "A ticket due in 3 days, assigned to someone at 88% utilization → At Risk",
   },
   utilization: {
-    meaning: "Measures the percentage of an employee's available working capacity currently committed to active (not completed) work, adjusted for logged progress.",
-    calculation: "Remaining Work Hours ÷ Weekly Working Hours × 100",
-    example: "32 remaining hours ÷ 40 weekly hours = 80% utilization",
+    meaning: "The share of an employee's available working hours taken up by work planned for this week. Each task's remaining effort is spread evenly across the working days until its deadline; On Hold and Completed work don't count.",
+    calculation: "Hours planned this week (Σ per task: remaining effort ÷ working days to deadline, for days in this week) ÷ Weekly Working Hours × 100",
+    example: "A 20h task due in 5 working days = 4h/day; 4 of those days fall this week → 16h → 40% of a 40h week",
   },
 };
 

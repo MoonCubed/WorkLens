@@ -146,7 +146,6 @@ function TableView({
             <th className="px-4 py-3">Tickets</th>
             <th className="px-4 py-3 w-36">Current Utilization</th>
             <th className="px-4 py-3">Available Capacity</th>
-            <th className="px-4 py-3">Future Capacity</th>
             <th className="px-4 py-3">Status</th>
             <th className="px-2 py-3" />
           </tr>
@@ -188,7 +187,6 @@ function TableView({
                   {onLeave ? <span className="text-xs text-ink-muted">On leave</span> : <CapacityBar value={e.currentUtilization} />}
                 </td>
                 <td className="px-4 py-3 tabular text-ink-secondary">{onLeave ? "0h / 0%" : `${avail}%`}</td>
-                <td className="px-4 py-3 tabular text-ink-secondary">{e.futureCapacity}%</td>
                 <td className="px-4 py-3">
                   {onLeave ? <OnLeaveBadge /> : <StatusBadge utilization={e.currentUtilization} />}
                 </td>
@@ -202,7 +200,7 @@ function TableView({
           })}
           {employees.length === 0 && (
             <tr>
-              <td colSpan={9} className="px-4 py-10 text-center text-sm text-ink-muted">
+              <td colSpan={8} className="px-4 py-10 text-center text-sm text-ink-muted">
                 No employees match the current filters.
               </td>
             </tr>

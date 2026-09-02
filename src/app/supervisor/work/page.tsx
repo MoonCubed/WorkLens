@@ -14,7 +14,7 @@ import { useEmployees } from "@/store/employees-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
 import { getDepartmentSupervisor, getUnitTeam } from "@/lib/hr";
-import { projectedUtilization } from "@/lib/capacityEngine";
+import { projectedUtilizationForTicket } from "@/lib/capacityEngine";
 import { completionSortKey } from "@/lib/dashboardSummary";
 import { slaWindowLabel } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
@@ -105,8 +105,7 @@ export default function SupervisorWorkPage() {
     const employee = unitEmployees.find((e) => e.id === employeeId);
     if (!ticket || !employee) return;
     const alreadyOwns = (ticket.assignedEmployeeIds ?? []).includes(employeeId);
-    const extra = alreadyOwns ? 0 : ticket.estimatedHours;
-    const projected = projectedUtilization(employee, tickets, getEntry, extra);
+    const projected = projectedUtilizationForTicket(employee, tickets, getEntry, ticket);
     if (projected > CAPACITY_WARN_THRESHOLD && !alreadyOwns) {
       setPendingAssign({ ticket, employee, projected });
       return;
@@ -354,8 +353,8 @@ export default function SupervisorWorkPage() {
 
       <Card>
         <CardHeader
-          title="Completed"
-          subtitle="Tasks a team member has marked complete, newest first"
+          title="Completed Tasks"
+          subtitle="Tasks your team has finished — no longer in the active lists or counted toward capacity"
           action={
             completed.length > 0 ? (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-good)]">
@@ -384,8 +383,8 @@ export default function SupervisorWorkPage() {
                       {t.title} <span className="text-xs font-normal text-ink-muted">({t.id})</span>
                     </p>
                     <p className="text-xs text-ink-muted mt-0.5">
-                      {(t.assignedEmployeeIds ?? []).map((id) => nameFor(id)).join(" & ") || "Unassigned"}
-                      {t.resolvedDate ? ` · completed ${t.resolvedDate}` : ""}
+                      Completed by {(t.assignedEmployeeIds ?? []).map((id) => nameFor(id)).join(" & ") || "Unassigned"}
+                      {t.resolvedDate ? ` · ${t.resolvedDate}` : ""} · {t.priority} priority · {t.assignedUnit}
                     </p>
                   </div>
                   <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--status-good)]" />
@@ -591,22 +590,31 @@ function CandidateCard({
 
       <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
         <div>
+          <p className="text-ink-muted">Current Capacity</p>
+          <p className="tabular font-semibold text-ink">{candidate.currentUtilization}%</p>
+        </div>
+        <div>
+          <p className="text-ink-muted">After Assignment</p>
+          <p className={`tabular font-semibold ${candidate.projectedCapacity > OVERLOAD_THRESHOLD ? "text-[var(--status-critical)]" : "text-ink"}`}>
+            {candidate.projectedCapacity}%
+          </p>
+        </div>
+        <div>
           <p className="text-ink-muted">Skill Match</p>
           <p className="tabular font-semibold text-ink">{candidate.skillMatch}%</p>
-        </div>
-        <div>
-          <p className="text-ink-muted">Available</p>
-          <p className="tabular font-semibold text-ink">{candidate.availableCapacity}%</p>
-        </div>
-        <div>
-          <p className="text-ink-muted">If Assigned</p>
-          <p className="tabular font-semibold text-ink">{candidate.projectedCapacity}%</p>
         </div>
       </div>
 
       <div className="mt-2.5">
         <CapacityBar value={candidate.projectedCapacity} showLabel={false} />
       </div>
+
+      {candidate.projectedCapacity > OVERLOAD_THRESHOLD && (
+        <p className="mt-2 flex items-start gap-1.5 text-xs font-medium text-[var(--status-critical)]">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          Assigning would take {e.name.split(" ")[0]} to {candidate.projectedCapacity}% — past the {OVERLOAD_THRESHOLD}% overload threshold.
+        </p>
+      )}
 
       <ul className="mt-3 space-y-1">
         {candidate.reasons.map((reason) => (

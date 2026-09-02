@@ -6,7 +6,7 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { CommentsThread } from "@/components/work/CommentsThread";
 import { useWorkLog } from "@/store/work-log-store";
 import { computeAbsenceImpact, type AbsenceImpact, type AffectedWorkItem, type CoverageCandidate, type RiskLevel } from "@/lib/absenceImpact";
-import { CAPACITY_THRESHOLDS } from "@/data/config";
+import { CAPACITY_THRESHOLDS, OVERLOAD_THRESHOLD } from "@/data/config";
 import { formatDisplayDate, toInputDateValue } from "@/lib/date";
 import type { Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
@@ -115,7 +115,8 @@ export function AbsenceSimulator({
       const currentOwnerIds = assignments[item.id]
         ? [assignments[item.id]]
         : (item.ticketId ? tickets.find((t) => t.id === item.ticketId)?.assignedEmployeeIds : undefined) ?? [];
-      const top = (impact.candidatesByItem.get(item.id) ?? []).find((c) => c.eligible);
+      const list = impact.candidatesByItem.get(item.id) ?? [];
+      const top = list.find((c) => c.eligible) ?? list.find((c) => c.assignable && !c.overloaded);
       if (!top || currentOwnerIds.includes(top.employee.id)) continue;
       await handleAssign(item, top);
       applied += 1;
@@ -130,8 +131,11 @@ export function AbsenceSimulator({
     impact && impact.primaryCandidateId ? unitEmployees.find((e) => e.id === impact.primaryCandidateId) : undefined;
   const urgentItems = impact ? impact.affectedWork.filter((i) => i.risk === "Critical" || i.risk === "High") : [];
   const itemsNeedingCoverage = impact ? impact.affectedWork.filter((i) => i.risk !== "Low") : [];
-  const coverageFoundCount = itemsNeedingCoverage.filter((i) => (impact?.candidatesByItem.get(i.id) ?? []).some((c) => c.eligible)).length;
+  // Coverage is "found" whenever there's anyone in the unit who can take it on — a
+  // missing skill match is a ranking concern, not a blocker.
+  const coverageFoundCount = itemsNeedingCoverage.filter((i) => (impact?.candidatesByItem.get(i.id) ?? []).some((c) => c.assignable)).length;
   const anyCoverageSuggested = coverageFoundCount > 0;
+  const nameFor = (id: string) => unitEmployees.find((e) => e.id === id)?.name ?? id;
 
   return (
     <div className="space-y-6">
@@ -226,15 +230,21 @@ export function AbsenceSimulator({
             <h3 className="text-sm font-semibold text-ink mb-3">Affected Work</h3>
             {impact.affectedWork.length === 0 ? (
               <Card>
-                <p className="text-sm text-ink-muted py-4 text-center">No active work found for {impact.employee.name} during this period.</p>
+                <p className="text-sm text-ink-muted py-4 text-center">
+                  None of {impact.employee.name}&rsquo;s work has planned effort during this period — nothing needs handover.
+                </p>
               </Card>
             ) : (
               <div className="space-y-3">
                 {impact.affectedWork.map((item) => {
-                  const candidates = (impact.candidatesByItem.get(item.id) ?? []).filter((c) => c.eligible);
-                  const assignedIds = assignments[item.id]
-                    ? [assignments[item.id]]
-                    : (item.ticketId ? tickets.find((t) => t.id === item.ticketId)?.assignedEmployeeIds : undefined) ?? [];
+                  const allCandidates = impact.candidatesByItem.get(item.id) ?? [];
+                  // Everyone who can be assigned — the same "all employees, ranked by
+                  // suitability" experience as Unassigned Tasks. Only people on leave
+                  // during the absence are excluded.
+                  const candidates = allCandidates.filter((c) => c.assignable);
+                  const liveOwnerIds =
+                    (item.ticketId ? tickets.find((t) => t.id === item.ticketId)?.assignedEmployeeIds : undefined) ?? [];
+                  const assignedIds = assignments[item.id] ? [assignments[item.id]] : liveOwnerIds;
                   const top = candidates[0];
                   const alternates = candidates.slice(1);
                   const altOpen = !!showAlternatives[item.id];
@@ -243,6 +253,9 @@ export function AbsenceSimulator({
                   const noteKey = `${impact.employee.id}:${item.id}`;
                   const noteCount = getEntry(noteKey).comments.length;
                   const risk = RISK_STYLES[item.risk];
+                  // Ownership: the absent employee still owns this work; a coverage
+                  // employee is picked to keep it moving during the leave.
+                  const handoverToId = assignments[item.id] ?? null;
 
                   return (
                     <Card key={item.id}>
@@ -253,6 +266,35 @@ export function AbsenceSimulator({
                           <span aria-hidden="true">{risk.symbol}</span> {risk.label}
                         </span>
                       </p>
+
+                      {/* Who leads and who owns this work — always visible so the
+                          supervisor knows the chain even after picking coverage. */}
+                      <div className="mt-3 rounded-lg border border-border bg-brand-50/40 p-3 text-xs">
+                        <div className="grid gap-1.5 sm:grid-cols-2">
+                          <p>
+                            <span className="text-ink-muted">Primary Project Leader: </span>
+                            <span className="font-medium text-ink">{currentUserName}</span>
+                          </p>
+                          <p>
+                            <span className="text-ink-muted">Current Owner: </span>
+                            <span className="font-medium text-ink">{impact.employee.name}</span>
+                          </p>
+                          <p>
+                            <span className="text-ink-muted">Status: </span>
+                            <span className="font-medium text-ink">{item.status}</span>
+                          </p>
+                          <p>
+                            <span className="text-ink-muted">Handover To: </span>
+                            <span className="font-medium text-ink">
+                              {handoverToId ? nameFor(handoverToId) : "— not selected"}
+                            </span>
+                          </p>
+                        </div>
+                        <p className="mt-1.5 text-ink-muted">
+                          {impact.employee.name} is going on leave {formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)} and
+                          still owns this task — coverage keeps it moving; the status and ownership don&rsquo;t change.
+                        </p>
+                      </div>
 
                       <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
                         <Detail label="Remaining effort" value={`${item.remainingHours}h`} />
@@ -267,48 +309,55 @@ export function AbsenceSimulator({
 
                       <div className="mt-3 text-xs">
                         <p className="font-medium uppercase tracking-wide text-ink-secondary mb-1">Coverage</p>
-                        {!needsCoverage ? (
-                          <p className="flex items-center gap-1.5 text-[var(--status-good)]">
+                        {!needsCoverage && candidates.length > 0 ? (
+                          <p className="mb-2 flex items-center gap-1.5 text-[var(--status-good)]">
                             <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                            No coverage required
+                            No coverage strictly required — you can still assign someone below.
                           </p>
-                        ) : top ? (
+                        ) : null}
+                        {top ? (
                           <div className="rounded-lg border border-brand-100 bg-brand-50/50 p-3">
                             <p className="flex items-center gap-1 text-[11px] font-medium text-brand-700">
                               <Sparkles className="h-3 w-3" />
-                              AI-assisted coverage recommendation
+                              Suggested coverage (ranked by suitability)
                             </p>
                             <p className="mt-1.5 text-sm font-medium text-ink">{top.employee.name}</p>
                             <p className="text-xs text-ink-secondary">
-                              {top.skillMatch}% skill match · {top.availableCapacity}% available · {top.utilization}% utilized
+                              Current capacity {top.utilization}% → {top.projectedCapacity}% after assignment · {top.skillMatch}% skill match
                             </p>
-                            <p className="mt-1.5 text-xs text-ink-muted">
-                              Recommended based on required skills, available capacity, and availability during the absence.
-                            </p>
+                            {top.projectedCapacity > OVERLOAD_THRESHOLD && (
+                              <p className="mt-1 flex items-start gap-1.5 font-medium text-[var(--status-critical)]">
+                                <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                Covering this would take {top.employee.name.split(" ")[0]} past the {OVERLOAD_THRESHOLD}% overload threshold.
+                              </p>
+                            )}
+                            {top.skillMatch === 0 && (
+                              <p className="mt-1 text-ink-muted">No skill match — ranked highest on capacity. Assign anyone below if you prefer.</p>
+                            )}
                             <button
                               onClick={() => handleAssign(item, top)}
                               disabled={assignedIds.includes(top.employee.id)}
                               className="mt-2.5 rounded-lg bg-brand-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
                             >
-                              {assignedIds.includes(top.employee.id) ? "Assigned" : "Assign"}
+                              {assignedIds.includes(top.employee.id) ? "Assigned" : `Assign to ${top.employee.name.split(" ")[0]}`}
                             </button>
                           </div>
                         ) : (
                           <p className="flex items-center gap-1.5 text-[var(--status-critical)]">
                             <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
-                            No suitable coverage identified
+                            Everyone in the unit is on leave during this period.
                           </p>
                         )}
                       </div>
 
                       <div className="mt-3.5 flex items-center gap-4 border-t border-border pt-3">
-                        {needsCoverage && (
+                        {candidates.length > 1 && (
                           <button
                             onClick={() => setShowAlternatives((prev) => ({ ...prev, [item.id]: !prev[item.id] }))}
                             className="flex items-center gap-1 text-xs font-medium text-brand-700 hover:text-brand-800"
                           >
                             {altOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-                            {altOpen ? "Hide" : "View"} Alternatives
+                            {altOpen ? "Hide" : "Choose a different employee"}
                           </button>
                         )}
                         <button
@@ -322,18 +371,14 @@ export function AbsenceSimulator({
 
                       {altOpen && (
                         <div className="mt-3 border-t border-border pt-3">
-                          {alternates.length === 0 ? (
-                            <p className="text-xs text-ink-muted">
-                              No suitable coverage identified. Employees in the unit are either unavailable, at capacity, or
-                              missing the required skill.
-                            </p>
-                          ) : (
-                            <div className="space-y-2">
-                              {alternates.map((c) => (
-                                <CoverageCandidateRow key={c.employee.id} candidate={c} assigned={assignedIds.includes(c.employee.id)} onAssign={() => handleAssign(item, c)} />
-                              ))}
-                            </div>
-                          )}
+                          <p className="mb-2 text-xs text-ink-muted">
+                            All employees in the unit, ranked by suitability. You can assign any of them.
+                          </p>
+                          <div className="space-y-2">
+                            {alternates.map((c) => (
+                              <CoverageCandidateRow key={c.employee.id} candidate={c} assigned={assignedIds.includes(c.employee.id)} onAssign={() => handleAssign(item, c)} />
+                            ))}
+                          </div>
                         </div>
                       )}
 
@@ -360,7 +405,7 @@ export function AbsenceSimulator({
                 ) : (
                   <ul className="space-y-1">
                     {urgentItems.map((i) => {
-                      const covered = assignments[i.id] || (impact.candidatesByItem.get(i.id) ?? []).some((c) => c.eligible);
+                      const covered = !!assignments[i.id] || (impact.candidatesByItem.get(i.id) ?? []).some((c) => c.assignable);
                       return (
                         <li key={i.id} className={`flex items-start gap-1.5 ${covered ? "text-[var(--status-good)]" : "text-[var(--status-warning)]"}`}>
                           {covered ? <CheckCircle2 className="h-3.5 w-3.5 mt-0.5 shrink-0" /> : <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />}
@@ -378,7 +423,11 @@ export function AbsenceSimulator({
                   <p className="text-ink-secondary">
                     <span className="font-medium text-ink">{primaryCandidate.name}</span> will cover{" "}
                     {impact.affectedWork
-                      .filter((i) => (impact.candidatesByItem.get(i.id) ?? []).find((c) => c.eligible)?.employee.id === primaryCandidate.id)
+                      .filter((i) => {
+                        const list = impact.candidatesByItem.get(i.id) ?? [];
+                        const pick = list.find((c) => c.eligible) ?? list.find((c) => c.assignable);
+                        return pick?.employee.id === primaryCandidate.id;
+                      })
                       .map((i) => `${i.title} (${i.remainingHours}h)`)
                       .join(", ")}
                   </p>
@@ -479,15 +528,23 @@ function CoverageCandidateRow({
           disabled={assigned}
           className="shrink-0 rounded-lg bg-brand-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
         >
-          {assigned ? "Assigned" : "Assign"}
+          {assigned ? "Assigned" : `Assign to ${e.name.split(" ")[0]}`}
         </button>
       </div>
-      <div className="mt-2.5 grid grid-cols-4 gap-2.5 text-xs">
-        <Detail label="Utilization" value={`${candidate.utilization}%`} />
-        <Detail label="Available" value={`${candidate.availableCapacity}%`} />
+      <div className="mt-2.5 grid grid-cols-3 gap-2.5 text-xs">
+        <Detail label="Current Capacity" value={`${candidate.utilization}%`} />
+        <Detail label="After Assignment" value={`${candidate.projectedCapacity}%`} />
         <Detail label="Skill Match" value={`${candidate.skillMatch}%`} />
-        <Detail label="Availability" value="Available" />
       </div>
+      {candidate.projectedCapacity > OVERLOAD_THRESHOLD && (
+        <p className="mt-2 flex items-start gap-1.5 text-xs font-medium text-[var(--status-critical)]">
+          <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          Would exceed the {OVERLOAD_THRESHOLD}% overload threshold ({candidate.projectedCapacity}%).
+        </p>
+      )}
+      {candidate.skillMatch === 0 && (
+        <p className="mt-1 text-xs text-ink-muted">No matching skill — assignable, but not a skills-based recommendation.</p>
+      )}
     </div>
   );
 }

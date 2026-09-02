@@ -2,7 +2,15 @@ import type { Employee, SkillLevel } from "@/data/types";
 import type { Ticket } from "@/data/tickets";
 import { availableCapacity } from "@/lib/capacity";
 import { computeSkillMatch } from "@/lib/simulate";
-import { isCurrentlyOnLeave, isOnUpcomingLeave } from "@/lib/capacityEngine";
+import {
+  isCurrentlyOnLeave,
+  isOnUpcomingLeave,
+  weeklyWorkingHours,
+  weeklyRequiredHoursForItem,
+  itemStartDate,
+} from "@/lib/capacityEngine";
+import { resolveDueDate } from "@/lib/date";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
 
 export interface TicketCandidate {
   employee: Employee;
@@ -46,7 +54,12 @@ export function rankCandidatesForTicket(employees: Employee[], ticket: Ticket, l
       );
       const matchedSkills = matchedSkillLevels.map((s) => s.name);
       const avail = availableCapacity(employee.currentUtilization);
-      const projected = Math.round(employee.currentUtilization + (ticket.estimatedHours / employee.weeklyHours) * 100);
+      // Deadline-driven weekly load of this ticket for this person, added to their
+      // current (already deadline-aware) capacity — the same maths as everywhere else.
+      const due = resolveDueDate(ticket.expectedResolutionDate, ticket.priority, ticket.raisedDate);
+      const extraWeekly = weeklyRequiredHoursForItem(ticket.estimatedHours, itemStartDate(ticket.raisedDate), due, employee);
+      const denom = weeklyWorkingHours(employee) || employee.weeklyHours || 40;
+      const projected = Math.round(employee.currentUtilization + (extraWeekly / denom) * 100);
 
       const onLeaveNow = isCurrentlyOnLeave(employee);
       const onLeaveSoon = !onLeaveNow && isOnUpcomingLeave(employee);
@@ -55,10 +68,10 @@ export function rankCandidatesForTicket(employees: Employee[], ticket: Ticket, l
       reasons.push(
         matchedSkillLevels.length > 0
           ? `Skill match on ${matchedSkillLevels.map((s) => `${s.name} (${s.level})`).join(", ")}`
-          : "No specific skill keywords matched — ranked by availability"
+          : "No specific skill match — ranked by capacity"
       );
-      reasons.push(`${avail}% available capacity`);
-      reasons.push(`Currently ${employee.currentUtilization}% utilized, ~${projected}% if assigned`);
+      reasons.push(`Current capacity ${employee.currentUtilization}% → ${projected}% after assignment`);
+      if (projected > OVERLOAD_THRESHOLD) reasons.push(`Assigning would exceed the ${OVERLOAD_THRESHOLD}% overload threshold`);
       if (onLeaveNow) reasons.push("On leave right now");
       else if (onLeaveSoon) reasons.push("Starting leave within a week");
 

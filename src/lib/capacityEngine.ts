@@ -10,10 +10,19 @@
 // to "make the number correct and keep it correct" rather than a rewrite of every page that
 // happens to read utilization.
 
-import type { Employee, LeaveEvent, WorkflowStatus } from "@/data/types";
+import type { AdhocItem, Employee, LeaveEvent, WorkflowStatus } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
 import type { TicketStatus } from "@/data/tickets";
-import { todayStart, parseLooseDate, getDueStatus, startOfWeek } from "@/lib/date";
+import {
+  todayStart,
+  parseLooseDate,
+  getDueStatus,
+  startOfWeek,
+  resolveDueDate,
+  dateKey,
+  dateFromKey,
+  isWorkingDay,
+} from "@/lib/date";
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import { availableCapacity } from "@/lib/capacity";
 
@@ -60,6 +69,315 @@ export function itemRemainingHours(estimatedHours: number, complete: boolean, pr
   return Math.round(estimatedHours * (1 - pct / 100) * 10) / 10;
 }
 
+/** When work on an item is assumed to start — the ticket's raised date if it's already
+ * passed, otherwise today. Ad-hoc items have no raised date, so they start today. */
+export function itemStartDate(raisedDate?: string | null): Date {
+  const today = todayStart();
+  const raised = raisedDate ? parseLooseDate(raisedDate) : null;
+  return raised && raised < today ? raised : today;
+}
+
+/** True when an approved leave event covers `date`. */
+export function isOnLeaveDate(employee: Employee, date: Date): boolean {
+  return employee.leaveEvents.some((l) => {
+    if (l.status === "Pending") return false;
+    const s = parseLooseDate(l.start);
+    const e = parseLooseDate(l.end);
+    return !!s && !!e && date >= s && date <= e;
+  });
+}
+
+/**
+ * The working days across which an item's remaining effort is spread: every day from
+ * `from` up to and including the `deadline` that is a working day (Sun–Thu) **and** not
+ * an approved-leave day for this employee. Returns `YYYY-MM-DD` keys.
+ *
+ * Empty when the deadline has already passed relative to `from` — the caller collapses
+ * that onto "due now" (see `DUE_NOW`).
+ */
+export function scheduledWorkingDayKeys(from: Date, deadline: Date, employee: Employee): string[] {
+  const keys: string[] = [];
+  const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const last = new Date(deadline.getFullYear(), deadline.getMonth(), deadline.getDate());
+  let guard = 0;
+  while (cursor <= last && guard < 1000) {
+    guard += 1;
+    if (isWorkingDay(cursor) && !isOnLeaveDate(employee, cursor)) keys.push(dateKey(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return keys;
+}
+
+/** Approved-leave working days for `employee` that fall within `[start, end]`. */
+export function leaveWorkingDaysBetween(employee: Employee, start: Date, end: Date): number {
+  if (start > end) return 0;
+  let days = 0;
+  const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  while (cursor <= last) {
+    if (isWorkingDay(cursor) && isOnLeaveDate(employee, cursor)) days += 1;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return days;
+}
+
+// ============================================================================
+// Task schedule — the ONE model of "which hours of which task land on which day".
+// Every deadline-driven number in WorkLens (employee capacity, team capacity,
+// assignment projections, the Daily Tasks view, the calendar) is derived from this
+// so no screen can drift onto its own scheduling maths.
+//
+//   Estimated Task Hours ÷ Available Working Days Until Deadline = Daily Required Hours
+//
+// where "available working days" excludes weekends, approved leave, and days before
+// the task's start/assignment date. An explicit deadline always wins; with none, the
+// priority's SLA window stands in (High 24h / Medium 1 week / Low 1 month).
+// ============================================================================
+
+export interface ScheduledWorkItem {
+  key: string;
+  title: string;
+  type: "Ticket" | "Ad-hoc";
+  ticketId?: string;
+  priority: "High" | "Medium" | "Low";
+  /** In Progress / On Hold — Completed items are never scheduled. */
+  status: "In Progress" | "On Hold";
+  /** In Progress and past its deadline. Still distributed (collapsed onto today). */
+  overdue: boolean;
+  remainingHours: number;
+  totalHours: number;
+  progress: number;
+  startDate: Date;
+  deadline: Date;
+  /** `YYYY-MM-DD` keys the remaining effort is spread across. Empty for On Hold. */
+  workingDayKeys: string[];
+  /** `remainingHours ÷ workingDayKeys.length` — the even per-day distribution.
+   * 0 for On Hold. */
+  dailyHours: number;
+}
+
+export interface DayAllocation {
+  item: ScheduledWorkItem;
+  hours: number;
+}
+
+export interface EmployeeDayPlan {
+  date: Date;
+  key: string;
+  /** e.g. "Monday". */
+  weekdayLabel: string;
+  isToday: boolean;
+  /** A working day (Sun–Thu) that is not an approved-leave day. */
+  isWorkingDay: boolean;
+  onLeave: boolean;
+  allocations: DayAllocation[];
+  totalHours: number;
+}
+
+export interface EmployeeSchedule {
+  employeeId: string;
+  /** All non-completed items (In Progress + On Hold). */
+  items: ScheduledWorkItem[];
+  /** In Progress items only — the ones with a live daily distribution. */
+  activeItems: ScheduledWorkItem[];
+  /** Allocations landing on one day. */
+  allocationsForDay: (key: string) => DayAllocation[];
+  /** The next `workingDays` working days from `from` (inclusive), each with its
+   * planned tasks and total planned hours. Non-working days in between are skipped. */
+  planForRange: (from: Date, workingDays: number) => EmployeeDayPlan[];
+  /** Deadline-driven hours landing in the current (Sunday-based) week — the value
+   * `computeEmployeeCapacity` turns into utilization. */
+  weeklyScheduledHours: number;
+}
+
+function buildScheduledItem(params: {
+  key: string;
+  title: string;
+  type: "Ticket" | "Ad-hoc";
+  ticketId?: string;
+  priority: "High" | "Medium" | "Low";
+  status: "In Progress" | "On Hold";
+  remainingHours: number;
+  totalHours: number;
+  progress: number;
+  startDate: Date;
+  deadline: Date;
+  employee: Employee;
+}): ScheduledWorkItem {
+  const { employee, ...rest } = params;
+  const { status, remainingHours, startDate, deadline } = rest;
+  const today = todayStart();
+  const from = startDate > today ? startDate : today;
+
+  if (status === "On Hold" || remainingHours <= 0) {
+    return { ...rest, overdue: false, workingDayKeys: [], dailyHours: 0 };
+  }
+
+  let workingDayKeys = deadline < from ? [] : scheduledWorkingDayKeys(from, deadline, employee);
+  const overdue = deadline < today;
+  // Overdue, or no working days left before the deadline (e.g. deadline is a weekend
+  // or falls entirely inside leave) → the whole remaining effort is needed today.
+  if (workingDayKeys.length === 0) workingDayKeys = [dateKey(today)];
+
+  const dailyHours = Math.round((remainingHours / workingDayKeys.length) * 100) / 100;
+  return { ...rest, overdue, workingDayKeys, dailyHours };
+}
+
+/** The task schedule for one employee — see the block comment above. */
+export function computeEmployeeSchedule(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup
+): EmployeeSchedule {
+  const items: ScheduledWorkItem[] = [];
+
+  tickets
+    .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id))
+    .forEach((t) => {
+      const entry = getEntry(`${employee.id}:${t.id}`);
+      const status = unifiedItemStatus(entry.workflowStatus, t.status);
+      if (status === "Completed") return;
+      const effort = ticketEffortForEmployee(t, employee.id);
+      const remaining = itemRemainingHours(effort, false, entry.progress);
+      items.push(
+        buildScheduledItem({
+          key: `${employee.id}:${t.id}`,
+          title: t.title,
+          type: "Ticket",
+          ticketId: t.id,
+          priority: t.priority,
+          status,
+          remainingHours: remaining,
+          totalHours: effort,
+          progress: Math.min(100, Math.max(0, entry.progress ?? 0)),
+          startDate: itemStartDate(t.raisedDate),
+          deadline: resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate),
+          employee,
+        })
+      );
+    });
+
+  employee.adhoc.forEach((a) => {
+    const entry = getEntry(`${employee.id}:${a.id}`);
+    const status = unifiedItemStatus(entry.workflowStatus);
+    if (status === "Completed") return;
+    const remaining = itemRemainingHours(a.estimatedHours, false, entry.progress);
+    // No explicit deadline → SLA window from today establishes the schedule.
+    const deadline = resolveDueDate(a.deadline === "Ongoing" ? null : a.deadline, a.priority);
+    items.push(
+      buildScheduledItem({
+        key: `${employee.id}:${a.id}`,
+        title: a.name,
+        type: "Ad-hoc",
+        priority: a.priority,
+        status,
+        remainingHours: remaining,
+        totalHours: a.estimatedHours,
+        progress: Math.min(100, Math.max(0, entry.progress ?? 0)),
+        startDate: todayStart(),
+        deadline,
+        employee,
+      })
+    );
+  });
+
+  const activeItems = items.filter((i) => i.status === "In Progress");
+
+  const byDay = new Map<string, DayAllocation[]>();
+  activeItems.forEach((item) => {
+    item.workingDayKeys.forEach((k) => {
+      const list = byDay.get(k) ?? [];
+      list.push({ item, hours: item.dailyHours });
+      byDay.set(k, list);
+    });
+  });
+
+  const allocationsForDay = (key: string) => byDay.get(key) ?? [];
+
+  const planForRange = (from: Date, workingDays: number): EmployeeDayPlan[] => {
+    const plans: EmployeeDayPlan[] = [];
+    const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+    const today = todayStart();
+    let guard = 0;
+    while (plans.length < workingDays && guard < 400) {
+      guard += 1;
+      const working = isWorkingDay(cursor);
+      const onLeave = isOnLeaveDate(employee, cursor);
+      if (working) {
+        const key = dateKey(cursor);
+        const allocations = allocationsForDay(key);
+        plans.push({
+          date: new Date(cursor),
+          key,
+          weekdayLabel: cursor.toLocaleDateString("en-US", { weekday: "long" }),
+          isToday: cursor.getTime() === today.getTime(),
+          isWorkingDay: working && !onLeave,
+          onLeave,
+          allocations,
+          totalHours: Math.round(allocations.reduce((s, a) => s + a.hours, 0) * 10) / 10,
+        });
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return plans;
+  };
+
+  // Hours landing in the current Sunday-based week — sum each active item's daily
+  // distribution over the days it's scheduled that fall in this week.
+  const { start: weekStart, end: weekEnd } = currentWeekBounds(todayStart());
+  let weeklyScheduledHours = 0;
+  activeItems.forEach((item) => {
+    const inWeek = item.workingDayKeys.filter((k) => {
+      const d = dateFromKey(k);
+      return d >= weekStart && d <= weekEnd;
+    }).length;
+    weeklyScheduledHours += item.dailyHours * inWeek;
+  });
+  weeklyScheduledHours = Math.round(weeklyScheduledHours * 10) / 10;
+
+  return { employeeId: employee.id, items, activeItems, allocationsForDay, planForRange, weeklyScheduledHours };
+}
+
+/**
+ * The effort (hours) one work item places on an employee **in the current week**,
+ * driven by its deadline — the same even day-by-day distribution the Daily Tasks view
+ * shows, summed over this week's working days. Used for assignment projections where a
+ * full `computeEmployeeSchedule` isn't to hand.
+ */
+export function weeklyRequiredHoursForItem(
+  remainingHours: number,
+  start: Date,
+  due: Date,
+  employee: Employee
+): number {
+  if (remainingHours <= 0) return 0;
+  const today = todayStart();
+  const from = start > today ? start : today;
+  let keys = due < from ? [] : scheduledWorkingDayKeys(from, due, employee);
+  if (keys.length === 0) keys = [dateKey(today)];
+  const perDay = remainingHours / keys.length;
+  const { start: weekStart, end: weekEnd } = currentWeekBounds(today);
+  const inWeek = keys.filter((k) => {
+    const d = dateFromKey(k);
+    return d >= weekStart && d <= weekEnd;
+  }).length;
+  return Math.round(perDay * inWeek * 10) / 10;
+}
+
+/** The deadline-driven weekly load for one assigned ticket on `employee`. */
+export function ticketWeeklyRequiredHours(ticket: AssignedTicket, employee: Employee, remainingHours: number): number {
+  const due = resolveDueDate(ticket.expectedResolutionDate, ticket.priority, ticket.raisedDate);
+  return weeklyRequiredHoursForItem(remainingHours, itemStartDate(ticket.raisedDate), due, employee);
+}
+
+/** The deadline-driven weekly load for one ad-hoc item — its SLA window stands in for
+ * the missing deadline. */
+export function adhocWeeklyRequiredHours(item: AdhocItem, employee: Employee, remainingHours: number): number {
+  if (remainingHours <= 0) return 0;
+  const due = resolveDueDate(item.deadline === "Ongoing" ? null : item.deadline, item.priority);
+  return weeklyRequiredHoursForItem(remainingHours, todayStart(), due, employee);
+}
+
 export interface EmployeeCapacity {
   /** Contracted weekly hours from HR. */
   weeklyHours: number;
@@ -68,9 +386,16 @@ export interface EmployeeCapacity {
    * employee is currently on leave. This is the denominator for every
    * utilization/availability figure in the app. */
   workingHours: number;
-  /** Remaining workload hours across active assigned work (progress and completion
-   * already applied). On-hold work still counts — only Completed work is zeroed. */
+  /** Deadline-driven workload hours for the **current week** — for each active item,
+   * its remaining effort spread across the working days between its start date and its
+   * deadline (an explicit deadline always wins; the SLA window only stands in when
+   * there is none), scaled to a week. This is what utilization and capacity are built
+   * on. On Hold and Completed work contribute 0 (see `unifiedItemStatus`). */
   activeHours: number;
+  /** Total remaining effort across active assigned work, irrespective of deadline —
+   * the raw "hours left to do" figure, for display where a plain total is wanted
+   * (e.g. "Total Workload"). Not used for utilization. */
+  totalRemainingHours: number;
   /** Spare capacity in hours — `workingHours − activeHours`, floored at 0, and
    * exactly 0 while the employee is currently on leave. */
   availableHours: number;
@@ -124,22 +449,12 @@ export function weeklyWorkingHours(employee: Employee): number {
  * seed duplicate of the ticket concept, superseded by the live tickets store) is
  * deliberately excluded so real tickets aren't counted twice under two systems. */
 export function computeEmployeeCapacity(employee: Employee, tickets: AssignedTicket[], getEntry: WorkLogLookup): EmployeeCapacity {
-  let activeHours = 0;
-
-  tickets
-    .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id))
-    .forEach((t) => {
-      const entry = getEntry(`${employee.id}:${t.id}`);
-      const effort = ticketEffortForEmployee(t, employee.id);
-      activeHours += itemRemainingHours(effort, isItemComplete(entry.workflowStatus, t.status), entry.progress);
-    });
-
-  employee.adhoc.forEach((a) => {
-    const entry = getEntry(`${employee.id}:${a.id}`);
-    activeHours += itemRemainingHours(a.estimatedHours, isItemComplete(entry.workflowStatus), entry.progress);
-  });
-
-  activeHours = Math.round(activeHours * 10) / 10;
+  // One schedule, one set of numbers. On Hold / Completed work is not "active" and
+  // contributes nothing to this week's load (`activeItems` is In Progress only).
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
+  const activeHours = schedule.weeklyScheduledHours;
+  const totalRemainingHours =
+    Math.round(schedule.activeItems.reduce((sum, i) => sum + i.remainingHours, 0) * 10) / 10;
   const weeklyHours = employee.weeklyHours || 40;
   const onLeave = isCurrentlyOnLeave(employee);
   // Currently on leave → no working hours and no availability, regardless of how the
@@ -153,6 +468,7 @@ export function computeEmployeeCapacity(employee: Employee, tickets: AssignedTic
     weeklyHours,
     workingHours,
     activeHours,
+    totalRemainingHours,
     availableHours: onLeave ? 0 : Math.max(0, Math.round((workingHours - activeHours) * 10) / 10),
     utilization,
     availablePercent: onLeave ? 0 : availableCapacity(utilization),
@@ -167,18 +483,37 @@ export function employeeAvailablePercent(employee: Employee): number {
   return isCurrentlyOnLeave(employee) ? 0 : availableCapacity(employee.currentUtilization);
 }
 
-/** Resulting utilization if `extraHours` of new work were added to `employee` —
- * uses the exact same formula as `computeEmployeeCapacity` so the assignment
- * warning and the dashboards can never disagree. */
+/** Resulting utilization if `extraWeeklyHours` of new weekly load were added to
+ * `employee` — uses the exact same formula as `computeEmployeeCapacity` so the
+ * assignment warning and the dashboards can never disagree. `extraWeeklyHours` is a
+ * per-week figure (the deadline-driven weekly load of the new work), not a raw estimate. */
 export function projectedUtilization(
   employee: Employee,
   tickets: AssignedTicket[],
   getEntry: WorkLogLookup,
-  extraHours: number
+  extraWeeklyHours: number
 ): number {
   const { activeHours, workingHours, weeklyHours } = computeEmployeeCapacity(employee, tickets, getEntry);
   const denom = workingHours > 0 ? workingHours : weeklyHours;
-  return Math.round(((activeHours + Math.max(0, extraHours)) / denom) * 100);
+  return Math.round(((activeHours + Math.max(0, extraWeeklyHours)) / denom) * 100);
+}
+
+/** Resulting utilization if `employee` picked up `ticket` — the ticket's deadline-driven
+ * weekly load added on top of their current capacity. Already-assigned tickets add nothing.
+ * The single calculation behind every "After Assignment: N%" figure in the app. */
+export function projectedUtilizationForTicket(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  ticket: AssignedTicket
+): number {
+  const currentIds = ticket.assignedEmployeeIds ?? [];
+  if (currentIds.includes(employee.id)) return computeEmployeeCapacity(employee, tickets, getEntry).utilization;
+  // Effort this employee would carry: whole estimate as sole owner, half if joining
+  // someone already on it (the assign flows here replace, not co-assign, but be safe).
+  const effort = currentIds.length >= 1 ? Math.round((ticket.estimatedHours / 2) * 10) / 10 : ticket.estimatedHours;
+  const extra = ticketWeeklyRequiredHours(ticket, employee, effort);
+  return projectedUtilization(employee, tickets, getEntry, extra);
 }
 
 export interface EmployeeWorkItem {
@@ -189,6 +524,8 @@ export interface EmployeeWorkItem {
   status: DisplayStatus;
   progress: number;
   remainingHours: number;
+  /** Deadline-driven effort this item places on the current week (0 unless In Progress). */
+  weeklyRequiredHours: number;
   ticketId?: string;
   /** Set once the item is Completed — its completion date. Null otherwise. */
   completedDate: string | null;
@@ -209,6 +546,7 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
     .forEach((t) => {
       const entry = getEntry(`${employee.id}:${t.id}`);
       const status = unifiedItemStatus(entry.workflowStatus, t.status);
+      const remaining = itemRemainingHours(ticketEffortForEmployee(t, employee.id), status === "Completed", entry.progress);
       items.push({
         key: `${employee.id}:${t.id}`,
         title: t.title,
@@ -216,7 +554,8 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
         dueDate: ticketDueLabel(t),
         status,
         progress: status === "Completed" ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
-        remainingHours: itemRemainingHours(ticketEffortForEmployee(t, employee.id), status === "Completed", entry.progress),
+        remainingHours: remaining,
+        weeklyRequiredHours: status === "In Progress" ? ticketWeeklyRequiredHours(t, employee, remaining) : 0,
         ticketId: t.id,
         completedDate: status === "Completed" ? (t.resolvedDate ?? entry.completedAt ?? null) : null,
         holdStart: status === "On Hold" ? (t.holdStartDate ?? entry.holdStartDate ?? null) : null,
@@ -227,6 +566,7 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
   employee.adhoc.forEach((a) => {
     const entry = getEntry(`${employee.id}:${a.id}`);
     const status = unifiedItemStatus(entry.workflowStatus);
+    const remaining = itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress);
     items.push({
       key: `${employee.id}:${a.id}`,
       title: a.name,
@@ -234,7 +574,8 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
       dueDate: adhocDueLabel(a),
       status,
       progress: status === "Completed" ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
-      remainingHours: itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress),
+      remainingHours: remaining,
+      weeklyRequiredHours: status === "In Progress" ? adhocWeeklyRequiredHours(a, employee, remaining) : 0,
       completedDate: status === "Completed" ? (entry.completedAt ?? null) : null,
       holdStart: status === "On Hold" ? (entry.holdStartDate ?? null) : null,
       holdEnd: status === "On Hold" ? (entry.holdEndDate ?? null) : null,

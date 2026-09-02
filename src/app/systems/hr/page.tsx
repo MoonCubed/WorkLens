@@ -68,8 +68,6 @@ function makeEmployee(
     weeklyHours: input.weeklyHours,
     workload: { project: 0, operational: 0, adhoc: 0, other: 0 },
     currentUtilization: 0,
-    futureCapacity: 0,
-    forecast8Week: [0, 0, 0, 0, 0, 0, 0, 0],
     upcomingTickets: [],
     adhoc: [],
     leaveEvents: [],

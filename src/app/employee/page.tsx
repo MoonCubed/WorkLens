@@ -5,22 +5,29 @@ import { Bell } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { InfoTip } from "@/components/ui/InfoTip";
-import { CapacityChart } from "@/components/charts/CapacityChart";
 import { TaskDetailPanel } from "@/components/work/TaskDetailPanel";
-import { getDueStatus, todayStart, weekOfYear } from "@/lib/date";
+import { DailyTasks } from "@/components/employee/DailyTasks";
+import { getDueStatus } from "@/lib/date";
 import { computeEmployeeWorkItems, computeEmployeeCapacity, type DisplayStatus } from "@/lib/capacityEngine";
-import { OVERLOAD_THRESHOLD, RECOMMENDED_CAPACITY } from "@/data/config";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useTickets } from "@/store/tickets-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
 
-const STATUS_STYLES: Record<DisplayStatus, string> = {
+const STATUS_STYLES: Record<DisplayStatus | "Overdue", string> = {
   Completed: "bg-[var(--status-good-bg)] border-[var(--status-good-border)] text-[var(--status-good)]",
   "In Progress": "bg-brand-50 border-brand-100 text-brand-700",
   "On Hold": "bg-brand-50/60 border-border-strong text-ink-secondary",
+  Overdue: "bg-[var(--status-critical-bg)] border-[var(--status-critical-border)] text-[var(--status-critical)]",
 };
+
+/** The active status to show for an employee's work item — In Progress / On Hold /
+ * Overdue (a passed deadline on active work). Completed never reaches these lists. */
+function activeStatusLabel(status: DisplayStatus, dueDate: string | null): DisplayStatus | "Overdue" {
+  if (status === "In Progress" && dueDate && getDueStatus(dueDate) === "Overdue") return "Overdue";
+  return status;
+}
 
 export default function EmployeeDashboardPage() {
   const { employeeId } = useEmployeeSession();
@@ -37,9 +44,6 @@ export default function EmployeeDashboardPage() {
   const capacity = useMemo(() => computeEmployeeCapacity(me, tickets, getEntry), [me, tickets, getEntry]);
   // Availability — 0% while on leave, never "100% free".
   const availPct = capacity.availablePercent;
-  // The forecast entry three weeks out, labelled with the app-wide 1–52 week number.
-  const week4 = me.forecast8Week[3] ?? capacity.utilization;
-  const week4Number = weekOfYear(new Date(todayStart().getFullYear(), todayStart().getMonth(), todayStart().getDate() + 21));
 
   const workItems = useMemo(() => computeEmployeeWorkItems(me, tickets, getEntry), [me, tickets, getEntry]);
   const activeWorkItems = workItems.filter((i) => i.status !== "Completed");
@@ -47,8 +51,10 @@ export default function EmployeeDashboardPage() {
   const dueSoonCount = activeWorkItems.filter((i) => i.dueDate && getDueStatus(i.dueDate) === "Due Soon").length;
   const detailTicket = openTicketId ? tickets.find((t) => t.id === openTicketId) ?? null : null;
 
-  const operationalHours = Math.round(activeWorkItems.filter((i) => i.type === "Ticket").reduce((sum, i) => sum + i.remainingHours, 0) * 10) / 10;
-  const adhocHours = Math.round(activeWorkItems.filter((i) => i.type === "Ad-hoc").reduce((sum, i) => sum + i.remainingHours, 0) * 10) / 10;
+  // Deadline-driven weekly load per bucket, so the rows add up to the week's working
+  // hours and match the utilization figure above.
+  const operationalHours = Math.round(activeWorkItems.filter((i) => i.type === "Ticket").reduce((sum, i) => sum + i.weeklyRequiredHours, 0) * 10) / 10;
+  const adhocHours = Math.round(activeWorkItems.filter((i) => i.type === "Ad-hoc").reduce((sum, i) => sum + i.weeklyRequiredHours, 0) * 10) / 10;
   const workloadRows = [
     { label: "Assigned tickets", hours: operationalHours },
     { label: "Ad-hoc work", hours: adhocHours },
@@ -59,7 +65,7 @@ export default function EmployeeDashboardPage() {
     <div className="max-w-6xl space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-ink tracking-tight">Good morning, {firstName}</h1>
-        <p className="mt-1 text-sm text-ink-muted">Here&rsquo;s your current capacity and workload outlook.</p>
+        <p className="mt-1 text-sm text-ink-muted">Here&rsquo;s your current capacity and what&rsquo;s planned for today.</p>
       </div>
 
       {detailError && (
@@ -72,7 +78,7 @@ export default function EmployeeDashboardPage() {
         <Card className="flex flex-col items-center justify-center text-center py-6">
           <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-secondary">
             Current Utilization
-            <InfoTip text="Remaining work hours across your active tickets and ad-hoc items ÷ your available working hours for the week × 100. Approved leave reduces available hours; completing an item or logging progress lowers this immediately." />
+            <InfoTip text="Each active task's remaining effort is spread evenly across the working days until its deadline. The hours that land in this week ÷ your available working hours × 100. On Hold and Completed work don't count; approved leave reduces available hours." />
           </div>
           <p className="mt-2 text-4xl font-semibold text-ink tabular">{capacity.utilization}%</p>
           <div className="mt-3">
@@ -82,7 +88,7 @@ export default function EmployeeDashboardPage() {
         <Card className="flex flex-col items-center justify-center text-center py-6">
           <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-secondary">
             Available Capacity
-            <InfoTip text="Your available working hours for the week minus your remaining active work hours." />
+            <InfoTip text="Your available working hours for the week minus the work planned for this week from your task deadlines." />
           </div>
           <p className="mt-2 text-4xl font-semibold text-ink tabular">{availPct}%</p>
           <p className="mt-1 text-xs text-ink-muted">{capacity.availableHours}h</p>
@@ -113,19 +119,25 @@ export default function EmployeeDashboardPage() {
         </p>
       </div>
 
-      {week4 >= 80 && (
-        <div className="flex items-start gap-3 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-4 py-3.5">
-          <Bell className="h-4 w-4 mt-0.5 shrink-0 text-[var(--status-warning)]" />
+      {capacity.utilization > 100 && (
+        <div className="flex items-start gap-3 rounded-xl border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-4 py-3.5">
+          <Bell className="h-4 w-4 mt-0.5 shrink-0 text-[var(--status-critical)]" />
           <div className="text-sm text-ink">
             <p>
-              Your capacity is expected to reach <span className="font-semibold">{week4}%</span> in Week {week4Number}.
+              Your planned work this week (<span className="font-semibold">{capacity.activeHours}h</span>) is more than your
+              available hours (<span className="font-semibold">{capacity.workingHours}h</span>).
             </p>
             <p className="mt-1 text-ink-secondary">
-              If you expect additional work, consider submitting a handover or capacity note.
+              A deadline may be at risk — consider requesting an adjustment or a handover.
             </p>
           </div>
         </div>
       )}
+
+      <Card>
+        <CardHeader title="Today's Plan" subtitle="Tasks scheduled for today, from your deadlines and estimated effort" />
+        <DailyTasks employee={me} todayOnly onOpenTicket={(id) => setOpenTicketId(id)} />
+      </Card>
 
       <Card>
         <CardHeader
@@ -177,23 +189,19 @@ export default function EmployeeDashboardPage() {
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
                   <span className="tabular text-xs text-ink-secondary">{item.progress}%</span>
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[item.status]}`}>
-                    {item.status}
-                  </span>
+                  {(() => {
+                    const label = activeStatusLabel(item.status, item.dueDate);
+                    return (
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[label]}`}>
+                        {label}
+                      </span>
+                    );
+                  })()}
                 </div>
               </li>
             ))}
           </ul>
         )}
-      </Card>
-
-      <Card>
-        <CardHeader title="Capacity Over Time" subtitle="Weekly or monthly — this period is live, the rest is forecast" />
-        <CapacityChart current={capacity.utilization} forecast={me.forecast8Week} currentLabelText="This period" />
-        <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-ink-muted">
-          <LegendDash color="var(--status-warning)" label={`${RECOMMENDED_CAPACITY}% recommended capacity threshold`} />
-          <LegendDash color="var(--status-critical)" label={`${OVERLOAD_THRESHOLD}% overload threshold`} />
-        </div>
       </Card>
 
       {detailTicket && (
@@ -222,14 +230,5 @@ export default function EmployeeDashboardPage() {
         />
       )}
     </div>
-  );
-}
-
-function LegendDash({ color, label }: { color: string; label: string }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      <span className="h-0.5 w-3.5 rounded-full" style={{ background: color, opacity: 0.7 }} />
-      {label}
-    </span>
   );
 }

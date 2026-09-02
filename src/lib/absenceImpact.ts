@@ -9,13 +9,30 @@
 
 import type { Employee, Skill } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
-import { todayStart, parseLooseDate, getDueStatus } from "@/lib/date";
+import {
+  todayStart,
+  parseLooseDate,
+  getDueStatus,
+  resolveDueDate,
+  addDays,
+  daysBetween,
+  countWorkingDays,
+} from "@/lib/date";
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
-import { ticketEffortForEmployee } from "@/lib/capacityEngine";
+import {
+  ticketEffortForEmployee,
+  itemStartDate,
+  leaveWorkingDaysBetween,
+  weeklyRequiredHoursForItem,
+} from "@/lib/capacityEngine";
 import { computeSkillMatch } from "@/lib/simulate";
 import { availableCapacity } from "@/lib/capacity";
 import { rankCandidatesForTicket } from "@/lib/ticketMatch";
-import { CAPACITY_THRESHOLDS } from "@/data/config";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
+
+// Re-exported so existing importers (`@/lib/absenceImpact`) keep working — the shared
+// definitions now live in `@/lib/date`.
+export { addDays, daysBetween, countWorkingDays };
 
 export type WorkItemType = "Ticket" | "Ad-hoc";
 export type DeadlineStatus = "Overdue" | "Approaching" | "On Track";
@@ -39,13 +56,24 @@ export interface AffectedWorkItem {
 
 export interface CoverageCandidate {
   employee: Employee;
+  /** Current capacity % (synced utilization) — the "Current Capacity" figure. */
   utilization: number;
   availableCapacity: number;
+  /** Capacity % if this person covered the item — the "After Assignment" figure. */
   projectedCapacity: number;
   skillMatch: number;
   matchedSkills: string[];
   workloadDuringAbsence: number;
   onLeave: boolean;
+  /** Covering this item would push them past the overload threshold. Surfaced as a
+   * risk, never a block — the supervisor can still assign. */
+  overloaded: boolean;
+  /** Can be picked at all — everyone in the unit except those on leave during the
+   * absence. A missing skill match does NOT make someone un-assignable; it only
+   * lowers their ranking. */
+  assignable: boolean;
+  /** Suitable to recommend automatically — assignable, not overloaded, has some
+   * skill overlap (or the item needs no particular skill). */
   eligible: boolean;
   excludeReason?: string;
 }
@@ -67,31 +95,6 @@ export interface AbsenceImpact {
   deadlinesAtRisk: number;
   candidatesByItem: Map<string, CoverageCandidate[]>;
   primaryCandidateId: string | null;
-}
-
-export function addDays(date: Date, days: number): Date {
-  const next = new Date(date);
-  next.setDate(next.getDate() + days);
-  return next;
-}
-
-export function daysBetween(a: Date, b: Date): number {
-  const msPerDay = 24 * 60 * 60 * 1000;
-  return Math.round((b.getTime() - a.getTime()) / msPerDay);
-}
-
-/** The org's work week is Sunday–Thursday (see employee working schedules) — Friday and
- * Saturday are the weekend. Inclusive of both endpoints. */
-export function countWorkingDays(start: Date, end: Date): number {
-  if (start > end) return 0;
-  let count = 0;
-  let cursor = new Date(start);
-  while (cursor <= end) {
-    const day = cursor.getDay();
-    if (day !== 5 && day !== 6) count++;
-    cursor = addDays(cursor, 1);
-  }
-  return count;
 }
 
 function rangesOverlap(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
@@ -146,8 +149,50 @@ function assessRisk(
   };
 }
 
+/**
+ * Does this item actually have planned work/effort during `[absenceStart, absenceEnd]`?
+ *
+ * A deadline after the leave is *not* enough — what matters is whether, on the item's
+ * deadline-driven schedule, effort is still outstanding once the leave begins:
+ *
+ *  - Deadline before the leave starts        → work wraps up before the leave  → no.
+ *  - Work only starts after the person is back → nothing to hand over           → no.
+ *  - Enough working time before the leave to finish it, and the deadline doesn't
+ *    fall on/inside the leave                  → it can be cleared beforehand    → no.
+ *  - Otherwise (incl. deadline during the leave) → planned effort overlaps       → yes.
+ */
+export function plannedWorkOverlapsAbsence(
+  remainingHours: number,
+  startDate: Date,
+  due: Date | null,
+  employee: Employee,
+  absenceStart: Date,
+  absenceEnd: Date
+): boolean {
+  if (remainingHours <= 0) return false;
+  const today = todayStart();
+  const plannedStart = startDate > today ? startDate : today;
+  if (plannedStart > absenceEnd) return false;
+  if (due && due < absenceStart) return false;
+
+  const hoursPerDay = (employee.weeklyHours || 40) / 5;
+  const dayBeforeAbsence = addDays(absenceStart, -1);
+  const workingDaysBefore = Math.max(
+    0,
+    countWorkingDays(plannedStart, dayBeforeAbsence) -
+      leaveWorkingDaysBetween(employee, plannedStart, dayBeforeAbsence)
+  );
+  const capacityBefore = workingDaysBefore * hoursPerDay;
+
+  // Comfortably finishable before the leave and the deadline isn't forcing it into
+  // the leave window → no handover needed.
+  if (capacityBefore >= remainingHours && (!due || due > absenceEnd)) return false;
+  return true;
+}
+
 /** All active work assigned to `employee` — live tickets plus their seed
- * project/ad-hoc workload — evaluated against a specific absence window. */
+ * project/ad-hoc workload — whose planned effort actually overlaps the absence window
+ * (a deadline after the leave is not, on its own, enough — see `plannedWorkOverlapsAbsence`). */
 export function computeAffectedWork(
   employee: Employee,
   tickets: AssignedTicket[],
@@ -161,6 +206,11 @@ export function computeAffectedWork(
 
   tickets
     .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id) && t.status !== "Completed")
+    .filter((t) => {
+      const effort = ticketEffortForEmployee(t, employee.id);
+      const due = resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate);
+      return plannedWorkOverlapsAbsence(effort, itemStartDate(t.raisedDate), due, employee, start, end);
+    })
     .forEach((t) => {
       const dueLabel = ticketDueLabel(t);
       const effort = ticketEffortForEmployee(t, employee.id);
@@ -184,6 +234,20 @@ export function computeAffectedWork(
 
   employee.adhoc.forEach((a) => {
     const dueDate = a.deadline === "Ongoing" ? null : adhocDueLabel(a);
+    // "Ongoing" ad-hoc work is continuous — it always needs cover during an absence.
+    // Dated ad-hoc work follows the same planned-overlap test as tickets.
+    const overlaps =
+      a.deadline === "Ongoing"
+        ? a.estimatedHours > 0
+        : plannedWorkOverlapsAbsence(
+            a.estimatedHours,
+            todayStart(),
+            resolveDueDate(a.deadline, a.priority),
+            employee,
+            start,
+            end
+          );
+    if (!overlaps) return;
     const { risk, explanation } = assessRisk(dueDate, start, end, a.estimatedHours, hoursPerDay);
     items.push({
       id: a.id,
@@ -237,7 +301,12 @@ function coverageCandidatesForItem(
             .map((s) => s.name)
             .filter((name) => required.some((r) => r.toLowerCase() === name.toLowerCase()));
           const avail = availableCapacity(e.currentUtilization);
-          const projected = Math.round(e.currentUtilization + (item.remainingHours / e.weeklyHours) * 100);
+          const due = item.dueDate ? parseLooseDate(item.dueDate) : null;
+          const extra = due
+            ? weeklyRequiredHoursForItem(item.remainingHours, todayStart(), due, e)
+            : item.remainingHours;
+          const denom = e.weeklyHours || 40;
+          const projected = Math.round(e.currentUtilization + (extra / denom) * 100);
           return { employee: e, skillMatch, matchedSkills, availableCapacity: avail, projectedCapacity: projected };
         })
         .sort((a, b) => b.skillMatch - a.skillMatch || b.availableCapacity - a.availableCapacity);
@@ -254,13 +323,16 @@ function coverageCandidatesForItem(
         (sum, w) => sum + w.remainingHours,
         0
       );
-      const overloaded = c.projectedCapacity > 100 || c.employee.currentUtilization >= CAPACITY_THRESHOLDS.atRisk.max;
+      const overloaded = c.projectedCapacity > OVERLOAD_THRESHOLD;
       const missingSkill = required.length > 0 && c.skillMatch === 0;
-      const eligible = !onLeave && !overloaded && !missingSkill;
+      // On leave during the absence is the only hard restriction — everyone else can
+      // be assigned; skill / capacity concerns only affect ranking and warnings.
+      const assignable = !onLeave;
+      const eligible = assignable && !overloaded && !missingSkill;
       let excludeReason: string | undefined;
       if (onLeave) excludeReason = "On leave during this period";
-      else if (overloaded) excludeReason = "Already at capacity";
-      else if (missingSkill) excludeReason = "Missing required skill";
+      else if (overloaded) excludeReason = "Covering this would exceed the overload threshold";
+      else if (missingSkill) excludeReason = "No matching skill — assign manually if needed";
 
       return {
         employee: c.employee,
@@ -272,11 +344,19 @@ function coverageCandidatesForItem(
         matchedSkills: c.matchedSkills,
         workloadDuringAbsence,
         onLeave,
+        overloaded,
+        assignable,
         eligible,
         excludeReason,
       };
     })
-    .sort((a, b) => Number(b.eligible) - Number(a.eligible) || b.skillMatch - a.skillMatch || b.availableCapacity - a.availableCapacity);
+    .sort(
+      (a, b) =>
+        Number(b.assignable) - Number(a.assignable) ||
+        Number(b.eligible) - Number(a.eligible) ||
+        b.skillMatch - a.skillMatch ||
+        a.projectedCapacity - b.projectedCapacity
+    );
 }
 
 /** Other employees in the unit already on approved leave, or with another pending
@@ -349,7 +429,8 @@ export function computeAbsenceImpact(params: {
   const urgentItems = affectedWork.filter((i) => i.risk === "Critical" || i.risk === "High");
   const topPickCounts = new Map<string, number>();
   urgentItems.forEach((item) => {
-    const top = candidatesByItem.get(item.id)?.find((c) => c.eligible);
+    const list = candidatesByItem.get(item.id);
+    const top = list?.find((c) => c.eligible) ?? list?.find((c) => c.assignable);
     if (top) topPickCounts.set(top.employee.id, (topPickCounts.get(top.employee.id) ?? 0) + 1);
   });
   let primaryCandidateId: string | null = null;
@@ -361,7 +442,8 @@ export function computeAbsenceImpact(params: {
     }
   });
   if (!primaryCandidateId && affectedWork[0]) {
-    primaryCandidateId = candidatesByItem.get(affectedWork[0].id)?.find((c) => c.eligible)?.employee.id ?? null;
+    const list = candidatesByItem.get(affectedWork[0].id);
+    primaryCandidateId = (list?.find((c) => c.eligible) ?? list?.find((c) => c.assignable))?.employee.id ?? null;
   }
 
   return {

@@ -411,7 +411,7 @@ function EmployeeSection() {
 /* =============================== INTELLIGENCE ============================== */
 
 const INTELLIGENCE_CARDS = [
-  { icon: TrendingUp, title: "Forecast", body: "What is likely to happen if current plans continue?" },
+  { icon: TrendingUp, title: "Daily Schedule", body: "How does each task's effort spread across the working days until its deadline?" },
   { icon: Target, title: "Scenario", body: "What happens if we add this project?" },
   { icon: Lightbulb, title: "Recommendation", body: "Who is the best available match based on skills and capacity?" },
 ];
@@ -422,8 +422,8 @@ function IntelligenceSection() {
       <div className="mx-auto max-w-4xl text-center">
         <h2 className="text-3xl md:text-4xl font-semibold tracking-tight text-ink">Intelligence when it matters</h2>
         <p className="mt-4 max-w-xl mx-auto text-base leading-relaxed text-ink-secondary">
-          WorkLens combines real-time workload data with forecasting and scenario analysis to help supervisors
-          understand what may happen next.
+          WorkLens combines real-time workload data with deadline-based scheduling and scenario analysis to help
+          supervisors plan with confidence.
         </p>
 
         <div className="mt-12 grid gap-5 sm:grid-cols-3">

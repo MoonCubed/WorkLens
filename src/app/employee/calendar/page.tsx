@@ -10,8 +10,10 @@ import { useEmployees } from "@/store/employees-store";
 import { useTickets, type AssignedTicket } from "@/store/tickets-store";
 import { useCalendarEvents } from "@/store/calendar-events-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
-import { parseLooseDate, getDueStatus } from "@/lib/date";
+import { useWorkLog } from "@/store/work-log-store";
+import { parseLooseDate, getDueStatus, todayStart, dateFromKey } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
+import { computeEmployeeSchedule } from "@/lib/capacityEngine";
 
 function ticketDeadlineState(t: AssignedTicket): TicketDeadlineState {
   if (t.status === "Completed") return "closed";
@@ -25,6 +27,7 @@ export default function EmployeeCalendarPage() {
   const { tickets, updateTicketStatus, updateTicketPriority, updateTicketSkills, setTicketAssignees, setTicketEffortSplit } = useTickets();
   const { events, addEvent } = useCalendarEvents();
   const { submit: submitAdjustment } = useTaskAdjustments();
+  const { getEntry } = useWorkLog();
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
 
@@ -33,6 +36,26 @@ export default function EmployeeCalendarPage() {
 
   const items = useMemo(() => {
     const list: CalendarItem[] = [];
+
+    // Planned daily work — each task's estimated effort spread evenly across the
+    // working days until its deadline (the same schedule the capacity numbers use).
+    const schedule = computeEmployeeSchedule(me, tickets, getEntry);
+    schedule.planForRange(todayStart(), 40).forEach((plan) => {
+      if (plan.allocations.length === 0) return;
+      const breakdown = plan.allocations
+        .slice()
+        .sort((a, b) => b.hours - a.hours)
+        .map((a) => `${a.item.title} — ${Math.round(a.hours * 10) / 10}h`)
+        .join("\n");
+      list.push({
+        key: `plan-${plan.key}`,
+        label: `Planned: ${plan.totalHours}h`,
+        sublabel: `${plan.allocations.length} task${plan.allocations.length === 1 ? "" : "s"}`,
+        kind: "Planned",
+        date: dateFromKey(plan.key),
+        note: breakdown,
+      });
+    });
 
     myTickets.forEach((t) => {
       const date = parseLooseDate(ticketDueLabel(t));
@@ -80,7 +103,7 @@ export default function EmployeeCalendarPage() {
       });
 
     return list;
-  }, [myTickets, me, events]);
+  }, [myTickets, me, events, tickets, getEntry]);
 
   return (
     <>

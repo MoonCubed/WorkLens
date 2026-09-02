@@ -78,8 +78,6 @@ export interface Employee {
   weeklyHours: number;
   workload: WorkloadBreakdown;
   currentUtilization: number;
-  futureCapacity: number;
-  forecast8Week: number[];
   upcomingTickets: UpcomingTicket[];
   adhoc: AdhocItem[];
   leaveEvents: LeaveEvent[];

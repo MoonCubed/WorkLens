@@ -26,12 +26,60 @@ export function parseLooseDate(value: string): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+/** `date` shifted by `days` (can be negative), time preserved. */
+export function addDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+/** Whole days from `a` to `b` (b − a), rounded. */
+export function daysBetween(a: Date, b: Date): number {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.round((b.getTime() - a.getTime()) / msPerDay);
+}
+
+/** Stable `YYYY-MM-DD` key for a date (local), for grouping/lookups by day. */
+export function dateKey(date: Date): string {
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${m}-${d}`;
+}
+
+/** Inverse of `dateKey` — midnight local on that day. */
+export function dateFromKey(key: string): Date {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1);
+}
+
+/** True when `date` is a working day (Sun–Thu; Fri/Sat are the weekend). */
+export function isWorkingDay(date: Date): boolean {
+  const day = date.getDay();
+  return day !== 5 && day !== 6;
+}
+
+/** Working days (the org week is Sun–Thu; Fri/Sat are the weekend) between `start`
+ * and `end`, inclusive of both endpoints. 0 when `start` is after `end`. The one
+ * shared definition of "how many working days are in this window" — used by capacity,
+ * the deadline-driven daily-effort calculation, and the Handover planner alike. */
+export function countWorkingDays(start: Date, end: Date): number {
+  if (start > end) return 0;
+  let count = 0;
+  const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  while (cursor <= last) {
+    const day = cursor.getDay();
+    if (day !== 5 && day !== 6) count++;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return count;
+}
+
 // ============================================================================
 // Weeks — one Sunday-based scheme used everywhere in WorkLens. Sunday is the first
 // day of a week; weeks are numbered 1–52 within the calendar year. Every chart,
-// forecast, calendar and capacity calculation that talks about "weeks" goes through
-// these two helpers so nothing can drift onto a different (e.g. Monday-based, or
-// ISO-8601) system.
+// calendar and capacity calculation that talks about "weeks" goes through these two
+// helpers so nothing can drift onto a different (e.g. Monday-based, or ISO-8601) system.
 // ============================================================================
 
 /** The Sunday that starts the week containing `date` (time zeroed, local). */

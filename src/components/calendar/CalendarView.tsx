@@ -8,7 +8,7 @@ import { todayStart, todayLabel, toInputDateValue, formatDisplayDate, startOfWee
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-export type CalendarItemKind = "Ticket" | "Leave" | "Custom";
+export type CalendarItemKind = "Ticket" | "Leave" | "Custom" | "Planned";
 export type CalendarItemPriority = "High" | "Medium" | "Low";
 
 export const CUSTOM_ITEM_TYPES = ["Task", "Meeting", "Reminder", "Personal", "Other"] as const;
@@ -43,10 +43,12 @@ function chipStyle(item: CalendarItem): string {
     return "bg-brand-100 border-brand-600 text-brand-900";
   }
   if (item.kind === "Leave") return "bg-yellow-100 border-yellow-500 text-yellow-900";
+  if (item.kind === "Planned") return "bg-emerald-100 border-emerald-600 text-emerald-900";
   return "bg-purple-100 border-purple-600 text-purple-900";
 }
 
 const LEGEND: { label: string; dot: string }[] = [
+  { label: "Planned work (hours that day)", dot: "bg-emerald-600" },
   { label: "Ticket deadline (open)", dot: "bg-brand-600" },
   { label: "Ticket deadline (closed)", dot: "bg-gray-400" },
   { label: "Ticket deadline (overdue)", dot: "bg-[var(--status-critical)]" },
@@ -54,14 +56,16 @@ const LEGEND: { label: string; dot: string }[] = [
   { label: "Added by you", dot: "bg-purple-600" },
 ];
 
-// Overdue first, then leave, then ticket deadlines (High → Low), then custom items —
-// so the most time-sensitive thing in a day is always the first chip you see.
+// Overdue first, then leave, then planned-work summary, then ticket deadlines
+// (High → Low), then custom items — so the most time-sensitive thing in a day is
+// always the first chip you see.
 const PRIORITY_RANK: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
 function itemSortRank(item: CalendarItem): number {
   if (item.kind === "Ticket" && item.ticketState === "overdue") return 0;
   if (item.kind === "Leave") return 1;
-  if (item.kind === "Ticket") return 2 + (PRIORITY_RANK[item.priority ?? "Low"] ?? 2);
-  return 6;
+  if (item.kind === "Planned") return 2;
+  if (item.kind === "Ticket") return 3 + (PRIORITY_RANK[item.priority ?? "Low"] ?? 2);
+  return 7;
 }
 function sortItems(items: CalendarItem[]): CalendarItem[] {
   return [...items].sort((a, b) => itemSortRank(a) - itemSortRank(b));

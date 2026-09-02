@@ -12,7 +12,13 @@ import { useSupervisorSession } from "@/store/session-store";
 import { getDepartmentSupervisor, getUnitTeam } from "@/lib/hr";
 import { findLeaveOverlaps, countWorkingDays } from "@/lib/absenceImpact";
 import { parseLooseDate } from "@/lib/date";
-import { isCurrentlyOnLeave, projectedUtilization } from "@/lib/capacityEngine";
+import {
+  isCurrentlyOnLeave,
+  projectedUtilization,
+  weeklyRequiredHoursForItem,
+  itemStartDate,
+} from "@/lib/capacityEngine";
+import { resolveDueDate } from "@/lib/date";
 import { OVERLOAD_THRESHOLD } from "@/data/config";
 import { useWorkLog } from "@/store/work-log-store";
 
@@ -107,11 +113,25 @@ export default function HandoverPlannerPage() {
               const preferred = r.preferredEmployeeId
                 ? employees.find((e) => e.id === r.preferredEmployeeId)
                 : undefined;
-              const transferHours = tickets
-                .filter((t) => (t.assignedEmployeeIds ?? []).includes(r.employeeId) && t.status !== "Completed")
-                .reduce((sum, t) => sum + (t.estimatedHours || 0), 0);
+              // The deadline-driven weekly load the absent employee's assigned tickets
+              // would add to whoever covers them — same maths as everywhere else.
+              const transferWeeklyHours = preferred
+                ? tickets
+                    .filter((t) => (t.assignedEmployeeIds ?? []).includes(r.employeeId) && t.status === "In Progress")
+                    .reduce(
+                      (sum, t) =>
+                        sum +
+                        weeklyRequiredHoursForItem(
+                          t.estimatedHours || 0,
+                          itemStartDate(t.raisedDate),
+                          resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate),
+                          preferred
+                        ),
+                      0
+                    )
+                : 0;
               const preferredProjected = preferred
-                ? projectedUtilization(preferred, tickets, getEntry, transferHours)
+                ? projectedUtilization(preferred, tickets, getEntry, transferWeeklyHours)
                 : null;
               const preferredOverloaded = preferredProjected !== null && preferredProjected >= OVERLOAD_THRESHOLD;
 
@@ -138,9 +158,9 @@ export default function HandoverPlannerPage() {
                           {isCurrentlyOnLeave(preferred) ? " (currently on leave)" : ""}
                         </p>
                         <p className="mt-0.5 text-ink-secondary">
-                          Currently <span className="font-medium text-ink">{preferred.currentUtilization}%</span> utilized
+                          Current capacity <span className="font-medium text-ink">{preferred.currentUtilization}%</span>
                           {preferredProjected !== null && (
-                            <> · ~<span className="font-medium text-ink">{preferredProjected}%</span> if they cover this work</>
+                            <> → <span className="font-medium text-ink">{preferredProjected}%</span> after taking on this work</>
                           )}
                         </p>
                         {preferredOverloaded && (

@@ -8,8 +8,8 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { SkillLevelBar } from "@/components/ui/ProgressBar";
 import { SkillSelect } from "@/components/skills/SkillSelect";
-import { CapacityChart } from "@/components/charts/CapacityChart";
 import { AssignedTaskStatusChart } from "@/components/charts/AssignedTaskStatusChart";
+import { DailyTasks } from "@/components/employee/DailyTasks";
 import { WorkItemRow, type WorkRow } from "@/components/work/WorkItemRow";
 import type { SkillLevel } from "@/data/types";
 import { useEmployees } from "@/store/employees-store";
@@ -78,6 +78,8 @@ export default function EmployeeDetailsPage() {
   }
 
   const assignedTickets = tickets.filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id));
+  const activeAssignedTickets = assignedTickets.filter((t) => t.status !== "Completed");
+  const completedAssignedTickets = assignedTickets.filter((t) => t.status === "Completed");
 
   const ticketRows: WorkRow[] = [
     ...employee.upcomingTickets.map((t) => ({
@@ -88,7 +90,7 @@ export default function EmployeeDetailsPage() {
       deadline: seedTicketDueLabel(t),
       estimatedHours: t.estimatedHours,
     })),
-    ...assignedTickets.map((t) => ({
+    ...activeAssignedTickets.map((t) => ({
       key: `${employee.id}:${t.id}`,
       title: (t.assignedEmployeeIds ?? []).length > 1 ? `${t.title} (${t.id}) — shared` : `${t.title} (${t.id})`,
       type: "Ticket" as const,
@@ -163,12 +165,14 @@ export default function EmployeeDetailsPage() {
 
       <div className="grid gap-4 sm:grid-cols-3">
         <Card>
-          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Total Workload</p>
+          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">This Week&rsquo;s Workload</p>
           <p className="mt-1.5 text-2xl font-semibold text-ink tabular">
             {capacity.activeHours}h{" "}
             <span className="text-base font-normal text-ink-muted">/ {capacity.workingHours}h this week</span>
           </p>
-          <p className="mt-1 text-xs text-ink-muted">Remaining hours across active assigned work</p>
+          <p className="mt-1 text-xs text-ink-muted">
+            Deadline-driven effort due this week · {capacity.totalRemainingHours}h remaining in total
+          </p>
         </Card>
         <Card>
           <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Current Capacity</p>
@@ -244,16 +248,22 @@ export default function EmployeeDetailsPage() {
 
         <Card>
           <CardHeader
-            title="Assigned Task Status"
-            subtitle={`${assignedTickets.length} ticket${assignedTickets.length === 1 ? "" : "s"} assigned in WorkLens`}
+            title="Task Status"
+            subtitle={(() => {
+              const active = assignedTickets.filter((t) => t.status !== "Completed").length;
+              return `${active} active task${active === 1 ? "" : "s"} · In Progress, On Hold, Overdue`;
+            })()}
           />
           <AssignedTaskStatusChart tickets={assignedTickets} />
         </Card>
       </div>
 
       <Card>
-        <CardHeader title="Capacity Over Time" subtitle="Weekly or monthly — this period is live, the rest is forecast" />
-        <CapacityChart current={capacity.utilization} forecast={employee.forecast8Week} currentLabelText="This period" />
+        <CardHeader
+          title="Daily Plan"
+          subtitle="Estimated effort spread evenly across working days until each deadline"
+        />
+        <DailyTasks employee={employee} workingDays={6} />
       </Card>
 
       <div>
@@ -292,6 +302,33 @@ export default function EmployeeDetailsPage() {
           </Card>
         </div>
       </div>
+
+      {completedAssignedTickets.length > 0 && (
+        <Card>
+          <CardHeader
+            title="Completed Tasks"
+            subtitle={`${completedAssignedTickets.length} task${completedAssignedTickets.length === 1 ? "" : "s"} ${employee.name.split(" ")[0]} has finished — no longer active work`}
+          />
+          <ul className="divide-y divide-border">
+            {completedAssignedTickets.map((t) => (
+              <li key={t.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-ink">
+                    {t.title} <span className="text-xs font-normal text-ink-muted">({t.id})</span>
+                  </p>
+                  <p className="text-xs text-ink-muted mt-0.5">
+                    {t.priority} priority · {t.assignedUnit}
+                    {t.resolvedDate ? ` · completed ${t.resolvedDate}` : ""}
+                  </p>
+                </div>
+                <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-good)]">
+                  Completed
+                </span>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
 
       <Card>
         <CardHeader title="Leave / Availability" />

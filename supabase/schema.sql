@@ -114,6 +114,18 @@ exception
   when undefined_column then null;
 end $$;
 
+-- Forecasting was removed from the app — WorkLens now works from the actual task
+-- schedule (estimated hours spread evenly across the working days until each deadline)
+-- rather than a separate 8-week projection. The "futureCapacity" / "forecast8Week"
+-- columns are no longer read or written; drop their NOT NULL constraint so inserts
+-- that omit them still succeed. Columns are left in place (may hold historical data).
+do $$
+begin
+  alter table employees alter column "forecast8Week" drop not null;
+exception
+  when undefined_column then null;
+end $$;
+
 update employees set "supervisorId" = 'ahmed-al-hassan' where department = 'Data & Analytics' and id <> 'ahmed-al-hassan';
 update employees set "supervisorId" = 'saad-al-dawsari' where department = 'Digital Solutions' and id <> 'saad-al-dawsari';
 update employees set "supervisorId" = 'fatimah-al-mutairi' where department = 'Business Systems' and id <> 'fatimah-al-mutairi';

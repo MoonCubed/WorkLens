@@ -1,27 +1,44 @@
 "use client";
 
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
-import { TICKET_STATUS_OPTIONS, type TicketStatus } from "@/data/tickets";
+import type { AssignedTicket } from "@/store/tickets-store";
+import { ticketDueLabel } from "@/lib/due";
+import { getDueStatus } from "@/lib/date";
 
-const STATUS_COLORS: Record<TicketStatus, string> = {
+/** The active task-status buckets an employee's work falls into. Completed work is
+ * deliberately excluded — once a task is done it's no longer active employee work and
+ * drops off this view (it still lives in the completed/historical task lists). Overdue
+ * takes priority over In Progress / On Hold, matching `deliveryBucket`. */
+type ActiveBucket = "In Progress" | "On Hold" | "Overdue";
+
+const BUCKET_ORDER: ActiveBucket[] = ["In Progress", "On Hold", "Overdue"];
+
+const BUCKET_COLORS: Record<ActiveBucket, string> = {
   "In Progress": "var(--series-4)",
   "On Hold": "var(--ink-muted)",
-  Completed: "var(--series-3)",
+  Overdue: "var(--status-critical)",
 };
 
-/** Pie chart of the assigned tickets grouped by status. Shows one slice per status
- * that actually has tickets, plus a legend with counts. */
-export function AssignedTaskStatusChart({ tickets }: { tickets: { status: TicketStatus }[] }) {
-  const counts = TICKET_STATUS_OPTIONS.map((status) => ({
-    status,
-    count: tickets.filter((t) => t.status === status).length,
-    color: STATUS_COLORS[status],
+function bucketFor(ticket: AssignedTicket): ActiveBucket | null {
+  if (ticket.status === "Completed") return null;
+  if (getDueStatus(ticketDueLabel(ticket)) === "Overdue") return "Overdue";
+  if (ticket.status === "On Hold") return "On Hold";
+  return "In Progress";
+}
+
+/** Pie chart of an employee's active assigned tasks grouped by status — In Progress,
+ * On Hold, Overdue. Completed tasks are excluded. */
+export function AssignedTaskStatusChart({ tickets }: { tickets: AssignedTicket[] }) {
+  const counts = BUCKET_ORDER.map((bucket) => ({
+    status: bucket,
+    count: tickets.filter((t) => bucketFor(t) === bucket).length,
+    color: BUCKET_COLORS[bucket],
   })).filter((d) => d.count > 0);
 
   const total = counts.reduce((sum, d) => sum + d.count, 0);
 
   if (total === 0) {
-    return <p className="text-sm text-ink-muted py-4">No assigned tasks yet.</p>;
+    return <p className="text-sm text-ink-muted py-4">No active tasks.</p>;
   }
 
   return (

@@ -15,7 +15,7 @@ import {
   type DisplayStatus,
   type DeliveryBucket,
 } from "@/lib/capacityEngine";
-import { parseLooseDate, todayStart, startOfWeek, weekOfYear } from "@/lib/date";
+import { parseLooseDate } from "@/lib/date";
 import { getCapacityStatus, type CapacityStatus } from "@/lib/capacity";
 import { CAPACITY_THRESHOLDS } from "@/data/config";
 import { getDueStatus } from "@/lib/date";
@@ -83,10 +83,8 @@ export interface DashboardSummary {
    * "task completed" indicator. */
   recentlyCompleted: AssignedTicket[];
   attentionItems: AttentionItem[];
-  /** Average live utilization across the team right now — the current-period value
-   * for the capacity chart. */
+  /** Average live (deadline-driven) utilization across the team right now. */
   teamUtilization: number;
-  forecast8Week: { week: string; utilization: number }[];
 }
 
 /** A comparable "when was this last active" number for ordering — the ISO `activityAt`
@@ -330,19 +328,6 @@ export function computeDashboardSummary(
       })
     );
 
-  const forecastWeekStart = startOfWeek(todayStart());
-  const forecast8Week = Array.from({ length: 8 }, (_, weekIdx) => {
-    const values = unitEmployees.map((e) => e.forecast8Week[weekIdx] ?? e.currentUtilization);
-    const avg = values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : 0;
-    // App-wide Sunday-based 1–52 week numbering.
-    const weekDate = new Date(
-      forecastWeekStart.getFullYear(),
-      forecastWeekStart.getMonth(),
-      forecastWeekStart.getDate() + weekIdx * 7
-    );
-    return { week: `Week ${weekOfYear(weekDate)}`, utilization: avg };
-  });
-
   const teamUtilization = employeeCapacities.length
     ? Math.round(employeeCapacities.reduce((sum, r) => sum + r.capacity.utilization, 0) / employeeCapacities.length)
     : 0;
@@ -369,6 +354,5 @@ export function computeDashboardSummary(
     recentlyCompleted,
     attentionItems: attentionItems.slice(0, 6),
     teamUtilization,
-    forecast8Week,
   };
 }

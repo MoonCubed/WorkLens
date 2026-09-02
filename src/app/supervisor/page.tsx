@@ -6,7 +6,6 @@ import { Users, Gauge, CalendarClock, Ticket, AlertTriangle, ShieldAlert, Chevro
 import { Card, CardHeader } from "@/components/ui/Card";
 import { KpiCard } from "@/components/ui/KpiCard";
 import { InfoTip } from "@/components/ui/InfoTip";
-import { CapacityChart } from "@/components/charts/CapacityChart";
 import { CapacityDistributionBar } from "@/components/charts/CapacityDistributionBar";
 import { useTickets } from "@/store/tickets-store";
 import { useSupervisorSession } from "@/store/session-store";
@@ -15,7 +14,6 @@ import { useWorkLog } from "@/store/work-log-store";
 import { useHandoverRequests } from "@/store/handover-requests-store";
 import { computeDashboardSummary, type AttentionTone, type DashboardSummary } from "@/lib/dashboardSummary";
 import { todayLabel } from "@/lib/date";
-import { OVERLOAD_THRESHOLD, RECOMMENDED_CAPACITY } from "@/data/config";
 
 const ATTENTION_STYLES: Record<AttentionTone, { icon: typeof AlertTriangle; text: string; bg: string; border: string; label: string }> = {
   critical: { icon: AlertTriangle, text: "text-[var(--status-critical)]", bg: "bg-[var(--status-critical-bg)]", border: "border-[var(--status-critical-border)]", label: "🔴" },
@@ -141,33 +139,11 @@ export default function SupervisorDashboardPage() {
         <CapacityDistributionBar data={deliveryDistribution} />
       </Card>
 
-      {/* Capacity Outlook */}
-      <Card>
-        <CardHeader title="Capacity Outlook" subtitle="Team utilization by week or month — the current period is live, the rest is forecast." />
-        <CapacityChart
-          current={summary.teamUtilization}
-          forecast={summary.forecast8Week.map((w) => w.utilization)}
-          currentLabelText="This period, team average"
-        />
-        <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-ink-muted">
-          <LegendDash color="var(--status-warning)" label={`${RECOMMENDED_CAPACITY}% recommended capacity threshold`} />
-          <LegendDash color="var(--status-critical)" label={`${OVERLOAD_THRESHOLD}% overload threshold`} />
-        </div>
-        <p className="mt-3 text-xs text-ink-muted border-t border-border pt-3">
-          <span className="font-medium text-ink-secondary">Forecast</span> ≠ <span className="font-medium text-ink-secondary">What-If</span> —
-          this is the expected future based on existing plans. To test a hypothetical change, use{" "}
-          <Link href="/supervisor/what-if" className="text-brand-700 hover:underline">
-            What-If
-          </Link>
-          .
-        </p>
-      </Card>
-
       {/* Team Capacity at a Glance */}
       <div>
         <div className="mb-3 flex items-center gap-1.5">
           <h2 className="text-sm font-semibold text-ink">Team Capacity at a Glance</h2>
-          <InfoTip text="Utilization = active remaining work hours ÷ available working hours for the week × 100. Available capacity = available working hours − active remaining work hours. Approved leave reduces the available working hours; completed work and logged progress reduce active hours immediately." />
+          <InfoTip text="Each active task's remaining effort is spread evenly across the working days until its deadline. Utilization = the hours landing in the current week ÷ available working hours × 100. Available capacity is the remainder. On Hold and Completed work don't count; approved leave and logged progress adjust the numbers immediately." />
         </div>
         {summary.employeeCapacities.length === 0 ? (
           <Card className="flex items-center gap-3 text-sm text-ink-secondary">
@@ -301,15 +277,6 @@ function NotificationCard({
       </span>
       <ChevronRight className="h-4 w-4 shrink-0 text-ink-muted" />
     </Link>
-  );
-}
-
-function LegendDash({ color, label }: { color: string; label: string }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      <span className="h-0.5 w-3.5 rounded-full" style={{ background: color, opacity: 0.7 }} />
-      {label}
-    </span>
   );
 }
 
