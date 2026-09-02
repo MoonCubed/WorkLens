@@ -1,14 +1,20 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Bell } from "lucide-react";
+import { Bell, Briefcase, CalendarClock, AlertTriangle, Gauge, X, ChevronRight } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
-import { StatusBadge } from "@/components/ui/StatusBadge";
-import { InfoTip } from "@/components/ui/InfoTip";
+import { KpiCard } from "@/components/ui/KpiCard";
+import { StatusBadge, PriorityBadge } from "@/components/ui/StatusBadge";
 import { TaskDetailPanel } from "@/components/work/TaskDetailPanel";
 import { DailyTasks } from "@/components/employee/DailyTasks";
-import { getDueStatus } from "@/lib/date";
-import { computeEmployeeWorkItems, computeEmployeeCapacity, type DisplayStatus } from "@/lib/capacityEngine";
+import { getDueStatus, parseLooseDate } from "@/lib/date";
+import {
+  computeEmployeeWorkItems,
+  computeEmployeeCapacity,
+  type DisplayStatus,
+  type EmployeeWorkItem,
+  type EmployeeCapacity,
+} from "@/lib/capacityEngine";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useTickets } from "@/store/tickets-store";
@@ -29,6 +35,15 @@ function activeStatusLabel(status: DisplayStatus, dueDate: string | null): Displ
   return status;
 }
 
+/** Ascending by due date (items without a parseable date sort last). */
+function byDueDate(a: EmployeeWorkItem, b: EmployeeWorkItem): number {
+  const da = a.dueDate ? parseLooseDate(a.dueDate)?.getTime() ?? Infinity : Infinity;
+  const db = b.dueDate ? parseLooseDate(b.dueDate)?.getTime() ?? Infinity : Infinity;
+  return da - db;
+}
+
+type KpiKey = "activeTasks" | "dueSoon" | "overdue" | "availableCapacity";
+
 export default function EmployeeDashboardPage() {
   const { employeeId } = useEmployeeSession();
   const { employees } = useEmployees();
@@ -37,41 +52,99 @@ export default function EmployeeDashboardPage() {
   const { getEntry } = useWorkLog();
   const { submit: submitAdjustment } = useTaskAdjustments();
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
+  const [openKpi, setOpenKpi] = useState<KpiKey | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
 
   const firstName = me.name.split(" ")[0];
   // One capacity calculation, shared by every number on this page.
   const capacity = useMemo(() => computeEmployeeCapacity(me, tickets, getEntry), [me, tickets, getEntry]);
-  // Availability — 0% while on leave, never "100% free".
   const availPct = capacity.availablePercent;
 
   const workItems = useMemo(() => computeEmployeeWorkItems(me, tickets, getEntry), [me, tickets, getEntry]);
-  const activeWorkItems = workItems.filter((i) => i.status !== "Completed");
-  const overdueCount = activeWorkItems.filter((i) => i.dueDate && getDueStatus(i.dueDate) === "Overdue").length;
-  const dueSoonCount = activeWorkItems.filter((i) => i.dueDate && getDueStatus(i.dueDate) === "Due Soon").length;
+  const activeWorkItems = useMemo(() => workItems.filter((i) => i.status !== "Completed"), [workItems]);
+  const overdueItems = useMemo(
+    () => activeWorkItems.filter((i) => i.dueDate && getDueStatus(i.dueDate) === "Overdue").sort(byDueDate),
+    [activeWorkItems]
+  );
+  const dueSoonItems = useMemo(
+    () => activeWorkItems.filter((i) => i.dueDate && getDueStatus(i.dueDate) === "Due Soon").sort(byDueDate),
+    [activeWorkItems]
+  );
   const detailTicket = openTicketId ? tickets.find((t) => t.id === openTicketId) ?? null : null;
 
-  // Deadline-driven weekly load per bucket, so the rows add up to the week's working
-  // hours and match the utilization figure above.
-  const operationalHours = Math.round(activeWorkItems.filter((i) => i.type === "Ticket").reduce((sum, i) => sum + i.weeklyRequiredHours, 0) * 10) / 10;
-  const adhocHours = Math.round(activeWorkItems.filter((i) => i.type === "Ad-hoc").reduce((sum, i) => sum + i.weeklyRequiredHours, 0) * 10) / 10;
+  // Deadline-driven weekly load per bucket, so the rows add up to the week's working hours.
+  const operationalHours = Math.round(activeWorkItems.filter((i) => i.type === "Ticket").reduce((s, i) => s + i.weeklyRequiredHours, 0) * 10) / 10;
+  const adhocHours = Math.round(activeWorkItems.filter((i) => i.type === "Ad-hoc").reduce((s, i) => s + i.weeklyRequiredHours, 0) * 10) / 10;
   const workloadRows = [
     { label: "Assigned tickets", hours: operationalHours },
     { label: "Ad-hoc work", hours: adhocHours },
     { label: "Available", hours: capacity.availableHours },
   ];
 
+  function openTicketFromKpi(ticketId: string) {
+    setOpenKpi(null);
+    setOpenTicketId(ticketId);
+  }
+
   return (
     <div className="max-w-6xl space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-ink tracking-tight">Good morning, {firstName}</h1>
-        <p className="mt-1 text-sm text-ink-muted">Your active work, and what&rsquo;s scheduled day by day this week.</p>
+        <p className="mt-1 text-sm text-ink-muted">
+          What needs your attention, and what&rsquo;s scheduled day by day this week. Click a metric for details.
+        </p>
       </div>
 
       {detailError && (
         <p className="rounded-lg border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-4 py-3 text-sm text-[var(--status-critical)]">
           {detailError}
         </p>
+      )}
+
+      {/* KPIs — the first thing the employee sees. Each opens a focused drill-down. */}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <KpiCard
+          label="Active Tasks"
+          value={String(activeWorkItems.length)}
+          icon={<Briefcase className="h-4 w-4" />}
+          onClick={() => setOpenKpi("activeTasks")}
+        />
+        <KpiCard
+          label="Due Soon"
+          value={String(dueSoonItems.length)}
+          tone={dueSoonItems.length > 0 ? "warning" : "neutral"}
+          icon={<CalendarClock className="h-4 w-4" />}
+          onClick={() => setOpenKpi("dueSoon")}
+        />
+        <KpiCard
+          label="Overdue"
+          value={String(overdueItems.length)}
+          tone={overdueItems.length > 0 ? "serious" : "neutral"}
+          icon={<AlertTriangle className="h-4 w-4" />}
+          onClick={() => setOpenKpi("overdue")}
+        />
+        <KpiCard
+          label="Available Capacity"
+          value={`${availPct}%`}
+          hint={`${capacity.availableHours}h free · ${capacity.utilization}% utilized`}
+          tone="good"
+          icon={<Gauge className="h-4 w-4" />}
+          onClick={() => setOpenKpi("availableCapacity")}
+        />
+      </div>
+
+      {openKpi && (
+        <EmployeeKpiModal
+          kpi={openKpi}
+          onClose={() => setOpenKpi(null)}
+          activeItems={activeWorkItems}
+          dueSoonItems={dueSoonItems}
+          overdueItems={overdueItems}
+          capacity={capacity}
+          availPct={availPct}
+          workloadRows={workloadRows}
+          onOpenTicket={openTicketFromKpi}
+        />
       )}
 
       <Card>
@@ -95,18 +168,14 @@ export default function EmployeeDashboardPage() {
                   <p className="text-sm font-medium text-ink truncate">{item.title}</p>
                   <p className="text-xs text-ink-muted mt-0.5">
                     {item.type} · Due {item.dueDate ?? "No deadline"}
+                    {item.resumedFromHold && <span className="text-brand-700"> · resumed after hold</span>}
                   </p>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
                   <span className="tabular text-xs text-ink-secondary">{item.progress}%</span>
-                  {(() => {
-                    const label = activeStatusLabel(item.status, item.dueDate);
-                    return (
-                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[label]}`}>
-                        {label}
-                      </span>
-                    );
-                  })()}
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[activeStatusLabel(item.status, item.dueDate)]}`}>
+                    {activeStatusLabel(item.status, item.dueDate)}
+                  </span>
                 </div>
               </li>
             ))}
@@ -118,43 +187,6 @@ export default function EmployeeDashboardPage() {
         <CardHeader title="Daily Tasks" subtitle="Your scheduled work for this week — each task's effort spread evenly across the working days until its deadline" />
         <DailyTasks employee={me} onOpenTicket={(id) => setOpenTicketId(id)} />
       </Card>
-
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
-        <Card className="flex flex-col items-center justify-center text-center py-6">
-          <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-secondary">
-            Current Utilization
-            <InfoTip text="Each active task's remaining effort is spread evenly across the working days until its deadline. The hours that land in this week ÷ your available working hours × 100. On Hold and Completed work don't count; approved leave reduces available hours." />
-          </div>
-          <p className="mt-2 text-4xl font-semibold text-ink tabular">{capacity.utilization}%</p>
-          <div className="mt-3">
-            <StatusBadge utilization={capacity.utilization} />
-          </div>
-        </Card>
-        <Card className="flex flex-col items-center justify-center text-center py-6">
-          <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-secondary">
-            Available Capacity
-            <InfoTip text="Your available working hours for the week minus the work planned for this week from your task deadlines." />
-          </div>
-          <p className="mt-2 text-4xl font-semibold text-ink tabular">{availPct}%</p>
-          <p className="mt-1 text-xs text-ink-muted">{capacity.availableHours}h</p>
-        </Card>
-        <Card className="flex flex-col items-center justify-center text-center py-6">
-          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Active Work</p>
-          <p className="mt-2 text-4xl font-semibold text-ink tabular">{activeWorkItems.length}</p>
-        </Card>
-        <Card className="flex flex-col items-center justify-center text-center py-6">
-          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Overdue</p>
-          <p className={`mt-2 text-4xl font-semibold tabular ${overdueCount > 0 ? "text-[var(--status-critical)]" : "text-ink"}`}>
-            {overdueCount}
-          </p>
-        </Card>
-        <Card className="flex flex-col items-center justify-center text-center py-6">
-          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Due Soon</p>
-          <p className={`mt-2 text-4xl font-semibold tabular ${dueSoonCount > 0 ? "text-[var(--status-warning)]" : "text-ink"}`}>
-            {dueSoonCount}
-          </p>
-        </Card>
-      </div>
 
       <div className="flex items-start gap-3 rounded-xl border border-brand-100 bg-brand-50 px-4 py-3.5">
         <Bell className="h-4 w-4 mt-0.5 shrink-0 text-brand-700" />
@@ -229,6 +261,158 @@ export default function EmployeeDashboardPage() {
           }
         />
       )}
+    </div>
+  );
+}
+
+const KPI_META: Record<KpiKey, { title: string; subtitle: (n: number) => string; empty: string }> = {
+  activeTasks: {
+    title: "Active Tasks",
+    subtitle: (n) => `${n} task${n === 1 ? "" : "s"} in progress, on hold or overdue`,
+    empty: "No active work assigned right now.",
+  },
+  dueSoon: {
+    title: "Due Soon",
+    subtitle: (n) => `${n} task${n === 1 ? "" : "s"} approaching their deadline — closest first`,
+    empty: "Nothing is due soon.",
+  },
+  overdue: {
+    title: "Overdue",
+    subtitle: (n) => `${n} task${n === 1 ? "" : "s"} past their deadline — needs immediate attention`,
+    empty: "Nothing is overdue right now.",
+  },
+  availableCapacity: {
+    title: "Available Capacity",
+    subtitle: () => "Your current workload and capacity for this week",
+    empty: "",
+  },
+};
+
+function EmployeeKpiModal({
+  kpi,
+  onClose,
+  activeItems,
+  dueSoonItems,
+  overdueItems,
+  capacity,
+  availPct,
+  workloadRows,
+  onOpenTicket,
+}: {
+  kpi: KpiKey;
+  onClose: () => void;
+  activeItems: EmployeeWorkItem[];
+  dueSoonItems: EmployeeWorkItem[];
+  overdueItems: EmployeeWorkItem[];
+  capacity: EmployeeCapacity;
+  availPct: number;
+  workloadRows: { label: string; hours: number }[];
+  onOpenTicket: (ticketId: string) => void;
+}) {
+  const meta = KPI_META[kpi];
+  const list = kpi === "activeTasks" ? activeItems : kpi === "dueSoon" ? dueSoonItems : kpi === "overdue" ? overdueItems : [];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 py-8" onClick={onClose}>
+      <div
+        className="max-h-full w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-surface p-6 shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-ink">{meta.title}</h2>
+            <p className="mt-0.5 text-xs text-ink-muted">
+              {kpi === "availableCapacity" ? meta.subtitle(0) : meta.subtitle(list.length)}
+            </p>
+          </div>
+          <button onClick={onClose} className="shrink-0 text-ink-muted hover:text-ink" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {kpi === "availableCapacity" ? (
+          <div className="space-y-4">
+            <div className="grid grid-cols-3 gap-3 text-center">
+              <MiniStat label="Utilized" value={`${capacity.utilization}%`} />
+              <MiniStat label="Available" value={`${availPct}%`} />
+              <MiniStat label="Free hours" value={`${capacity.availableHours}h`} />
+            </div>
+            <div className="flex justify-center">
+              <StatusBadge utilization={capacity.utilization} />
+            </div>
+            <div className="space-y-3 border-t border-border pt-4">
+              {workloadRows.map((row) => (
+                <div key={row.label}>
+                  <div className="mb-1 flex items-center justify-between text-sm">
+                    <span className="text-ink-secondary">{row.label}</span>
+                    <span className="tabular font-medium text-ink">{row.hours}h</span>
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-brand-50">
+                    <div
+                      className="h-full rounded-full bg-brand-600"
+                      style={{ width: `${Math.min(100, capacity.workingHours ? (row.hours / capacity.workingHours) * 100 : 0)}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
+              <p className="text-xs text-ink-muted">
+                {capacity.workingHours}h available this week
+                {capacity.workingHours !== capacity.weeklyHours ? ` (of ${capacity.weeklyHours}h, reduced for leave)` : ""}. Each
+                task&rsquo;s effort is spread evenly across the working days until its deadline.
+              </p>
+            </div>
+          </div>
+        ) : list.length === 0 ? (
+          <p className="py-6 text-center text-sm text-ink-muted">{meta.empty}</p>
+        ) : (
+          <ul className="divide-y divide-border">
+            {list.map((item) => {
+              const label = activeStatusLabel(item.status, item.dueDate);
+              const row = (
+                <div className="flex items-center justify-between gap-3 py-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-ink">{item.title}</p>
+                    <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-ink-muted">
+                      <PriorityBadge priority={item.priority} />
+                      <span>Due {item.dueDate ?? "No deadline"}</span>
+                      {item.remainingHours > 0 && <span>· {item.remainingHours}h left</span>}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[label]}`}>
+                      {label}
+                    </span>
+                    {item.ticketId && <ChevronRight className="h-4 w-4 text-ink-muted" />}
+                  </div>
+                </div>
+              );
+              return (
+                <li key={item.key}>
+                  {item.ticketId ? (
+                    <button
+                      onClick={() => onOpenTicket(item.ticketId!)}
+                      className="-mx-2 block w-full rounded-lg px-2 text-left transition-colors hover:bg-brand-50/40"
+                    >
+                      {row}
+                    </button>
+                  ) : (
+                    row
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-brand-50/40 p-3">
+      <p className="text-[11px] font-medium uppercase tracking-wide text-ink-muted">{label}</p>
+      <p className="mt-0.5 text-lg font-semibold tabular text-ink">{value}</p>
     </div>
   );
 }

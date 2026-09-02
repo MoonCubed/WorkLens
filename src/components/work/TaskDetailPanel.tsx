@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Lock, X } from "lucide-react";
+import { Lock, PlayCircle, X } from "lucide-react";
 import { CommentsThread } from "@/components/work/CommentsThread";
+import { PriorityBadge } from "@/components/ui/StatusBadge";
 import { SkillSelect } from "@/components/skills/SkillSelect";
 import { StatusChangeDialog, type HoldDates } from "@/components/work/StatusChangeDialog";
 import type { AssignedTicket } from "@/store/tickets-store";
@@ -10,7 +11,7 @@ import type { Employee } from "@/data/types";
 import { TICKET_STATUS_OPTIONS, type TicketStatus, type TicketPriority } from "@/data/tickets";
 import { slaWindowLabel, isSlaDerived, toInputDateValue, formatDisplayDate } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
-import { ticketEffortForEmployee } from "@/lib/capacityEngine";
+import { ticketEffortForEmployee, holdEndPassed } from "@/lib/capacityEngine";
 import type { AdjustmentKind } from "@/store/task-adjustments-store";
 
 const PRIORITY_OPTIONS: TicketPriority[] = ["High", "Medium", "Low"];
@@ -65,6 +66,11 @@ export function TaskDetailPanel({
     .map((id) => employees.find((e) => e.id === id))
     .filter((e): e is Employee => !!e);
   const availableToAdd = employees.filter((e) => !assigneeIds.includes(e.id));
+
+  // Priority and Required Skills are supervisor-controlled. In an employee's own view
+  // (`currentEmployeeId` set) they are read-only — the employee uses the "request an
+  // adjustment" form for changes they need.
+  const metaEditable = !currentEmployeeId;
 
   const [skillDraft, setSkillDraft] = useState("");
   const [pendingStatus, setPendingStatus] = useState<"Completed" | "On Hold" | null>(null);
@@ -157,17 +163,21 @@ export function TaskDetailPanel({
           </label>
           <label className="flex items-center gap-2 text-xs">
             <span className="font-medium uppercase tracking-wide text-ink-secondary">Priority</span>
-            <select
-              value={ticket.priority}
-              onChange={(e) => onUpdatePriority(e.target.value as TicketPriority)}
-              className="input max-w-[140px]"
-            >
-              {PRIORITY_OPTIONS.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </select>
+            {metaEditable ? (
+              <select
+                value={ticket.priority}
+                onChange={(e) => onUpdatePriority(e.target.value as TicketPriority)}
+                className="input max-w-[140px]"
+              >
+                {PRIORITY_OPTIONS.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <PriorityBadge priority={ticket.priority} />
+            )}
           </label>
         </div>
 
@@ -189,9 +199,20 @@ export function TaskDetailPanel({
           <Detail label="Created By" value={ticket.createdBy} />
           <Detail label="Assigned By" value={ticket.assignedBy} />
           {ticket.status === "On Hold" && (ticket.holdStartDate || ticket.holdEndDate) && (
-            <Detail label="On Hold" value={`${ticket.holdStartDate ?? "?"} – ${ticket.holdEndDate ?? "?"}`} />
+            <Detail
+              label={holdEndPassed(ticket.holdEndDate) ? "Hold (ended)" : "On Hold"}
+              value={`${ticket.holdStartDate ?? "?"} – ${ticket.holdEndDate ?? "?"}`}
+            />
           )}
         </div>
+
+        {ticket.status === "On Hold" && holdEndPassed(ticket.holdEndDate) && (
+          <p className="mt-2 flex items-start gap-1.5 rounded-lg border border-brand-100 bg-brand-50/60 px-3 py-2 text-xs text-brand-800">
+            <PlayCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            The hold period has ended, so this task is back in the schedule — its remaining effort is spread across the
+            working days left before the deadline. Its status stays On Hold until someone changes it.
+          </p>
+        )}
 
         <div className="mt-6">
           <h3 className="mb-2 text-sm font-semibold text-ink">Assigned To</h3>
@@ -272,39 +293,50 @@ export function TaskDetailPanel({
         </div>
 
         <div className="mt-6">
-          <h3 className="mb-2 text-sm font-semibold text-ink">Skills</h3>
+          <h3 className="mb-2 text-sm font-semibold text-ink">Skills Required</h3>
           <div className="flex flex-wrap items-center gap-1.5">
+            {skills.length === 0 && !metaEditable && <p className="text-xs text-ink-muted">None specified.</p>}
             {skills.map((s) => (
               <span
                 key={s}
                 className="inline-flex items-center gap-1.5 rounded-full border border-brand-100 bg-brand-50 pl-2.5 pr-1.5 py-1 text-xs font-medium text-brand-800"
               >
                 {s}
-                <button
-                  onClick={() => removeSkill(s)}
-                  className="rounded-full p-0.5 text-brand-500 hover:bg-brand-100 hover:text-brand-800"
-                  aria-label={`Remove ${s}`}
-                >
-                  <X className="h-3 w-3" />
-                </button>
+                {metaEditable && (
+                  <button
+                    onClick={() => removeSkill(s)}
+                    className="rounded-full p-0.5 text-brand-500 hover:bg-brand-100 hover:text-brand-800"
+                    aria-label={`Remove ${s}`}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                )}
               </span>
             ))}
-            <SkillSelect
-              value={skillDraft}
-              onChange={setSkillDraft}
-              exclude={skills}
-              placeholder="Add a skill…"
-              className="input max-w-[180px] py-1.5 text-xs"
-              aria-label="Add a skill"
-            />
-            <button
-              onClick={addSkill}
-              className="rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:bg-brand-50"
-            >
-              Add
-            </button>
+            {metaEditable && (
+              <>
+                <SkillSelect
+                  value={skillDraft}
+                  onChange={setSkillDraft}
+                  exclude={skills}
+                  placeholder="Add a skill…"
+                  className="input max-w-[180px] py-1.5 text-xs"
+                  aria-label="Add a skill"
+                />
+                <button
+                  onClick={addSkill}
+                  className="rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:bg-brand-50"
+                >
+                  Add
+                </button>
+              </>
+            )}
           </div>
-          <p className="mt-1.5 text-xs text-ink-muted">Used to suggest candidates for this ticket.</p>
+          <p className="mt-1.5 text-xs text-ink-muted">
+            {metaEditable
+              ? "Used to suggest candidates for this ticket."
+              : "Priority and required skills are set by your supervisor."}
+          </p>
         </div>
 
         {currentEmployeeId && onRequestAdjustment && (

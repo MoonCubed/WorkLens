@@ -129,7 +129,9 @@ export function MyWorkList({
             key={row.key}
             row={row}
             currentUserName={employee.name}
-            onUpdateTicketStatus={(id, status, hold) => updateTicketStatus(id, status, hold).catch(() => {})}
+            onUpdateTicketStatus={(id, status, hold) =>
+              updateTicketStatus(id, status, hold).catch(() => setError("Couldn't update the task status — check your connection and try again."))
+            }
             onOpenDetails={row.ticketId ? (id) => setOpenTicketId(id) : undefined}
           />
         ))

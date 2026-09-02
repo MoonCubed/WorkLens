@@ -36,7 +36,8 @@ export function DailyTasks({
     const idx = weekPlans.findIndex((p) => p.isToday);
     return {
       plans: weekPlans,
-      onHold: schedule.items.filter((i) => i.status === "On Hold"),
+      // Tasks paused by an active hold window — their hours resume on `resumesOn`.
+      onHold: schedule.items.filter((i) => i.heldNow),
       weekLabel: `Week ${weekOfYear(weekStart)} · ${weekRangeLabel(weekStart)}`,
       // Start on today; on the weekend the week's last working day (Thu).
       todayIndex: idx >= 0 ? idx : Math.max(0, weekPlans.length - 1),
@@ -91,11 +92,17 @@ export function DailyTasks({
         <div className="rounded-lg border border-border bg-brand-50/40 p-3 text-xs text-ink-secondary">
           <p className="flex items-center gap-1.5 font-medium text-ink-secondary">
             <PauseCircle className="h-3.5 w-3.5" />
-            On hold — not scheduled
+            On Hold — paused until the hold ends
           </p>
           <ul className="mt-1.5 space-y-0.5">
             {onHold.map((i) => (
-              <li key={i.key} className="truncate">{i.title}</li>
+              <li key={i.key} className="truncate">
+                {i.title}
+                {i.resumesOn && <span className="text-ink-muted"> — resumes {i.resumesOn}</span>}
+                {i.deadlineUnreachable && (
+                  <span className="text-[var(--status-critical)]"> — deadline is before it can resume</span>
+                )}
+              </li>
             ))}
           </ul>
         </div>
@@ -143,6 +150,9 @@ function DayCard({ plan, onOpenTicket }: { plan: EmployeeDayPlan; onOpenTicket?:
               >
                 <span className="min-w-0 truncate text-ink">
                   {item.title}
+                  {item.resumedFromHold && (
+                    <span className="ml-1.5 text-[11px] text-brand-700">· resumed after hold</span>
+                  )}
                   {item.remainingHours > hours + 0.05 && (
                     <span className="ml-1.5 text-[11px] text-ink-muted">· {formatHours(item.remainingHours)}h left total</span>
                   )}
@@ -151,12 +161,12 @@ function DayCard({ plan, onOpenTicket }: { plan: EmployeeDayPlan; onOpenTicket?:
                   <span className="tabular font-medium text-ink">{formatHours(hours)}h</span>
                   <span
                     className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${
-                      item.overdue
+                      item.overdue || item.deadlineUnreachable
                         ? "border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] text-[var(--status-critical)]"
                         : "border-brand-100 bg-brand-50 text-brand-700"
                     }`}
                   >
-                    {item.overdue ? "Overdue" : "In Progress"}
+                    {item.overdue ? "Overdue" : item.deadlineUnreachable ? "Deadline risk" : "In Progress"}
                   </span>
                 </span>
               </li>

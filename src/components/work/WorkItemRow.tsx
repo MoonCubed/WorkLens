@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { ChevronDown, ChevronUp, CalendarCheck2, PauseCircle, Lock } from "lucide-react";
+import { ChevronDown, ChevronUp, CalendarCheck2, PauseCircle, Lock, PlayCircle } from "lucide-react";
 import { PriorityBadge } from "@/components/ui/StatusBadge";
 import type { WorkflowStatus } from "@/data/types";
 import { TICKET_STATUS_OPTIONS, type TicketStatus } from "@/data/tickets";
 import { getDueStatus, type DueStatus } from "@/lib/date";
+import { unifiedItemStatus } from "@/lib/capacityEngine";
 import { useWorkLog } from "@/store/work-log-store";
 import { CommentsThread } from "@/components/work/CommentsThread";
 import { StatusChangeDialog, type HoldDates } from "@/components/work/StatusChangeDialog";
@@ -64,11 +65,22 @@ export function WorkItemRow({
   const due = getDueStatus(row.deadline);
   const isTicket = row.ticketId !== undefined && row.ticketStatus !== undefined;
   const workflowStatus = entry.workflowStatus ?? "In Progress";
-  const complete = isTicket ? row.ticketStatus === "Completed" : workflowStatus === "Completed";
-  const onHold = isTicket ? row.ticketStatus === "On Hold" : workflowStatus === "On Hold";
+  // For a ticket the ticket's own status is authoritative; for a stand-alone row it's
+  // the personal work-log status. Resolved through the same `unifiedItemStatus` the
+  // dashboard, calendar and capacity use, so this row can never disagree with them.
+  const holdStart = isTicket ? (row.ticketHoldStart ?? null) : entry.holdStartDate ?? null;
+  const holdEnd = isTicket ? (row.ticketHoldEnd ?? null) : entry.holdEndDate ?? null;
+  const rawStatus = isTicket ? row.ticketStatus : entry.workflowStatus;
+  const effectiveStatus = unifiedItemStatus(
+    isTicket ? undefined : entry.workflowStatus,
+    isTicket ? row.ticketStatus : undefined,
+    holdEnd
+  );
+  const complete = effectiveStatus === "Completed";
+  const onHold = effectiveStatus === "On Hold";
+  // Stored status is On Hold but the hold window has passed → scheduled as active again.
+  const resumedFromHold = rawStatus === "On Hold" && effectiveStatus === "In Progress";
   const completedDate = isTicket ? (row.ticketResolvedDate ?? entry.completedAt ?? null) : entry.completedAt ?? null;
-  const holdStart = isTicket ? (row.ticketHoldStart ?? entry.holdStartDate ?? null) : entry.holdStartDate ?? null;
-  const holdEnd = isTicket ? (row.ticketHoldEnd ?? entry.holdEndDate ?? null) : entry.holdEndDate ?? null;
   const progress = entry.progress ?? 0;
   const remainingHours = complete ? 0 : Math.round(row.estimatedHours * (1 - progress / 100) * 10) / 10;
 
@@ -121,6 +133,15 @@ export function WorkItemRow({
                   <span className="inline-flex items-center gap-1 rounded-full border border-border-strong bg-brand-50/60 px-2 py-0.5 text-[11px] font-medium text-ink-secondary">
                     <PauseCircle className="h-3 w-3" />
                     On hold {holdStart ?? "?"} – {holdEnd ?? "?"}
+                  </span>
+                )}
+                {resumedFromHold && (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full border border-brand-100 bg-brand-50 px-2 py-0.5 text-[11px] font-medium text-brand-700"
+                    title={`Hold ended ${holdEnd ?? ""} — the remaining effort is re-spread across the working days left before the deadline.`}
+                  >
+                    <PlayCircle className="h-3 w-3" />
+                    Resumed after hold
                   </span>
                 )}
               </>

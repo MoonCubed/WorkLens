@@ -106,7 +106,8 @@ function buildUnitWorkItems(unitEmployees: Employee[], tickets: AssignedTicket[]
       .filter((t) => (t.assignedEmployeeIds ?? []).includes(e.id))
       .forEach((t) => {
         const entry = getEntry(`${e.id}:${t.id}`);
-        const status = unifiedItemStatus(entry.workflowStatus, t.status);
+        // The ticket's own status is the single source of truth for a ticket.
+        const status = unifiedItemStatus(undefined, t.status, t.holdEndDate ?? null);
         const dueDate = ticketDueLabel(t);
         items.push({
           key: `${e.id}:${t.id}`,
@@ -125,7 +126,7 @@ function buildUnitWorkItems(unitEmployees: Employee[], tickets: AssignedTicket[]
 
     e.adhoc.forEach((a) => {
       const entry = getEntry(`${e.id}:${a.id}`);
-      const status = unifiedItemStatus(entry.workflowStatus);
+      const status = unifiedItemStatus(entry.workflowStatus, undefined, entry.holdEndDate ?? null);
       const dueDate = adhocDueLabel(a);
       items.push({
         key: `${e.id}:${a.id}`,

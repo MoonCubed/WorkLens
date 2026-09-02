@@ -4,6 +4,7 @@ import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 import type { AssignedTicket } from "@/store/tickets-store";
 import { ticketDueLabel } from "@/lib/due";
 import { getDueStatus } from "@/lib/date";
+import { unifiedItemStatus } from "@/lib/capacityEngine";
 
 /** The active task-status buckets an employee's work falls into. Completed work is
  * deliberately excluded — once a task is done it's no longer active employee work and
@@ -20,9 +21,12 @@ const BUCKET_COLORS: Record<ActiveBucket, string> = {
 };
 
 function bucketFor(ticket: AssignedTicket): ActiveBucket | null {
-  if (ticket.status === "Completed") return null;
+  // Same status resolution as the dashboard / calendar / capacity — an On Hold ticket
+  // whose hold window has passed auto-resumes and reads as In Progress / Overdue here too.
+  const status = unifiedItemStatus(undefined, ticket.status, ticket.holdEndDate ?? null);
+  if (status === "Completed") return null;
   if (getDueStatus(ticketDueLabel(ticket)) === "Overdue") return "Overdue";
-  if (ticket.status === "On Hold") return "On Hold";
+  if (status === "On Hold") return "On Hold";
   return "In Progress";
 }
 

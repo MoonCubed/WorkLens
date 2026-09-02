@@ -25,6 +25,8 @@ import {
   weekOfYear,
   weekLabel,
   weekRangeLabel,
+  addDays,
+  formatDisplayDate,
 } from "@/lib/date";
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import { availableCapacity } from "@/lib/capacity";
@@ -47,6 +49,20 @@ export function isItemComplete(workflowStatus: WorkflowStatus | undefined, ticke
   if (workflowStatus === "Completed") return true;
   if (ticketStatus === "Completed") return true;
   return false;
+}
+
+/**
+ * Has an On Hold task's hold window elapsed?
+ *
+ * A hold with an end date pauses the task only until that date passes; the day after,
+ * the task auto-resumes normal scheduling (its remaining effort re-spread across the
+ * working days that are left before its deadline) even though its stored status is
+ * still "On Hold". A hold with no end date is open-ended and never auto-resumes.
+ */
+export function holdEndPassed(holdEndDate: string | null | undefined): boolean {
+  if (!holdEndDate) return false;
+  const end = parseLooseDate(holdEndDate);
+  return !!end && end.getTime() < todayStart().getTime();
 }
 
 /** The share of a ticket's estimated effort that falls on `employeeId`. A solo owner
@@ -127,14 +143,23 @@ export function leaveWorkingDaysBetween(employee: Employee, start: Date, end: Da
 // ============================================================================
 // Task schedule — the ONE model of "which hours of which task land on which day".
 // Every deadline-driven number in WorkLens (employee capacity, team capacity,
-// assignment projections, the Daily Tasks view, the calendar) is derived from this
-// so no screen can drift onto its own scheduling maths.
+// assignment projections, the Daily Tasks view, the calendar, Task Details) is
+// derived from this so no screen can drift onto its own scheduling maths.
 //
-//   Estimated Task Hours ÷ Available Working Days Until Deadline = Daily Required Hours
+//   Remaining Task Hours ÷ Remaining Available Working Days Until Deadline = Daily Hours
 //
 // where "available working days" excludes weekends, approved leave, and days before
-// the task's start/assignment date. An explicit deadline always wins; with none, the
+// the task can actually be worked. An explicit deadline always wins; with none, the
 // priority's SLA window stands in (High 24h / Medium 1 week / Low 1 month).
+//
+// ON HOLD is purely date-driven — never `if status === "On Hold" → no schedule":
+//
+//   • work can't be scheduled before the day AFTER the hold end date
+//   • so a held task's remaining hours land on [holdEnd + 1 … deadline], and are
+//     therefore absent from every day up to and including the hold end date, and
+//     present (normally) from the day after
+//   • `heldNow` (today ≤ holdEnd) only decides whether to show "On Hold — resumes …"
+//     context; the per-day hours are identical whether you look during or after the hold
 // ============================================================================
 
 export interface ScheduledWorkItem {
@@ -143,19 +168,32 @@ export interface ScheduledWorkItem {
   type: "Ticket" | "Ad-hoc";
   ticketId?: string;
   priority: "High" | "Medium" | "Low";
-  /** In Progress / On Hold — Completed items are never scheduled. */
+  /** The stored status. Completed items are never scheduled. */
   status: "In Progress" | "On Hold";
-  /** In Progress and past its deadline. Still distributed (collapsed onto today). */
+  /** The hold end date (parsed), when the task is On Hold with a window. */
+  heldUntil: Date | null;
+  /** Today is on or before the hold end date — the task is paused *right now*
+   * (its scheduled hours all fall after `heldUntil`). */
+  heldNow: boolean;
+  /** "16 Sep 2026" — the first day work resumes, while `heldNow`. Null otherwise. */
+  resumesOn: string | null;
+  /** Stored status is On Hold but the hold window has already passed — it's scheduled
+   * normally again from its remaining hours over the working days left. */
+  resumedFromHold: boolean;
+  /** Its deadline is on/before the first day work can resume — it cannot be met. */
+  deadlineUnreachable: boolean;
+  /** Scheduled (not held) and past its deadline. */
   overdue: boolean;
   remainingHours: number;
   totalHours: number;
   progress: number;
   startDate: Date;
   deadline: Date;
-  /** `YYYY-MM-DD` keys the remaining effort is spread across. Empty for On Hold. */
+  /** `YYYY-MM-DD` keys the remaining effort is spread across — the real distribution
+   * even while held (those days are simply all after `heldUntil`). Empty only when
+   * there is genuinely nothing to schedule (no remaining hours). */
   workingDayKeys: string[];
-  /** `remainingHours ÷ workingDayKeys.length` — the even per-day distribution.
-   * 0 for On Hold. */
+  /** `remainingHours ÷ workingDayKeys.length` — the even per-day distribution. */
   dailyHours: number;
 }
 
@@ -179,12 +217,16 @@ export interface EmployeeDayPlan {
 
 export interface EmployeeSchedule {
   employeeId: string;
-  /** All non-completed items (In Progress + On Hold). */
+  /** Every non-completed item, each with its real day-by-day distribution (a held
+   * task's days are all after its hold end date). */
   items: ScheduledWorkItem[];
-  /** In Progress items only — the ones with a live daily distribution. */
+  /** Items being worked right now — everything except those still inside a hold
+   * window (`heldNow`). */
   activeItems: ScheduledWorkItem[];
   /** Allocations landing on one day. */
   allocationsForDay: (key: string) => DayAllocation[];
+  /** That item's scheduled hours that fall in the current (Sunday-based) week. */
+  currentWeekHoursByKey: Map<string, number>;
   /** The next `workingDays` working days from `from` (inclusive), each with its
    * planned tasks and total planned hours. Non-working days in between are skipped. */
   planForRange: (from: Date, workingDays: number) => EmployeeDayPlan[];
@@ -200,6 +242,8 @@ function buildScheduledItem(params: {
   ticketId?: string;
   priority: "High" | "Medium" | "Low";
   status: "In Progress" | "On Hold";
+  /** Parsed hold end date, if the task is On Hold with a window. */
+  heldUntil: Date | null;
   remainingHours: number;
   totalHours: number;
   progress: number;
@@ -207,23 +251,35 @@ function buildScheduledItem(params: {
   deadline: Date;
   employee: Employee;
 }): ScheduledWorkItem {
-  const { employee, ...rest } = params;
-  const { status, remainingHours, startDate, deadline } = rest;
+  const { employee, heldUntil, ...rest } = params;
+  const { remainingHours, startDate, deadline } = rest;
   const today = todayStart();
-  const from = startDate > today ? startDate : today;
 
-  if (status === "On Hold" || remainingHours <= 0) {
-    return { ...rest, overdue: false, workingDayKeys: [], dailyHours: 0 };
+  // Date-driven hold: work can't be scheduled until the day AFTER the hold ends.
+  const dayAfterHold = heldUntil ? addDays(heldUntil, 1) : null;
+  const heldNow = !!heldUntil && heldUntil.getTime() >= today.getTime();
+  const resumesOn = heldNow && dayAfterHold ? formatDisplayDate(dayAfterHold) : null;
+  const resumedFromHold = !!heldUntil && !heldNow;
+
+  // Earliest schedulable day: not before the task's start, not before today, and —
+  // if held — not before the day after the hold ends.
+  let from = startDate > today ? new Date(startDate) : new Date(today);
+  if (dayAfterHold && dayAfterHold.getTime() > from.getTime()) from = dayAfterHold;
+
+  if (remainingHours <= 0) {
+    return { ...rest, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable: false, overdue: false, workingDayKeys: [], dailyHours: 0 };
   }
 
-  let workingDayKeys = deadline < from ? [] : scheduledWorkingDayKeys(from, deadline, employee);
-  const overdue = deadline < today;
-  // Overdue, or no working days left before the deadline (e.g. deadline is a weekend
-  // or falls entirely inside leave) → the whole remaining effort is needed today.
-  if (workingDayKeys.length === 0) workingDayKeys = [dateKey(today)];
+  let workingDayKeys = deadline.getTime() < from.getTime() ? [] : scheduledWorkingDayKeys(from, deadline, employee);
+  // No room before the deadline (deadline already passed, or falls entirely on
+  // weekends/leave, or is before the hold ends) → surface the risk on the first day
+  // work can actually happen rather than hiding the task.
+  const deadlineUnreachable = workingDayKeys.length === 0;
+  if (deadlineUnreachable) workingDayKeys = [dateKey(from)];
 
+  const overdue = !heldNow && deadline.getTime() < today.getTime();
   const dailyHours = Math.round((remainingHours / workingDayKeys.length) * 100) / 100;
-  return { ...rest, overdue, workingDayKeys, dailyHours };
+  return { ...rest, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable, overdue, workingDayKeys, dailyHours };
 }
 
 /** The task schedule for one employee — see the block comment above. */
@@ -238,8 +294,12 @@ export function computeEmployeeSchedule(
     .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id))
     .forEach((t) => {
       const entry = getEntry(`${employee.id}:${t.id}`);
-      const status = unifiedItemStatus(entry.workflowStatus, t.status);
-      if (status === "Completed") return;
+      // A ticket's own status is the single source of truth for a ticket.
+      if (isItemComplete(undefined, t.status)) return;
+      const onHold = t.status === "On Hold";
+      // Hold is date-driven from the stored hold end date — the status string never
+      // decides "not scheduled".
+      const heldUntil = onHold && t.holdEndDate ? parseLooseDate(t.holdEndDate) : null;
       const effort = ticketEffortForEmployee(t, employee.id);
       const remaining = itemRemainingHours(effort, false, entry.progress);
       items.push(
@@ -249,7 +309,8 @@ export function computeEmployeeSchedule(
           type: "Ticket",
           ticketId: t.id,
           priority: t.priority,
-          status,
+          status: onHold ? "On Hold" : "In Progress",
+          heldUntil,
           remainingHours: remaining,
           totalHours: effort,
           progress: Math.min(100, Math.max(0, entry.progress ?? 0)),
@@ -262,8 +323,9 @@ export function computeEmployeeSchedule(
 
   employee.adhoc.forEach((a) => {
     const entry = getEntry(`${employee.id}:${a.id}`);
-    const status = unifiedItemStatus(entry.workflowStatus);
-    if (status === "Completed") return;
+    if (isItemComplete(entry.workflowStatus)) return;
+    const onHold = entry.workflowStatus === "On Hold";
+    const heldUntil = onHold && entry.holdEndDate ? parseLooseDate(entry.holdEndDate) : null;
     const remaining = itemRemainingHours(a.estimatedHours, false, entry.progress);
     // No explicit deadline → SLA window from today establishes the schedule.
     const deadline = resolveDueDate(a.deadline === "Ongoing" ? null : a.deadline, a.priority);
@@ -273,7 +335,8 @@ export function computeEmployeeSchedule(
         title: a.name,
         type: "Ad-hoc",
         priority: a.priority,
-        status,
+        status: onHold ? "On Hold" : "In Progress",
+        heldUntil,
         remainingHours: remaining,
         totalHours: a.estimatedHours,
         progress: Math.min(100, Math.max(0, entry.progress ?? 0)),
@@ -284,10 +347,13 @@ export function computeEmployeeSchedule(
     );
   });
 
-  const activeItems = items.filter((i) => i.status === "In Progress");
+  // Everything not currently paused by an active hold window — used where "what's
+  // being worked right now" matters (a held task's hours still appear on their
+  // scheduled future days regardless).
+  const activeItems = items.filter((i) => !i.heldNow);
 
   const byDay = new Map<string, DayAllocation[]>();
-  activeItems.forEach((item) => {
+  items.forEach((item) => {
     item.workingDayKeys.forEach((k) => {
       const list = byDay.get(k) ?? [];
       list.push({ item, hours: item.dailyHours });
@@ -325,20 +391,32 @@ export function computeEmployeeSchedule(
     return plans;
   };
 
-  // Hours landing in the current Sunday-based week — sum each active item's daily
-  // distribution over the days it's scheduled that fall in this week.
+  // Hours landing in the current Sunday-based week — each item's daily distribution
+  // summed over the days it's scheduled that fall in this week. A task still inside
+  // its hold window contributes 0 here unless its post-hold days reach into this week.
   const { start: weekStart, end: weekEnd } = currentWeekBounds(todayStart());
+  const currentWeekHoursByKey = new Map<string, number>();
   let weeklyScheduledHours = 0;
-  activeItems.forEach((item) => {
+  items.forEach((item) => {
     const inWeek = item.workingDayKeys.filter((k) => {
       const d = dateFromKey(k);
       return d >= weekStart && d <= weekEnd;
     }).length;
-    weeklyScheduledHours += item.dailyHours * inWeek;
+    const hrs = Math.round(item.dailyHours * inWeek * 100) / 100;
+    currentWeekHoursByKey.set(item.key, hrs);
+    weeklyScheduledHours += hrs;
   });
   weeklyScheduledHours = Math.round(weeklyScheduledHours * 10) / 10;
 
-  return { employeeId: employee.id, items, activeItems, allocationsForDay, planForRange, weeklyScheduledHours };
+  return {
+    employeeId: employee.id,
+    items,
+    activeItems,
+    allocationsForDay,
+    currentWeekHoursByKey,
+    planForRange,
+    weeklyScheduledHours,
+  };
 }
 
 /**
@@ -450,12 +528,14 @@ export function weeklyWorkingHours(employee: Employee): number {
  * seed duplicate of the ticket concept, superseded by the live tickets store) is
  * deliberately excluded so real tickets aren't counted twice under two systems. */
 export function computeEmployeeCapacity(employee: Employee, tickets: AssignedTicket[], getEntry: WorkLogLookup): EmployeeCapacity {
-  // One schedule, one set of numbers. On Hold / Completed work is not "active" and
-  // contributes nothing to this week's load (`activeItems` is In Progress only).
+  // One schedule, one set of numbers. `weeklyScheduledHours` is the deadline-driven
+  // hours landing in the current week — a task inside its hold window contributes 0
+  // unless its post-hold days reach into this week. `totalRemainingHours` is all the
+  // non-completed effort left, held or not.
   const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
   const activeHours = schedule.weeklyScheduledHours;
   const totalRemainingHours =
-    Math.round(schedule.activeItems.reduce((sum, i) => sum + i.remainingHours, 0) * 10) / 10;
+    Math.round(schedule.items.reduce((sum, i) => sum + i.remainingHours, 0) * 10) / 10;
   const weeklyHours = employee.weeklyHours || 40;
   const onLeave = isCurrentlyOnLeave(employee);
   // Currently on leave → no working hours and no availability, regardless of how the
@@ -517,7 +597,10 @@ export interface WeeklyCapacityPoint {
 function scheduledHoursInWeek(schedule: EmployeeSchedule, weekStart: Date, weekEnd: Date): { hours: number; taskCount: number } {
   let hours = 0;
   let taskCount = 0;
-  schedule.activeItems.forEach((item) => {
+  // All items, not just currently-active ones: a held task's post-hold days still
+  // land in whatever week they fall in, so its hours show up from the resume week on
+  // and are absent from the weeks it's held.
+  schedule.items.forEach((item) => {
     const inWeek = item.workingDayKeys.filter((k) => {
       const d = dateFromKey(k);
       return d >= weekStart && d <= weekEnd;
@@ -639,6 +722,7 @@ export interface EmployeeWorkItem {
   key: string;
   title: string;
   type: "Ticket" | "Ad-hoc";
+  priority: "High" | "Medium" | "Low";
   dueDate: string | null;
   status: DisplayStatus;
   progress: number;
@@ -648,56 +732,72 @@ export interface EmployeeWorkItem {
   ticketId?: string;
   /** Set once the item is Completed — its completion date. Null otherwise. */
   completedDate: string | null;
-  /** The hold window, when the item is On Hold. */
+  /** The hold window, while the item is still On Hold (cleared once the hold ends). */
   holdStart: string | null;
   holdEnd: string | null;
+  /** Stored status is On Hold but the hold window has elapsed — it's scheduled as
+   * active again (`status` reads "In Progress"/"Overdue"). */
+  resumedFromHold: boolean;
 }
 
 /** Every active-or-completed work item on `employee`'s plate, in the same shape
- * whether it's a live ticket or a seed ad-hoc item — used for both the "my work"
- * lists (My Work, MyWorkList) and the small KPI counts (Active Work, Overdue, Due
- * Soon) that need to agree with each other and with `computeEmployeeCapacity`. */
+ * whether it's a live ticket or a seed ad-hoc item — built directly on
+ * `computeEmployeeSchedule` so the "my work" lists and KPI counts can never disagree
+ * with the calendar, capacity, or the Daily Tasks view. `weeklyRequiredHours` is that
+ * item's exact scheduled hours for the current week (0 while held out of this week). */
 export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTicket[], getEntry: WorkLogLookup): EmployeeWorkItem[] {
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
+  const scheduled = new Map(schedule.items.map((i) => [i.key, i]));
   const items: EmployeeWorkItem[] = [];
 
   tickets
     .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id))
     .forEach((t) => {
-      const entry = getEntry(`${employee.id}:${t.id}`);
-      const status = unifiedItemStatus(entry.workflowStatus, t.status);
-      const remaining = itemRemainingHours(ticketEffortForEmployee(t, employee.id), status === "Completed", entry.progress);
+      const key = `${employee.id}:${t.id}`;
+      const entry = getEntry(key);
+      const s = scheduled.get(key); // absent only for Completed items
+      const complete = isItemComplete(undefined, t.status);
+      const status: DisplayStatus = complete ? "Completed" : s?.heldNow ? "On Hold" : "In Progress";
+      const remaining = itemRemainingHours(ticketEffortForEmployee(t, employee.id), complete, entry.progress);
       items.push({
-        key: `${employee.id}:${t.id}`,
+        key,
         title: t.title,
         type: "Ticket",
+        priority: t.priority,
         dueDate: ticketDueLabel(t),
         status,
-        progress: status === "Completed" ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
+        progress: complete ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
         remainingHours: remaining,
-        weeklyRequiredHours: status === "In Progress" ? ticketWeeklyRequiredHours(t, employee, remaining) : 0,
+        weeklyRequiredHours: s ? schedule.currentWeekHoursByKey.get(key) ?? 0 : 0,
         ticketId: t.id,
-        completedDate: status === "Completed" ? (t.resolvedDate ?? entry.completedAt ?? null) : null,
-        holdStart: status === "On Hold" ? (t.holdStartDate ?? entry.holdStartDate ?? null) : null,
-        holdEnd: status === "On Hold" ? (t.holdEndDate ?? entry.holdEndDate ?? null) : null,
+        completedDate: complete ? (t.resolvedDate ?? entry.completedAt ?? null) : null,
+        holdStart: s?.heldNow ? (t.holdStartDate ?? null) : null,
+        holdEnd: s?.heldNow ? (t.holdEndDate ?? null) : null,
+        resumedFromHold: s?.resumedFromHold ?? false,
       });
     });
 
   employee.adhoc.forEach((a) => {
-    const entry = getEntry(`${employee.id}:${a.id}`);
-    const status = unifiedItemStatus(entry.workflowStatus);
-    const remaining = itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress);
+    const key = `${employee.id}:${a.id}`;
+    const entry = getEntry(key);
+    const s = scheduled.get(key);
+    const complete = isItemComplete(entry.workflowStatus);
+    const status: DisplayStatus = complete ? "Completed" : s?.heldNow ? "On Hold" : "In Progress";
+    const remaining = itemRemainingHours(a.estimatedHours, complete, entry.progress);
     items.push({
-      key: `${employee.id}:${a.id}`,
+      key,
       title: a.name,
       type: "Ad-hoc",
+      priority: a.priority,
       dueDate: adhocDueLabel(a),
       status,
-      progress: status === "Completed" ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
+      progress: complete ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
       remainingHours: remaining,
-      weeklyRequiredHours: status === "In Progress" ? adhocWeeklyRequiredHours(a, employee, remaining) : 0,
-      completedDate: status === "Completed" ? (entry.completedAt ?? null) : null,
-      holdStart: status === "On Hold" ? (entry.holdStartDate ?? null) : null,
-      holdEnd: status === "On Hold" ? (entry.holdEndDate ?? null) : null,
+      weeklyRequiredHours: s ? schedule.currentWeekHoursByKey.get(key) ?? 0 : 0,
+      completedDate: complete ? (entry.completedAt ?? null) : null,
+      holdStart: s?.heldNow ? (entry.holdStartDate ?? null) : null,
+      holdEnd: s?.heldNow ? (entry.holdEndDate ?? null) : null,
+      resumedFromHold: s?.resumedFromHold ?? false,
     });
   });
 
@@ -706,12 +806,27 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
 
 export type DisplayStatus = "In Progress" | "On Hold" | "Completed";
 
-/** A single, unified status for any work item — ticket or ad-hoc — for status rollups
- * (Team Progress, Work Delivery) that don't care which system the item came from.
- * Only the three app-wide states. Work with no status yet counts as In Progress. */
-export function unifiedItemStatus(workflowStatus: WorkflowStatus | undefined, ticketStatus?: TicketStatus): DisplayStatus {
+/** A single, unified status for any work item — ticket or ad-hoc — used everywhere
+ * (My Dashboard, Calendar, Daily Tasks, capacity, Work Delivery) so status can never
+ * differ between views. Only the three app-wide states; work with no status counts as
+ * In Progress.
+ *
+ * For a ticket, its own `ticketStatus` is the single source of truth (callers pass
+ * `undefined` for `workflowStatus`); the personal work-log `workflowStatus` only
+ * applies to ad-hoc items that have no ticket.
+ *
+ * `holdEndDate` (when known) makes this hold-window-aware: an On Hold task whose hold
+ * period has already elapsed resolves back to "In Progress" — it resumes normal
+ * scheduling automatically without its stored status being changed. */
+export function unifiedItemStatus(
+  workflowStatus: WorkflowStatus | undefined,
+  ticketStatus?: TicketStatus,
+  holdEndDate?: string | null
+): DisplayStatus {
   if (isItemComplete(workflowStatus, ticketStatus)) return "Completed";
-  if (workflowStatus === "On Hold" || ticketStatus === "On Hold") return "On Hold";
+  if (workflowStatus === "On Hold" || ticketStatus === "On Hold") {
+    return holdEndPassed(holdEndDate) ? "In Progress" : "On Hold";
+  }
   return "In Progress";
 }
 
