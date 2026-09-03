@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import { useEmployees } from "@/store/employees-store";
 import { useTickets } from "@/store/tickets-store";
 import { useWorkLog } from "@/store/work-log-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import { computeEmployeeCapacity } from "@/lib/capacityEngine";
 
 /** Keeps `Employee.currentUtilization` truthful. This is the one place that recomputes
@@ -22,13 +23,18 @@ export function CapacitySyncEngine() {
   const { employees, updateEmployee } = useEmployees();
   const { tickets } = useTickets();
   const { getEntry } = useWorkLog();
+  // Timed personal calendar events reduce available capacity, so utilization has to
+  // account for them too — this keeps every screen that reads `currentUtilization`
+  // (Team Capacity, supervisor views, ranking, Handover, What-If) consistent with the
+  // employee-facing capacity numbers with no change needed in those files.
+  const { events } = useCalendarEvents();
   const syncing = useRef(false);
 
   useEffect(() => {
     if (syncing.current) return;
 
     const drifted = employees
-      .map((employee) => ({ employee, next: computeEmployeeCapacity(employee, tickets, getEntry).utilization }))
+      .map((employee) => ({ employee, next: computeEmployeeCapacity(employee, tickets, getEntry, events).utilization }))
       .filter(({ employee, next }) => employee.currentUtilization !== next);
 
     if (drifted.length === 0) return;
@@ -43,7 +49,7 @@ export function CapacitySyncEngine() {
         syncing.current = false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [employees, tickets, getEntry]);
+  }, [employees, tickets, getEntry, events]);
 
   return null;
 }

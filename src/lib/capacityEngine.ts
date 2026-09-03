@@ -30,6 +30,7 @@ import {
 } from "@/lib/date";
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import { availableCapacity } from "@/lib/capacity";
+import type { CalendarEvent } from "@/store/calendar-events-store";
 
 export interface WorkLogLookup {
   (key: string): {
@@ -38,7 +39,95 @@ export interface WorkLogLookup {
     completedAt?: string | null;
     holdStartDate?: string | null;
     holdEndDate?: string | null;
+    actualHours?: number | null;
+    remainingHours?: number | null;
+    progressUpdatedAt?: string | null;
   };
+}
+
+// ============================================================================
+// Employee calendar events — a timed personal commitment ("Doctor Appointment ·
+// 09:00–10:00") is time the employee is unavailable for task work, so it reduces
+// their available working hours for that day. This is the ONE place that turns
+// calendar events into an hours figure; every capacity function takes the event
+// list and subtracts it the same way, so Employee/Team/Supervisor capacity, the
+// Daily Tasks view, Plan My Day and the Workload View can never disagree. Untimed
+// calendar entries are plain notes and never affect capacity, and no calendar
+// event ever changes the employee's official working-hours profile.
+// ============================================================================
+
+/** Minutes past midnight for a 24h "HH:MM" string, or null. */
+function timeToMinutes(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const mins = Number(m[1]) * 60 + Number(m[2]);
+  return Number.isFinite(mins) && mins >= 0 && mins <= 24 * 60 ? mins : null;
+}
+
+/** Duration in hours of a timed calendar event (0 when both times aren't set, or end
+ * isn't after start — an untimed calendar note contributes nothing to capacity). */
+export function calendarEventHours(ev: Pick<CalendarEvent, "startTime" | "endTime">): number {
+  const s = timeToMinutes(ev.startTime);
+  const e = timeToMinutes(ev.endTime);
+  if (s == null || e == null || e <= s) return 0;
+  return Math.round(((e - s) / 60) * 100) / 100;
+}
+
+/** Hours `employeeId` is committed to personal calendar events on `date` — 0 on a
+ * non-working day (those hours weren't available anyway). */
+export function calendarEventHoursOn(events: CalendarEvent[], employeeId: string, date: Date): number {
+  if (!isWorkingDay(date)) return 0;
+  const key = dateKey(date);
+  let hours = 0;
+  events.forEach((ev) => {
+    if (ev.authorId !== employeeId) return;
+    const d = parseLooseDate(ev.date);
+    if (!d || dateKey(d) !== key) return;
+    hours += calendarEventHours(ev);
+  });
+  return Math.round(hours * 100) / 100;
+}
+
+/** Personal calendar-event hours for `employeeId` across the working days in
+ * `[start, end]` — the amount to subtract from a week's available working hours. */
+export function calendarEventHoursBetween(events: CalendarEvent[], employeeId: string, start: Date, end: Date): number {
+  if (start > end) return 0;
+  let total = 0;
+  const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  while (cursor <= last) {
+    total += calendarEventHoursOn(events, employeeId, cursor);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return Math.round(total * 10) / 10;
+}
+
+export interface DayCalendarEvent {
+  id: string;
+  title: string;
+  startTime: string;
+  endTime: string;
+  hours: number;
+}
+
+/** The timed calendar events `employeeId` has on `date`, for display in day views. */
+export function calendarEventsOn(events: CalendarEvent[], employeeId: string, date: Date): DayCalendarEvent[] {
+  const key = dateKey(date);
+  return events
+    .filter((ev) => {
+      if (ev.authorId !== employeeId || calendarEventHours(ev) <= 0) return false;
+      const d = parseLooseDate(ev.date);
+      return !!d && dateKey(d) === key;
+    })
+    .map((ev) => ({
+      id: ev.id,
+      title: ev.title,
+      startTime: ev.startTime as string,
+      endTime: ev.endTime as string,
+      hours: calendarEventHours(ev),
+    }))
+    .sort((a, b) => a.startTime.localeCompare(b.startTime));
 }
 
 /** A task is done once it's Completed on the ticket itself (the supervisor's or
@@ -81,9 +170,21 @@ export function ticketEffortForEmployee(
 }
 
 /** Remaining effort for one work item — the full estimate once progress/completion is
- * factored in. Completed work is always 0h remaining regardless of a stale progress value. */
-export function itemRemainingHours(estimatedHours: number, complete: boolean, progress: number | undefined): number {
+ * factored in. Completed work is always 0h remaining regardless of a stale progress
+ * value. When the employee has logged an explicit remaining-effort estimate
+ * (`remainingOverride`), that wins over the progress-derived figure — a task that
+ * turned out larger or smaller than its original estimate reschedules from the real
+ * number rather than blindly trusting `estimate × (1 − progress)`. */
+export function itemRemainingHours(
+  estimatedHours: number,
+  complete: boolean,
+  progress: number | undefined,
+  remainingOverride?: number | null
+): number {
   if (complete) return 0;
+  if (typeof remainingOverride === "number" && remainingOverride >= 0) {
+    return Math.round(remainingOverride * 10) / 10;
+  }
   const pct = Math.min(100, Math.max(0, progress ?? 0));
   return Math.round(estimatedHours * (1 - pct / 100) * 10) / 10;
 }
@@ -184,6 +285,23 @@ export interface ScheduledWorkItem {
   deadlineUnreachable: boolean;
   /** Scheduled (not held) and past its deadline. */
   overdue: boolean;
+  /** Has an incomplete prerequisite ticket, so its work is held back until the
+   * prerequisite's due date. */
+  blockedByDependency: boolean;
+  /** The prerequisite's title, while `blockedByDependency`. */
+  dependencyTitle: string | null;
+  /** `remainingHours` came from an employee-logged remaining-effort figure rather
+   * than `estimate × (1 − progress)`. */
+  remainingOverridden: boolean;
+  /** This item is on the schedule because the person is *covering* it for its owner
+   * during a turnover — they carry only the frozen coverage days/hours, and ownership
+   * has not transferred. */
+  isCoverage: boolean;
+  /** While `isCoverage`, the owner this person is covering for. */
+  coverageOwnerName: string | null;
+  /** For the OWNER of a covered ticket — the window their planned days were handed to
+   * a cover, so those days no longer appear on their own schedule. Null otherwise. */
+  coveredAway: { start: string; end: string; coveringName: string; hours: number } | null;
   remainingHours: number;
   totalHours: number;
   progress: number;
@@ -213,6 +331,13 @@ export interface EmployeeDayPlan {
   onLeave: boolean;
   allocations: DayAllocation[];
   totalHours: number;
+  /** Timed personal calendar events on this day. */
+  calendarEvents: DayCalendarEvent[];
+  /** Hours lost to those calendar events. */
+  eventHours: number;
+  /** Working hours actually available for task work this day — contracted hours per
+   * day minus calendar-event hours, and 0 on leave. */
+  availableHours: number;
 }
 
 export interface EmployeeSchedule {
@@ -250,8 +375,35 @@ function buildScheduledItem(params: {
   startDate: Date;
   deadline: Date;
   employee: Employee;
+  /** `remainingHours` was employee-logged rather than progress-derived. */
+  remainingOverridden?: boolean;
+  /** Earliest day work can start because of an incomplete prerequisite ticket. */
+  dependencyStart?: Date | null;
+  dependencyTitle?: string | null;
+  /** This person is covering the item for its owner — set from a frozen coverage plan. */
+  isCoverage?: boolean;
+  coverageOwnerName?: string | null;
+  coveredAway?: ScheduledWorkItem["coveredAway"];
+  /** Day keys handed to a cover — removed from this (owner's) schedule while the
+   * per-day rate stays constant. */
+  excludeDayKeys?: Set<string> | null;
+  /** Force the item onto exactly these day keys (a coverage item's frozen days),
+   * bypassing normal deadline scheduling. */
+  forceDayKeys?: string[] | null;
 }): ScheduledWorkItem {
-  const { employee, heldUntil, ...rest } = params;
+  const {
+    employee,
+    heldUntil,
+    remainingOverridden = false,
+    dependencyStart = null,
+    dependencyTitle = null,
+    isCoverage = false,
+    coverageOwnerName = null,
+    coveredAway = null,
+    excludeDayKeys = null,
+    forceDayKeys = null,
+    ...rest
+  } = params;
   const { remainingHours, startDate, deadline } = rest;
   const today = todayStart();
 
@@ -261,13 +413,35 @@ function buildScheduledItem(params: {
   const resumesOn = heldNow && dayAfterHold ? formatDisplayDate(dayAfterHold) : null;
   const resumedFromHold = !!heldUntil && !heldNow;
 
-  // Earliest schedulable day: not before the task's start, not before today, and —
-  // if held — not before the day after the hold ends.
+  // Earliest schedulable day: not before the task's start, not before today, not
+  // before the day after any hold ends, and not before an unfinished prerequisite's
+  // due date (basic dependencies — dependent work never lands ahead of what it needs).
   let from = startDate > today ? new Date(startDate) : new Date(today);
   if (dayAfterHold && dayAfterHold.getTime() > from.getTime()) from = dayAfterHold;
+  const blockedByDependency = !isCoverage && !!dependencyStart && dependencyStart.getTime() > from.getTime();
+  if (blockedByDependency && dependencyStart) from = new Date(dependencyStart);
+
+  const extra = { blockedByDependency, dependencyTitle: blockedByDependency ? dependencyTitle : null, remainingOverridden, isCoverage, coverageOwnerName, coveredAway };
 
   if (remainingHours <= 0) {
-    return { ...rest, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable: false, overdue: false, workingDayKeys: [], dailyHours: 0 };
+    return { ...rest, ...extra, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable: false, overdue: false, workingDayKeys: [], dailyHours: 0 };
+  }
+
+  // A coverage item runs on its frozen days at the owner's original rate.
+  if (forceDayKeys) {
+    const keys = forceDayKeys.slice();
+    return {
+      ...rest,
+      ...extra,
+      heldUntil,
+      heldNow,
+      resumesOn,
+      resumedFromHold,
+      deadlineUnreachable: false,
+      overdue: false,
+      workingDayKeys: keys,
+      dailyHours: keys.length ? Math.round((remainingHours / keys.length) * 100) / 100 : 0,
+    };
   }
 
   let workingDayKeys = deadline.getTime() < from.getTime() ? [] : scheduledWorkingDayKeys(from, deadline, employee);
@@ -278,17 +452,83 @@ function buildScheduledItem(params: {
   if (deadlineUnreachable) workingDayKeys = [dateKey(from)];
 
   const overdue = !heldNow && deadline.getTime() < today.getTime();
+  // The per-day rate is fixed by the full plan; handing some days to a cover removes
+  // them from this schedule without compressing what's left onto fewer days.
   const dailyHours = Math.round((remainingHours / workingDayKeys.length) * 100) / 100;
-  return { ...rest, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable, overdue, workingDayKeys, dailyHours };
+  if (excludeDayKeys && excludeDayKeys.size > 0) {
+    workingDayKeys = workingDayKeys.filter((k) => !excludeDayKeys.has(k));
+  }
+  return { ...rest, ...extra, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable, overdue, workingDayKeys, dailyHours };
 }
 
-/** The task schedule for one employee — see the block comment above. */
+/** Display progress for an item — the employee-logged remaining figure, expressed as a
+ * percentage of the estimate when present, otherwise the logged progress value. */
+function progressForItem(estimate: number, progress: number | undefined, remainingOverride: number | null | undefined): number {
+  if (typeof remainingOverride === "number" && remainingOverride >= 0 && estimate > 0) {
+    return Math.min(100, Math.max(0, Math.round((1 - remainingOverride / estimate) * 100)));
+  }
+  return Math.min(100, Math.max(0, progress ?? 0));
+}
+
+/**
+ * The frozen day-by-day plan for handing a ticket to a cover during the owner's leave.
+ * Takes the OWNER's real deadline-driven schedule for the ticket, keeps its per-day
+ * rate, and returns just the working days that fall inside `[leaveStart, leaveEnd]`.
+ * The cover carries exactly this — the same planned daily workload the owner had for
+ * those days — so temporarily changing who does the work never compresses the schedule.
+ */
+export function computeCoveragePlan(
+  owner: Employee,
+  ticket: AssignedTicket,
+  getEntry: WorkLogLookup,
+  leaveStart: Date,
+  leaveEnd: Date
+): { allocations: { dateKey: string; hours: number }[]; hours: number; dailyHours: number } {
+  if (isItemComplete(undefined, ticket.status)) return { allocations: [], hours: 0, dailyHours: 0 };
+  const entry = getEntry(`${owner.id}:${ticket.id}`);
+  const effort = ticketEffortForEmployee(ticket, owner.id);
+  const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+  const remaining = itemRemainingHours(effort, false, entry.progress, override);
+  if (remaining <= 0) return { allocations: [], hours: 0, dailyHours: 0 };
+
+  const today = todayStart();
+  let from = itemStartDate(ticket.raisedDate);
+  if (from < today) from = today;
+  const heldUntil = ticket.status === "On Hold" && ticket.holdEndDate ? parseLooseDate(ticket.holdEndDate) : null;
+  if (heldUntil) {
+    const after = addDays(heldUntil, 1);
+    if (after > from) from = after;
+  }
+  const deadline = resolveDueDate(ticket.expectedResolutionDate, ticket.priority, ticket.raisedDate);
+  const allKeys = deadline < from ? [dateKey(from)] : scheduledWorkingDayKeys(from, deadline, owner);
+  const rate = allKeys.length ? Math.round((remaining / allKeys.length) * 100) / 100 : 0;
+
+  const ls = new Date(leaveStart.getFullYear(), leaveStart.getMonth(), leaveStart.getDate());
+  const le = new Date(leaveEnd.getFullYear(), leaveEnd.getMonth(), leaveEnd.getDate());
+  const coveredKeys = allKeys.filter((k) => {
+    const d = dateFromKey(k);
+    return d >= ls && d <= le;
+  });
+  return {
+    allocations: coveredKeys.map((k) => ({ dateKey: k, hours: rate })),
+    hours: Math.round(rate * coveredKeys.length * 10) / 10,
+    dailyHours: rate,
+  };
+}
+
+/** The task schedule for one employee — see the block comment above. `events` (the
+ * employee's own timed calendar commitments) only shape the per-day available-hours
+ * figure in `planForRange`; they never change task workload. A ticket with an active
+ * `coverage` plan has its covered days moved from the owner's schedule onto the
+ * cover's — at the owner's original per-day rate — for the coverage window only. */
 export function computeEmployeeSchedule(
   employee: Employee,
   tickets: AssignedTicket[],
-  getEntry: WorkLogLookup
+  getEntry: WorkLogLookup,
+  events: CalendarEvent[] = []
 ): EmployeeSchedule {
   const items: ScheduledWorkItem[] = [];
+  const ticketById = new Map(tickets.map((t) => [t.id, t]));
 
   tickets
     .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id))
@@ -301,7 +541,14 @@ export function computeEmployeeSchedule(
       // decides "not scheduled".
       const heldUntil = onHold && t.holdEndDate ? parseLooseDate(t.holdEndDate) : null;
       const effort = ticketEffortForEmployee(t, employee.id);
-      const remaining = itemRemainingHours(effort, false, entry.progress);
+      const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+      const remaining = itemRemainingHours(effort, false, entry.progress, override);
+      // Basic dependency: an unfinished prerequisite holds this work back until its due date.
+      const prereq = t.dependsOnTicketId ? ticketById.get(t.dependsOnTicketId) : undefined;
+      const prereqBlocking = !!prereq && prereq.id !== t.id && prereq.status !== "Completed";
+      // Time-boxed coverage: this employee OWNS the ticket but a cover carries the days
+      // inside the coverage window — remove those from the owner's own schedule.
+      const cov = t.coverage && t.coverage.ownerId === employee.id ? t.coverage : null;
       items.push(
         buildScheduledItem({
           key: `${employee.id}:${t.id}`,
@@ -313,9 +560,18 @@ export function computeEmployeeSchedule(
           heldUntil,
           remainingHours: remaining,
           totalHours: effort,
-          progress: Math.min(100, Math.max(0, entry.progress ?? 0)),
+          progress: progressForItem(effort, entry.progress, override),
+          remainingOverridden: override != null,
           startDate: itemStartDate(t.raisedDate),
           deadline: resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate),
+          dependencyStart: prereqBlocking
+            ? resolveDueDate(prereq!.expectedResolutionDate, prereq!.priority, prereq!.raisedDate)
+            : null,
+          dependencyTitle: prereqBlocking ? `${prereq!.title} (${prereq!.id})` : null,
+          excludeDayKeys: cov ? new Set(cov.allocations.map((a) => a.dateKey)) : null,
+          coveredAway: cov
+            ? { start: cov.startDate, end: cov.endDate, coveringName: cov.coveringName, hours: cov.hours }
+            : null,
           employee,
         })
       );
@@ -326,7 +582,8 @@ export function computeEmployeeSchedule(
     if (isItemComplete(entry.workflowStatus)) return;
     const onHold = entry.workflowStatus === "On Hold";
     const heldUntil = onHold && entry.holdEndDate ? parseLooseDate(entry.holdEndDate) : null;
-    const remaining = itemRemainingHours(a.estimatedHours, false, entry.progress);
+    const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+    const remaining = itemRemainingHours(a.estimatedHours, false, entry.progress, override);
     // No explicit deadline → SLA window from today establishes the schedule.
     const deadline = resolveDueDate(a.deadline === "Ongoing" ? null : a.deadline, a.priority);
     items.push(
@@ -339,10 +596,41 @@ export function computeEmployeeSchedule(
         heldUntil,
         remainingHours: remaining,
         totalHours: a.estimatedHours,
-        progress: Math.min(100, Math.max(0, entry.progress ?? 0)),
+        progress: progressForItem(a.estimatedHours, entry.progress, override),
+        remainingOverridden: override != null,
         startDate: todayStart(),
         deadline,
         employee,
+      })
+    );
+  });
+
+  // Coverage this employee is providing for someone else's ticket during their leave —
+  // exactly the frozen days/hours from the accepted turnover, at the owner's rate.
+  tickets.forEach((t) => {
+    const cov = t.coverage;
+    if (!cov || cov.coveringEmployeeId !== employee.id) return;
+    if (isItemComplete(undefined, t.status)) return;
+    const keys = cov.allocations.map((a) => a.dateKey);
+    if (keys.length === 0) return;
+    items.push(
+      buildScheduledItem({
+        key: `${employee.id}:${t.id}:coverage`,
+        title: t.title,
+        type: "Ticket",
+        ticketId: t.id,
+        priority: t.priority,
+        status: "In Progress",
+        heldUntil: null,
+        remainingHours: cov.hours,
+        totalHours: cov.hours,
+        progress: 0,
+        startDate: todayStart(),
+        deadline: resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate),
+        employee,
+        isCoverage: true,
+        coverageOwnerName: cov.ownerName,
+        forceDayKeys: keys,
       })
     );
   });
@@ -363,6 +651,8 @@ export function computeEmployeeSchedule(
 
   const allocationsForDay = (key: string) => byDay.get(key) ?? [];
 
+  const perDayContractedHours = (employee.weeklyHours || 40) / 5;
+
   const planForRange = (from: Date, workingDays: number): EmployeeDayPlan[] => {
     const plans: EmployeeDayPlan[] = [];
     const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
@@ -375,6 +665,8 @@ export function computeEmployeeSchedule(
       if (working) {
         const key = dateKey(cursor);
         const allocations = allocationsForDay(key);
+        const calendarEvents = calendarEventsOn(events, employee.id, cursor);
+        const eventHours = Math.round(calendarEvents.reduce((s, e) => s + e.hours, 0) * 10) / 10;
         plans.push({
           date: new Date(cursor),
           key,
@@ -384,6 +676,9 @@ export function computeEmployeeSchedule(
           onLeave,
           allocations,
           totalHours: Math.round(allocations.reduce((s, a) => s + a.hours, 0) * 10) / 10,
+          calendarEvents,
+          eventHours,
+          availableHours: onLeave ? 0 : Math.max(0, Math.round((perDayContractedHours - eventHours) * 10) / 10),
         });
       }
       cursor.setDate(cursor.getDate() + 1);
@@ -502,14 +797,17 @@ function currentWeekBounds(ref: Date): { start: Date; end: Date } {
 
 /** Available working hours for `employee` in the Sunday-based week containing
  * `weekRef` — contracted weekly hours minus the pro-rata hours lost to approved leave
- * that falls in the week. The single source of truth for the capacity denominator,
- * for the current week and any future week alike. */
-export function weeklyWorkingHoursForWeek(employee: Employee, weekRef: Date): number {
+ * that falls in the week, minus the hours committed to timed personal calendar events
+ * that week. The single source of truth for the capacity denominator, for the current
+ * week and any future week alike. Calendar events reduce *available* capacity only;
+ * they never touch the contracted `weeklyHours` profile. */
+export function weeklyWorkingHoursForWeek(employee: Employee, weekRef: Date, events: CalendarEvent[] = []): number {
   const weekly = employee.weeklyHours || 40;
   const perDay = weekly / 5;
   const { start, end } = currentWeekBounds(weekRef);
   const leaveDays = leaveWorkingDaysBetween(employee, start, end);
-  return Math.max(0, Math.round((weekly - leaveDays * perDay) * 10) / 10);
+  const eventHours = calendarEventHoursBetween(events, employee.id, start, end);
+  return Math.max(0, Math.round((weekly - leaveDays * perDay - eventHours) * 10) / 10);
 }
 
 /** Approved-leave working days in `employee`'s current week. */
@@ -519,28 +817,33 @@ export function leaveWorkingDaysThisWeek(employee: Employee): number {
 }
 
 /** Available working hours for `employee` this week. */
-export function weeklyWorkingHours(employee: Employee): number {
-  return weeklyWorkingHoursForWeek(employee, todayStart());
+export function weeklyWorkingHours(employee: Employee, events: CalendarEvent[] = []): number {
+  return weeklyWorkingHoursForWeek(employee, todayStart(), events);
 }
 
 /** Every ticket assigned to `employee` (live tickets-store data) plus their seed ad-hoc
  * items, reduced by logged progress and zeroed out once complete. `upcomingTickets` (a
  * seed duplicate of the ticket concept, superseded by the live tickets store) is
  * deliberately excluded so real tickets aren't counted twice under two systems. */
-export function computeEmployeeCapacity(employee: Employee, tickets: AssignedTicket[], getEntry: WorkLogLookup): EmployeeCapacity {
+export function computeEmployeeCapacity(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  events: CalendarEvent[] = []
+): EmployeeCapacity {
   // One schedule, one set of numbers. `weeklyScheduledHours` is the deadline-driven
   // hours landing in the current week — a task inside its hold window contributes 0
   // unless its post-hold days reach into this week. `totalRemainingHours` is all the
   // non-completed effort left, held or not.
-  const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
   const activeHours = schedule.weeklyScheduledHours;
   const totalRemainingHours =
     Math.round(schedule.items.reduce((sum, i) => sum + i.remainingHours, 0) * 10) / 10;
   const weeklyHours = employee.weeklyHours || 40;
   const onLeave = isCurrentlyOnLeave(employee);
   // Currently on leave → no working hours and no availability, regardless of how the
-  // rest of the week looks. Otherwise it's the leave-adjusted weekly figure.
-  const workingHours = onLeave ? 0 : weeklyWorkingHours(employee);
+  // rest of the week looks. Otherwise it's the leave-adjusted, calendar-adjusted figure.
+  const workingHours = onLeave ? 0 : weeklyWorkingHours(employee, events);
   // Keep the ratio finite when there are no working hours (full-week leave or an
   // unusual schedule) by falling back to contracted hours for the denominator only.
   const denom = workingHours > 0 ? workingHours : weeklyHours;
@@ -594,6 +897,24 @@ export interface WeeklyCapacityPoint {
   isCurrent: boolean;
 }
 
+/** Planned task hours on `schedule` that fall on working days within `[start, end]`
+ * (inclusive). The one shared way to ask "how loaded is this person over an arbitrary
+ * date range" — used by turnover coverage to weigh candidates against the leave dates
+ * rather than today. */
+export function scheduledHoursBetween(schedule: EmployeeSchedule, start: Date, end: Date): number {
+  const s = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const e = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  let hours = 0;
+  schedule.items.forEach((item) => {
+    const inRange = item.workingDayKeys.filter((k) => {
+      const d = dateFromKey(k);
+      return d >= s && d <= e;
+    }).length;
+    hours += item.dailyHours * inRange;
+  });
+  return Math.round(hours * 10) / 10;
+}
+
 function scheduledHoursInWeek(schedule: EmployeeSchedule, weekStart: Date, weekEnd: Date): { hours: number; taskCount: number } {
   let hours = 0;
   let taskCount = 0;
@@ -620,9 +941,10 @@ export function computeEmployeeWeeklyCapacity(
   tickets: AssignedTicket[],
   getEntry: WorkLogLookup,
   weeks = 8,
-  from: Date = todayStart()
+  from: Date = todayStart(),
+  events: CalendarEvent[] = []
 ): WeeklyCapacityPoint[] {
-  const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
   const base = startOfWeek(from);
   const thisWeekStart = startOfWeek(todayStart()).getTime();
 
@@ -630,7 +952,7 @@ export function computeEmployeeWeeklyCapacity(
     const weekStart = new Date(base.getFullYear(), base.getMonth(), base.getDate() + i * 7);
     const { start, end } = currentWeekBounds(weekStart);
     const { hours, taskCount } = scheduledHoursInWeek(schedule, start, end);
-    const workingHours = weeklyWorkingHoursForWeek(employee, weekStart);
+    const workingHours = weeklyWorkingHoursForWeek(employee, weekStart, events);
     const denom = workingHours > 0 ? workingHours : employee.weeklyHours || 40;
     return {
       weekNumber: weekOfYear(weekStart),
@@ -655,9 +977,10 @@ export function computeTeamWeeklyCapacity(
   tickets: AssignedTicket[],
   getEntry: WorkLogLookup,
   weeks = 8,
-  from: Date = todayStart()
+  from: Date = todayStart(),
+  events: CalendarEvent[] = []
 ): (WeeklyCapacityPoint & { memberCount: number })[] {
-  const perEmployee = employees.map((e) => computeEmployeeWeeklyCapacity(e, tickets, getEntry, weeks, from));
+  const perEmployee = employees.map((e) => computeEmployeeWeeklyCapacity(e, tickets, getEntry, weeks, from, events));
   const base = startOfWeek(from);
   const thisWeekStart = startOfWeek(todayStart()).getTime();
 
@@ -693,9 +1016,10 @@ export function projectedUtilization(
   employee: Employee,
   tickets: AssignedTicket[],
   getEntry: WorkLogLookup,
-  extraWeeklyHours: number
+  extraWeeklyHours: number,
+  events: CalendarEvent[] = []
 ): number {
-  const { activeHours, workingHours, weeklyHours } = computeEmployeeCapacity(employee, tickets, getEntry);
+  const { activeHours, workingHours, weeklyHours } = computeEmployeeCapacity(employee, tickets, getEntry, events);
   const denom = workingHours > 0 ? workingHours : weeklyHours;
   return Math.round(((activeHours + Math.max(0, extraWeeklyHours)) / denom) * 100);
 }
@@ -707,15 +1031,16 @@ export function projectedUtilizationForTicket(
   employee: Employee,
   tickets: AssignedTicket[],
   getEntry: WorkLogLookup,
-  ticket: AssignedTicket
+  ticket: AssignedTicket,
+  events: CalendarEvent[] = []
 ): number {
   const currentIds = ticket.assignedEmployeeIds ?? [];
-  if (currentIds.includes(employee.id)) return computeEmployeeCapacity(employee, tickets, getEntry).utilization;
+  if (currentIds.includes(employee.id)) return computeEmployeeCapacity(employee, tickets, getEntry, events).utilization;
   // Effort this employee would carry: whole estimate as sole owner, half if joining
   // someone already on it (the assign flows here replace, not co-assign, but be safe).
   const effort = currentIds.length >= 1 ? Math.round((ticket.estimatedHours / 2) * 10) / 10 : ticket.estimatedHours;
   const extra = ticketWeeklyRequiredHours(ticket, employee, effort);
-  return projectedUtilization(employee, tickets, getEntry, extra);
+  return projectedUtilization(employee, tickets, getEntry, extra, events);
 }
 
 export interface EmployeeWorkItem {
@@ -738,6 +1063,19 @@ export interface EmployeeWorkItem {
   /** Stored status is On Hold but the hold window has elapsed — it's scheduled as
    * active again (`status` reads "In Progress"/"Overdue"). */
   resumedFromHold: boolean;
+  /** Time actually worked so far (employee-logged), if any. */
+  actualHours: number | null;
+  /** `remainingHours` came from an employee-logged figure rather than progress. */
+  remainingOverridden: boolean;
+  /** "26 Aug 2026"-style date progress / effort was last touched, for the freshness
+   * indicator. Null when nothing has been logged. */
+  progressUpdatedAt: string | null;
+  /** This row is coverage the employee is providing for another person's ticket. */
+  isCoverage: boolean;
+  /** While `isCoverage`, who owns the ticket. */
+  coverageOwnerName: string | null;
+  /** For an owned ticket handed to a cover during the employee's leave. */
+  coveredAway: { start: string; end: string; coveringName: string; hours: number } | null;
 }
 
 /** Every active-or-completed work item on `employee`'s plate, in the same shape
@@ -745,8 +1083,13 @@ export interface EmployeeWorkItem {
  * `computeEmployeeSchedule` so the "my work" lists and KPI counts can never disagree
  * with the calendar, capacity, or the Daily Tasks view. `weeklyRequiredHours` is that
  * item's exact scheduled hours for the current week (0 while held out of this week). */
-export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTicket[], getEntry: WorkLogLookup): EmployeeWorkItem[] {
-  const schedule = computeEmployeeSchedule(employee, tickets, getEntry);
+export function computeEmployeeWorkItems(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  events: CalendarEvent[] = []
+): EmployeeWorkItem[] {
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
   const scheduled = new Map(schedule.items.map((i) => [i.key, i]));
   const items: EmployeeWorkItem[] = [];
 
@@ -758,7 +1101,8 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
       const s = scheduled.get(key); // absent only for Completed items
       const complete = isItemComplete(undefined, t.status);
       const status: DisplayStatus = complete ? "Completed" : s?.heldNow ? "On Hold" : "In Progress";
-      const remaining = itemRemainingHours(ticketEffortForEmployee(t, employee.id), complete, entry.progress);
+      const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+      const remaining = itemRemainingHours(ticketEffortForEmployee(t, employee.id), complete, entry.progress, override);
       items.push({
         key,
         title: t.title,
@@ -766,7 +1110,7 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
         priority: t.priority,
         dueDate: ticketDueLabel(t),
         status,
-        progress: complete ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
+        progress: complete ? 100 : s?.progress ?? Math.min(100, Math.max(0, entry.progress ?? 0)),
         remainingHours: remaining,
         weeklyRequiredHours: s ? schedule.currentWeekHoursByKey.get(key) ?? 0 : 0,
         ticketId: t.id,
@@ -774,6 +1118,43 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
         holdStart: s?.heldNow ? (t.holdStartDate ?? null) : null,
         holdEnd: s?.heldNow ? (t.holdEndDate ?? null) : null,
         resumedFromHold: s?.resumedFromHold ?? false,
+        actualHours: entry.actualHours ?? null,
+        remainingOverridden: override != null && !complete,
+        progressUpdatedAt: entry.progressUpdatedAt ?? null,
+        isCoverage: false,
+        coverageOwnerName: null,
+        coveredAway: s?.coveredAway ?? null,
+      });
+    });
+
+  // Coverage this employee is providing during someone else's leave — a distinct row
+  // so "My Work" shows it without pretending ownership moved.
+  schedule.items
+    .filter((s) => s.isCoverage)
+    .forEach((s) => {
+      const lastCoveredKey = [...s.workingDayKeys].sort().pop();
+      items.push({
+        key: s.key,
+        title: s.title,
+        type: "Ticket",
+        priority: s.priority,
+        // For coverage, "due" reads as the last day of the coverage window.
+        dueDate: lastCoveredKey ? formatDisplayDate(dateFromKey(lastCoveredKey)) : formatDisplayDate(s.deadline),
+        status: "In Progress",
+        progress: 0,
+        remainingHours: s.remainingHours,
+        weeklyRequiredHours: schedule.currentWeekHoursByKey.get(s.key) ?? 0,
+        ticketId: s.ticketId,
+        completedDate: null,
+        holdStart: null,
+        holdEnd: null,
+        resumedFromHold: false,
+        actualHours: null,
+        remainingOverridden: false,
+        progressUpdatedAt: null,
+        isCoverage: true,
+        coverageOwnerName: s.coverageOwnerName,
+        coveredAway: null,
       });
     });
 
@@ -783,7 +1164,8 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
     const s = scheduled.get(key);
     const complete = isItemComplete(entry.workflowStatus);
     const status: DisplayStatus = complete ? "Completed" : s?.heldNow ? "On Hold" : "In Progress";
-    const remaining = itemRemainingHours(a.estimatedHours, complete, entry.progress);
+    const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+    const remaining = itemRemainingHours(a.estimatedHours, complete, entry.progress, override);
     items.push({
       key,
       title: a.name,
@@ -791,13 +1173,19 @@ export function computeEmployeeWorkItems(employee: Employee, tickets: AssignedTi
       priority: a.priority,
       dueDate: adhocDueLabel(a),
       status,
-      progress: complete ? 100 : Math.min(100, Math.max(0, entry.progress ?? 0)),
+      progress: complete ? 100 : s?.progress ?? Math.min(100, Math.max(0, entry.progress ?? 0)),
       remainingHours: remaining,
       weeklyRequiredHours: s ? schedule.currentWeekHoursByKey.get(key) ?? 0 : 0,
       completedDate: complete ? (entry.completedAt ?? null) : null,
       holdStart: s?.heldNow ? (entry.holdStartDate ?? null) : null,
       holdEnd: s?.heldNow ? (entry.holdEndDate ?? null) : null,
       resumedFromHold: s?.resumedFromHold ?? false,
+      actualHours: entry.actualHours ?? null,
+      remainingOverridden: override != null && !complete,
+      progressUpdatedAt: entry.progressUpdatedAt ?? null,
+      isCoverage: false,
+      coverageOwnerName: null,
+      coveredAway: null,
     });
   });
 

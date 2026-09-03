@@ -236,7 +236,12 @@ export default function SupervisorSkillsPage() {
                     </Link>{" "}
                     {describeChange(r)}
                   </p>
-                  <p className="text-xs text-ink-muted mt-0.5">Submitted {r.submittedAt}</p>
+                  {r.justification && (
+                    <p className="mt-1 rounded-md border border-border bg-brand-50/40 px-2.5 py-1.5 text-xs italic text-ink-secondary">
+                      &ldquo;{r.justification}&rdquo;
+                    </p>
+                  )}
+                  <p className="text-xs text-ink-muted mt-1">Submitted {r.submittedAt}</p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <button

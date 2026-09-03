@@ -2,13 +2,15 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { CalendarClock } from "lucide-react";
+import { CalendarClock, CalendarRange, LayoutGrid } from "lucide-react";
 import { CalendarView, type CalendarItem, type TicketDeadlineState } from "@/components/calendar/CalendarView";
+import { WorkloadView } from "@/components/calendar/WorkloadView";
+import { AppointmentsManager } from "@/components/employee/AppointmentsManager";
 import { TaskDetailPanel } from "@/components/work/TaskDetailPanel";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useTickets, type AssignedTicket } from "@/store/tickets-store";
-import { useCalendarEvents } from "@/store/calendar-events-store";
+import { useCalendarEvents, isTimedEvent } from "@/store/calendar-events-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { parseLooseDate, getDueStatus, todayStart, dateFromKey } from "@/lib/date";
@@ -30,6 +32,7 @@ export default function EmployeeCalendarPage() {
   const { getEntry } = useWorkLog();
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [view, setView] = useState<"calendar" | "workload">("calendar");
 
   const myTickets = useMemo(() => tickets.filter((t) => (t.assignedEmployeeIds ?? []).includes(me.id)), [tickets, me]);
   const detailTicket = openTicketId ? myTickets.find((t) => t.id === openTicketId) ?? null : null;
@@ -39,7 +42,7 @@ export default function EmployeeCalendarPage() {
 
     // Planned daily work — each task's estimated effort spread evenly across the
     // working days until its deadline (the same schedule the capacity numbers use).
-    const schedule = computeEmployeeSchedule(me, tickets, getEntry);
+    const schedule = computeEmployeeSchedule(me, tickets, getEntry, events);
     schedule.planForRange(todayStart(), 40).forEach((plan) => {
       if (plan.allocations.length === 0) return;
       const breakdown = plan.allocations
@@ -63,7 +66,7 @@ export default function EmployeeCalendarPage() {
       list.push({
         key: `t-${t.id}`,
         label: `${t.title} (${t.id})`,
-        sublabel: "Assigned to you",
+        sublabel: "IT-Demand ticket · assigned to you",
         kind: "Ticket",
         date,
         priority: t.priority,
@@ -72,6 +75,37 @@ export default function EmployeeCalendarPage() {
         onClick: () => setOpenTicketId(t.id),
       });
     });
+
+    // Ad-hoc work — a distinct colour from tickets and project/planned work.
+    me.adhoc.forEach((a) => {
+      const date = a.deadline === "Ongoing" ? null : parseLooseDate(a.deadline);
+      if (!date) return;
+      list.push({
+        key: `a-${a.id}`,
+        label: a.name,
+        sublabel: "Ad-hoc work",
+        kind: "Adhoc",
+        date,
+        priority: a.priority,
+        itemType: "Ad-hoc",
+      });
+    });
+
+    // Turnover coverage this employee is providing — one marker on the last covered day.
+    schedule.items
+      .filter((s) => s.isCoverage && s.workingDayKeys.length > 0)
+      .forEach((s) => {
+        const keys = [...s.workingDayKeys].sort();
+        list.push({
+          key: `cov-${s.key}`,
+          label: `Covering: ${s.title}`,
+          sublabel: `for ${s.coverageOwnerName ?? "a teammate"} · ${s.remainingHours}h`,
+          kind: "Coverage",
+          date: dateFromKey(keys[keys.length - 1]),
+          note: `Covering ${s.coverageOwnerName ?? "a teammate"}'s task while they're on leave — ${s.dailyHours}h/day, ${keys.length} day${keys.length === 1 ? "" : "s"}.`,
+          onClick: s.ticketId ? () => setOpenTicketId(s.ticketId!) : undefined,
+        });
+      });
 
     // Only approved leave ever lands in `leaveEvents` — a request is pending until
     // the employee's supervisor approves it (see Handover Requests), so nothing shows
@@ -90,14 +124,15 @@ export default function EmployeeCalendarPage() {
       .forEach((ev) => {
         const date = parseLooseDate(ev.date);
         if (!date) return;
+        const timed = isTimedEvent(ev);
         list.push({
           key: ev.id,
           label: ev.title,
-          sublabel: "You",
-          kind: "Custom",
+          sublabel: timed ? `${ev.startTime}–${ev.endTime}` : "You",
+          kind: timed ? "Appointment" : "Custom",
           date,
           priority: ev.priority,
-          itemType: ev.itemType,
+          itemType: timed ? "Appointment" : ev.itemType,
           note: ev.note,
         });
       });
@@ -107,7 +142,8 @@ export default function EmployeeCalendarPage() {
 
   return (
     <>
-      <div className="flex justify-end">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <ViewToggle view={view} onChange={setView} />
         <Link
           href="/employee/handover-requests"
           className="inline-flex items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-3.5 py-2 text-sm font-medium text-ink hover:bg-brand-50"
@@ -117,25 +153,41 @@ export default function EmployeeCalendarPage() {
         </Link>
       </div>
 
-      <div className="mt-3">
-        <CalendarView
-          title="My Calendar"
-          subtitle="Your assigned tickets, approved leave, and anything you've added — visible only to you."
-          items={items}
-          onAddItem={async (input) => {
-            await addEvent({
-              authorId: me.id,
-              authorName: me.name,
-              authorRole: "employee",
-              department: me.department,
-              title: input.title,
-              date: input.date,
-              priority: input.priority,
-              itemType: input.itemType,
-              note: input.note,
-            });
-          }}
-        />
+      <div className="mt-3 space-y-6">
+        {view === "workload" ? (
+          <>
+            <div>
+              <h1 className="text-2xl font-semibold text-ink tracking-tight">My Workload</h1>
+              <p className="mt-1 text-sm text-ink-muted">
+                Your scheduled tasks against your available working time — the same schedule your capacity numbers use.
+              </p>
+            </div>
+            <WorkloadView employees={[me]} revealEventTitlesFor={me.id} />
+            <AppointmentsManager employee={me} />
+          </>
+        ) : (
+          <>
+            <CalendarView
+              title="My Calendar"
+              subtitle="Your assigned tickets, planned work, approved leave, appointments and notes — visible only to you."
+              items={items}
+              onAddItem={async (input) => {
+                await addEvent({
+                  authorId: me.id,
+                  authorName: me.name,
+                  authorRole: "employee",
+                  department: me.department,
+                  title: input.title,
+                  date: input.date,
+                  priority: input.priority,
+                  itemType: input.itemType,
+                  note: input.note,
+                });
+              }}
+            />
+            <AppointmentsManager employee={me} />
+          </>
+        )}
       </div>
 
       {detailError && (
@@ -170,5 +222,30 @@ export default function EmployeeCalendarPage() {
         />
       )}
     </>
+  );
+}
+
+function ViewToggle({ view, onChange }: { view: "calendar" | "workload"; onChange: (v: "calendar" | "workload") => void }) {
+  return (
+    <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1">
+      <button
+        onClick={() => onChange("calendar")}
+        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+          view === "calendar" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+        }`}
+      >
+        <CalendarRange className="h-3.5 w-3.5" />
+        Calendar
+      </button>
+      <button
+        onClick={() => onChange("workload")}
+        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+          view === "workload" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+        }`}
+      >
+        <LayoutGrid className="h-3.5 w-3.5" />
+        Workload
+      </button>
+    </div>
   );
 }

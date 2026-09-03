@@ -8,6 +8,7 @@ import { CalendarEventsProvider } from "@/store/calendar-events-store";
 import { SkillsProvider } from "@/store/skills-store";
 import { TaskAdjustmentsProvider } from "@/store/task-adjustments-store";
 import { SkillChangeRequestsProvider } from "@/store/skill-change-requests-store";
+import { DayPlansProvider } from "@/store/day-plans-store";
 import { RootDataGate } from "@/components/layout/RootDataGate";
 import "./globals.css";
 
@@ -34,7 +35,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                   <SkillsProvider>
                     <TaskAdjustmentsProvider>
                       <SkillChangeRequestsProvider>
-                        <RootDataGate>{children}</RootDataGate>
+                        <DayPlansProvider>
+                          <RootDataGate>{children}</RootDataGate>
+                        </DayPlansProvider>
                       </SkillChangeRequestsProvider>
                     </TaskAdjustmentsProvider>
                   </SkillsProvider>

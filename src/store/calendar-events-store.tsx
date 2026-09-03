@@ -24,6 +24,18 @@ export interface CalendarEvent {
   itemType: string;
   note: string;
   createdAt: string;
+  /** Optional 24h "HH:MM" start/end. When both are set the entry is a timed personal
+   * commitment (an appointment) that reduces the author's available working capacity
+   * for that day. Untimed entries are plain calendar notes and never affect capacity. */
+  startTime?: string | null;
+  endTime?: string | null;
+}
+
+/** True when the entry is a timed personal commitment — both times set and end after
+ * start. These are the only calendar events that reduce available capacity. */
+export function isTimedEvent(ev: Pick<CalendarEvent, "startTime" | "endTime">): boolean {
+  if (!ev.startTime || !ev.endTime) return false;
+  return ev.endTime > ev.startTime;
 }
 
 interface CalendarEventsContextValue {
@@ -31,6 +43,8 @@ interface CalendarEventsContextValue {
   loading: boolean;
   error: string | null;
   addEvent: (input: Omit<CalendarEvent, "id" | "createdAt">) => Promise<void>;
+  updateEvent: (id: string, patch: Partial<Omit<CalendarEvent, "id" | "createdAt" | "authorId">>) => Promise<void>;
+  deleteEvent: (id: string) => Promise<void>;
 }
 
 const CalendarEventsContext = createContext<CalendarEventsContextValue | null>(null);
@@ -54,7 +68,28 @@ export function CalendarEventsProvider({ children }: { children: ReactNode }) {
     [events, refetch]
   );
 
-  const value = useMemo(() => ({ events, loading, error, addEvent }), [events, loading, error, addEvent]);
+  const updateEvent = useCallback(
+    async (id: string, patch: Partial<Omit<CalendarEvent, "id" | "createdAt" | "authorId">>) => {
+      const { error: updateError } = await supabase.from(TABLE).update(patch).eq("id", id);
+      if (updateError) throw updateError;
+      await refetch();
+    },
+    [refetch]
+  );
+
+  const deleteEvent = useCallback(
+    async (id: string) => {
+      const { error: deleteError } = await supabase.from(TABLE).delete().eq("id", id);
+      if (deleteError) throw deleteError;
+      await refetch();
+    },
+    [refetch]
+  );
+
+  const value = useMemo(
+    () => ({ events, loading, error, addEvent, updateEvent, deleteEvent }),
+    [events, loading, error, addEvent, updateEvent, deleteEvent]
+  );
 
   return <CalendarEventsContext.Provider value={value}>{children}</CalendarEventsContext.Provider>;
 }

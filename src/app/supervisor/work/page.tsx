@@ -34,6 +34,8 @@ export default function SupervisorWorkPage() {
     assignTicketToEmployee,
     setTicketAssignees,
     setTicketEffortSplit,
+    setTicketDependency,
+    setTicketCoverage,
     updateTicketStatus,
     updateTicketPriority,
     updateTicketSkills,
@@ -425,6 +427,9 @@ export default function SupervisorWorkPage() {
           onUpdateSkills={(skills) => updateTicketSkills(detailTicket.id, skills).catch(() => setAssignError("Couldn't update skills — check your connection and try again."))}
           onUpdateAssignees={(ids, split) => setTicketAssignees(detailTicket.id, ids, split).catch(() => setAssignError("Couldn't update assignees — check your connection and try again."))}
           onUpdateEffortSplit={(split) => setTicketEffortSplit(detailTicket.id, split).catch(() => setAssignError("Couldn't update the effort split — check your connection and try again."))}
+          allTickets={unitTickets}
+          onUpdateDependency={(dep) => setTicketDependency(detailTicket.id, dep).catch(() => setAssignError("Couldn't update the dependency — check your connection and try again."))}
+          onClearCoverage={() => setTicketCoverage(detailTicket.id, null).catch(() => setAssignError("Couldn't end coverage — check your connection and try again."))}
         />
       )}
 

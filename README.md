@@ -84,6 +84,9 @@ in [`supabase/schema.sql`](supabase/schema.sql), not by keeping the key secret.
    `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` (locally in
    `.env.local`, and in whatever hosts the deployment — see below).
 4. First page load seeds the tables from the app's demo dataset automatically.
+   Seeding only runs against an **empty** table, so if the demo dataset in
+   `src/data/*` changes, clear the affected tables (or use a fresh Supabase
+   project) to pick it up — re-running `schema.sql` migrates structure, not rows.
 
 **Tables:** `employees`, `tickets`, `handover_requests`, `work_log_entries` — column
 names match the TypeScript types in `src/data/*` field-for-field.

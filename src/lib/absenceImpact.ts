@@ -6,14 +6,22 @@
 // picture already shown elsewhere (supervisor's employee-detail page, MyWorkList), so
 // it's folded in too. `upcomingTickets` (a seed duplicate of the ticket concept) is
 // skipped to avoid double-counting a unit's real tickets under two different systems.
+//
+// Turnover coverage is TIME-BOXED: the covering employee carries a ticket's planned
+// days only for the owner's leave window, at the owner's own per-day rate (see
+// `computeCoveragePlan` in capacityEngine). Candidates are therefore weighed against
+// their availability, leave, calendar events and existing scheduled workload ON THE
+// LEAVE DATES — not on today.
 
 import type { Employee, Skill } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
+import type { CalendarEvent } from "@/store/calendar-events-store";
 import {
   todayStart,
   parseLooseDate,
   getDueStatus,
   resolveDueDate,
+  formatDisplayDate,
   addDays,
   daysBetween,
   countWorkingDays,
@@ -22,12 +30,16 @@ import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import {
   ticketEffortForEmployee,
   itemStartDate,
+  itemRemainingHours,
   leaveWorkingDaysBetween,
-  weeklyRequiredHoursForItem,
+  calendarEventHoursBetween,
+  computeEmployeeSchedule,
+  computeCoveragePlan,
+  scheduledHoursBetween,
+  isOnLeaveDate,
+  type WorkLogLookup,
 } from "@/lib/capacityEngine";
 import { computeSkillMatch } from "@/lib/simulate";
-import { availableCapacity } from "@/lib/capacity";
-import { rankCandidatesForTicket } from "@/lib/ticketMatch";
 import { OVERLOAD_THRESHOLD } from "@/data/config";
 
 // Re-exported so existing importers (`@/lib/absenceImpact`) keep working — the shared
@@ -52,30 +64,44 @@ export interface AffectedWorkItem {
   risk: RiskLevel;
   riskExplanation: string;
   ticketId?: string;
+  /** Planned hours that fall inside the leave window — what a cover actually takes on
+   * (the owner's own per-day rate × the covered working days). Same distribution the
+   * owner already had; nothing is compressed. */
+  coverageHours: number;
+  /** The working-day span inside the leave that needs covering, formatted. */
+  turnoverStart: string | null;
+  turnoverEnd: string | null;
+  turnoverWorkingDays: number;
 }
 
 export interface CoverageCandidate {
   employee: Employee;
-  /** Current capacity % (synced utilization) — the "Current Capacity" figure. */
+  /** Utilization % ON THE LEAVE DATES (scheduled hours ÷ available hours in the window). */
   utilization: number;
+  /** Available % in the window. */
   availableCapacity: number;
-  /** Capacity % if this person covered the item — the "After Assignment" figure. */
+  /** Utilization % in the window if they also took on the coverage hours. */
   projectedCapacity: number;
+  /** Hours, for the detail rows. */
+  windowCapacityHours: number;
+  windowScheduledHours: number;
+  windowAvailableHours: number;
+  coverageHours: number;
   skillMatch: number;
   matchedSkills: string[];
-  workloadDuringAbsence: number;
+  /** On approved leave for any part of the turnover window — the one hard block. */
   onLeave: boolean;
-  /** Covering this item would push them past the overload threshold. Surfaced as a
-   * risk, never a block — the supervisor can still assign. */
+  /** Covering this would push them past the overload threshold IN THE WINDOW, or
+   * they simply don't have the hours. */
   overloaded: boolean;
   /** Can be picked at all — everyone in the unit except those on leave during the
-   * absence. A missing skill match does NOT make someone un-assignable; it only
-   * lowers their ranking. */
+   * window. A missing skill match does NOT make someone un-assignable. */
   assignable: boolean;
-  /** Suitable to recommend automatically — assignable, not overloaded, has some
-   * skill overlap (or the item needs no particular skill). */
+  /** Suitable to recommend automatically. */
   eligible: boolean;
   excludeReason?: string;
+  /** Short, human "why they're ranked here" clauses (deadline / capacity / skills). */
+  reasons: string[];
 }
 
 export interface LeaveOverlap {
@@ -90,10 +116,16 @@ export interface AbsenceImpact {
   employee: Employee;
   start: Date;
   end: Date;
+  /** Working days inside the leave window — the turnover period. */
+  turnoverWorkingDays: number;
   affectedWork: AffectedWorkItem[];
   totalEstimatedHours: number;
+  /** Total planned hours that need covering across all affected work. */
+  totalCoverageHours: number;
   deadlinesAtRisk: number;
   candidatesByItem: Map<string, CoverageCandidate[]>;
+  /** The frozen coverage plan per affected ticket, ready to store on accept. */
+  coveragePlanByItem: Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number; dailyHours: number }>;
   primaryCandidateId: string | null;
 }
 
@@ -130,36 +162,28 @@ function assessRisk(
     return { risk: "Critical", explanation: "Already overdue — no one is available to resolve it." };
   }
   if (due >= absenceStart && due <= absenceEnd) {
-    return { risk: "Critical", explanation: "Deadline falls during the absence — will be missed unless reassigned." };
+    return { risk: "Critical", explanation: "Deadline falls during the leave — will be missed unless someone covers it." };
   }
   const bufferDays = due > absenceEnd ? countWorkingDays(addDays(absenceEnd, 1), due) : 0;
   const bufferHours = bufferDays * hoursPerDay;
   if (bufferHours < remainingHours) {
-    return { risk: "Critical", explanation: "Deadline will be missed unless reassigned." };
+    return { risk: "Critical", explanation: "Deadline will be missed unless the leave days are covered." };
   }
   if (bufferDays <= 3 && remainingHours >= 6) {
-    return { risk: "High", explanation: "May not be completed before the deadline." };
+    return { risk: "High", explanation: "Tight after the leave — may not be completed before the deadline." };
   }
   if (bufferDays > 10 && remainingHours <= 2) {
     return { risk: "Low", explanation: "No scheduling impact." };
   }
   return {
     risk: "Medium",
-    explanation: `Affected during the absence, but there's time after return (${bufferDays} working day${bufferDays === 1 ? "" : "s"}) to finish the remaining work.`,
+    explanation: `Affected during the leave, but there's time after return (${bufferDays} working day${bufferDays === 1 ? "" : "s"}) to finish the rest.`,
   };
 }
 
 /**
  * Does this item actually have planned work/effort during `[absenceStart, absenceEnd]`?
- *
- * A deadline after the leave is *not* enough — what matters is whether, on the item's
- * deadline-driven schedule, effort is still outstanding once the leave begins:
- *
- *  - Deadline before the leave starts        → work wraps up before the leave  → no.
- *  - Work only starts after the person is back → nothing to hand over           → no.
- *  - Enough working time before the leave to finish it, and the deadline doesn't
- *    fall on/inside the leave                  → it can be cleared beforehand    → no.
- *  - Otherwise (incl. deadline during the leave) → planned effort overlaps       → yes.
+ * (A deadline after the leave is not, on its own, enough.)
  */
 export function plannedWorkOverlapsAbsence(
   remainingHours: number,
@@ -184,37 +208,36 @@ export function plannedWorkOverlapsAbsence(
   );
   const capacityBefore = workingDaysBefore * hoursPerDay;
 
-  // Comfortably finishable before the leave and the deadline isn't forcing it into
-  // the leave window → no handover needed.
   if (capacityBefore >= remainingHours && (!due || due > absenceEnd)) return false;
   return true;
 }
 
-/** All active work assigned to `employee` — live tickets plus their seed
- * project/ad-hoc workload — whose planned effort actually overlaps the absence window
- * (a deadline after the leave is not, on its own, enough — see `plannedWorkOverlapsAbsence`). */
+/** All active work assigned to `employee` whose planned effort overlaps the leave. */
 export function computeAffectedWork(
   employee: Employee,
   tickets: AssignedTicket[],
   start: Date,
-  end: Date
+  end: Date,
+  getEntry: WorkLogLookup
 ): AffectedWorkItem[] {
   const workingDaysAffected = countWorkingDays(start, end);
-  const hoursPerDay = employee.weeklyHours / 5;
-
+  const hoursPerDay = (employee.weeklyHours || 40) / 5;
   const items: AffectedWorkItem[] = [];
 
   tickets
     .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id) && t.status !== "Completed")
-    .filter((t) => {
-      const effort = ticketEffortForEmployee(t, employee.id);
-      const due = resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate);
-      return plannedWorkOverlapsAbsence(effort, itemStartDate(t.raisedDate), due, employee, start, end);
-    })
     .forEach((t) => {
-      const dueLabel = ticketDueLabel(t);
+      const entry = getEntry(`${employee.id}:${t.id}`);
       const effort = ticketEffortForEmployee(t, employee.id);
-      const { risk, explanation } = assessRisk(dueLabel, start, end, effort, hoursPerDay);
+      const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+      const remaining = itemRemainingHours(effort, false, entry.progress, override);
+      const due = resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate);
+      if (!plannedWorkOverlapsAbsence(remaining, itemStartDate(t.raisedDate), due, employee, start, end)) return;
+
+      const plan = computeCoveragePlan(employee, t, getEntry, start, end);
+      const covKeys = plan.allocations.map((a) => a.dateKey).sort();
+      const dueLabel = ticketDueLabel(t);
+      const { risk, explanation } = assessRisk(dueLabel, start, end, remaining, hoursPerDay);
       items.push({
         id: t.id,
         title: t.title,
@@ -222,33 +245,33 @@ export function computeAffectedWork(
         priority: t.priority,
         status: t.status,
         estimatedHours: effort,
-        remainingHours: effort,
+        remainingHours: remaining,
         dueDate: dueLabel,
         deadlineStatus: mapDeadlineStatus(dueLabel),
         overlapDays: workingDaysAffected,
         risk,
         riskExplanation: explanation,
         ticketId: t.id,
+        coverageHours: plan.hours || Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
+        turnoverStart: covKeys[0] ? formatDisplayDate(parseLooseDate(covKeys[0])!) : null,
+        turnoverEnd: covKeys[covKeys.length - 1] ? formatDisplayDate(parseLooseDate(covKeys[covKeys.length - 1])!) : null,
+        turnoverWorkingDays: covKeys.length || workingDaysAffected,
       });
     });
 
   employee.adhoc.forEach((a) => {
+    const entry = getEntry(`${employee.id}:${a.id}`);
+    const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+    const remaining = itemRemainingHours(a.estimatedHours, false, entry.progress, override);
     const dueDate = a.deadline === "Ongoing" ? null : adhocDueLabel(a);
-    // "Ongoing" ad-hoc work is continuous — it always needs cover during an absence.
-    // Dated ad-hoc work follows the same planned-overlap test as tickets.
     const overlaps =
       a.deadline === "Ongoing"
-        ? a.estimatedHours > 0
-        : plannedWorkOverlapsAbsence(
-            a.estimatedHours,
-            todayStart(),
-            resolveDueDate(a.deadline, a.priority),
-            employee,
-            start,
-            end
-          );
+        ? remaining > 0
+        : plannedWorkOverlapsAbsence(remaining, todayStart(), resolveDueDate(a.deadline, a.priority), employee, start, end);
     if (!overlaps) return;
-    const { risk, explanation } = assessRisk(dueDate, start, end, a.estimatedHours, hoursPerDay);
+    const { risk, explanation } = assessRisk(dueDate, start, end, remaining, hoursPerDay);
+    // Ad-hoc work spreads evenly across the leave days at the person's per-day share.
+    const perDay = Math.round((remaining / Math.max(1, countWorkingDays(todayStart(), resolveDueDate(a.deadline === "Ongoing" ? null : a.deadline, a.priority)))) * 100) / 100;
     items.push({
       id: a.id,
       title: a.name,
@@ -256,12 +279,16 @@ export function computeAffectedWork(
       priority: a.priority,
       status: a.status,
       estimatedHours: a.estimatedHours,
-      remainingHours: a.estimatedHours,
+      remainingHours: remaining,
       dueDate,
       deadlineStatus: mapDeadlineStatus(dueDate),
       overlapDays: workingDaysAffected,
       risk,
       riskExplanation: explanation,
+      coverageHours: Math.round(Math.min(remaining, perDay * workingDaysAffected) * 10) / 10,
+      turnoverStart: formatDisplayDate(start),
+      turnoverEnd: formatDisplayDate(end),
+      turnoverWorkingDays: workingDaysAffected,
     });
   });
 
@@ -275,79 +302,104 @@ function requiredSkillNames(item: AffectedWorkItem, ticket: AssignedTicket | und
   return absentEmployee.skills.map((s: Skill) => s.name);
 }
 
+/** Working days inside `[start, end]` the candidate is NOT on leave — the real
+ * turnover capacity denominator for that person. */
+function windowWorkingDaysAvailable(employee: Employee, start: Date, end: Date): number {
+  let n = 0;
+  const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  while (cursor <= last) {
+    const day = cursor.getDay();
+    if (day !== 5 && day !== 6 && !isOnLeaveDate(employee, cursor)) n += 1;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return n;
+}
+
 function coverageCandidatesForItem(
   item: AffectedWorkItem,
   ticket: AssignedTicket | undefined,
   absentEmployee: Employee,
   peers: Employee[],
   allTickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  events: CalendarEvent[],
   start: Date,
   end: Date
 ): CoverageCandidate[] {
   const required = requiredSkillNames(item, ticket, absentEmployee);
+  const coverageHours = item.coverageHours;
 
-  const base = ticket
-    ? rankCandidatesForTicket(peers, ticket, peers.length).map((c) => ({
-        employee: c.employee,
-        skillMatch: c.skillMatch,
-        matchedSkills: c.matchedSkills,
-        availableCapacity: c.availableCapacity,
-        projectedCapacity: c.projectedCapacity,
-      }))
-    : peers
-        .map((e) => {
-          const skillMatch = computeSkillMatch(e, required);
-          const matchedSkills = e.skills
-            .map((s) => s.name)
-            .filter((name) => required.some((r) => r.toLowerCase() === name.toLowerCase()));
-          const avail = availableCapacity(e.currentUtilization);
-          const due = item.dueDate ? parseLooseDate(item.dueDate) : null;
-          const extra = due
-            ? weeklyRequiredHoursForItem(item.remainingHours, todayStart(), due, e)
-            : item.remainingHours;
-          const denom = e.weeklyHours || 40;
-          const projected = Math.round(e.currentUtilization + (extra / denom) * 100);
-          return { employee: e, skillMatch, matchedSkills, availableCapacity: avail, projectedCapacity: projected };
-        })
-        .sort((a, b) => b.skillMatch - a.skillMatch || b.availableCapacity - a.availableCapacity);
+  return peers
+    .map((e) => {
+      const perDay = (e.weeklyHours || 40) / 5;
 
-  return base
-    .map((c) => {
-      const onLeave = c.employee.leaveEvents.some((l) => {
+      // On approved leave for any part of the turnover window — the one hard block.
+      const onLeave = e.leaveEvents.some((l) => {
         if (l.status === "Pending") return false;
-        const lStart = parseLooseDate(l.start);
-        const lEnd = parseLooseDate(l.end);
-        return lStart && lEnd ? rangesOverlap(start, end, lStart, lEnd) : false;
+        const ls = parseLooseDate(l.start);
+        const le = parseLooseDate(l.end);
+        return ls && le ? rangesOverlap(start, end, ls, le) : false;
       });
-      const workloadDuringAbsence = computeAffectedWork(c.employee, allTickets, start, end).reduce(
-        (sum, w) => sum + w.remainingHours,
-        0
-      );
-      const overloaded = c.projectedCapacity > OVERLOAD_THRESHOLD;
-      const missingSkill = required.length > 0 && c.skillMatch === 0;
-      // On leave during the absence is the only hard restriction — everyone else can
-      // be assigned; skill / capacity concerns only affect ranking and warnings.
+
+      // Capacity IN THE WINDOW: working days not on leave, minus timed calendar events.
+      const availDays = windowWorkingDaysAvailable(e, start, end);
+      const eventHours = calendarEventHoursBetween(events, e.id, start, end);
+      const windowCapacityHours = Math.max(0, Math.round((availDays * perDay - eventHours) * 10) / 10);
+
+      // Existing scheduled workload on those dates (their real deadline-driven schedule).
+      const schedule = computeEmployeeSchedule(e, allTickets, getEntry, events);
+      const windowScheduledHours = scheduledHoursBetween(schedule, start, end);
+      const windowAvailableHours = Math.round((windowCapacityHours - windowScheduledHours) * 10) / 10;
+
+      const denom = windowCapacityHours > 0 ? windowCapacityHours : e.weeklyHours || 40;
+      const utilization = Math.round((windowScheduledHours / denom) * 100);
+      const projectedCapacity = Math.round(((windowScheduledHours + coverageHours) / denom) * 100);
+
+      const skillMatch = computeSkillMatch(e, required);
+      const matchedSkills = e.skills
+        .map((s) => s.name)
+        .filter((name) => required.some((r) => r.toLowerCase() === name.toLowerCase()));
+
+      const notEnoughHours = !onLeave && windowAvailableHours < coverageHours - 0.5;
+      const overloaded = !onLeave && (projectedCapacity > OVERLOAD_THRESHOLD || notEnoughHours);
+      const missingSkill = required.length > 0 && skillMatch === 0;
+
       const assignable = !onLeave;
       const eligible = assignable && !overloaded && !missingSkill;
+
       let excludeReason: string | undefined;
-      if (onLeave) excludeReason = "On leave during this period";
-      else if (overloaded) excludeReason = "Covering this would exceed the overload threshold";
+      if (onLeave) excludeReason = "On approved leave during the turnover window";
+      else if (notEnoughHours) excludeReason = `Only ${Math.max(0, windowAvailableHours)}h free in the window — needs ${coverageHours}h`;
+      else if (projectedCapacity > OVERLOAD_THRESHOLD) excludeReason = "Covering this would overload them during the window";
       else if (missingSkill) excludeReason = "No matching skill — assign manually if needed";
 
+      const reasons: string[] = [];
+      if (onLeave) reasons.push("On leave during the turnover — not available");
+      else {
+        reasons.push(`${windowAvailableHours}h free during ${formatDisplayDate(start)}–${formatDisplayDate(end)} (needs ${coverageHours}h)`);
+        reasons.push(`Window capacity ${utilization}% → ${projectedCapacity}% with this cover`);
+      }
+      if (matchedSkills.length > 0) reasons.push(`Skill match: ${matchedSkills.join(", ")}`);
+      else if (required.length > 0) reasons.push("No matching skill for this task");
+
       return {
-        employee: c.employee,
-        utilization: c.employee.currentUtilization,
-        // On leave during the window → no availability to offer.
-        availableCapacity: onLeave ? 0 : c.availableCapacity,
-        projectedCapacity: c.projectedCapacity,
-        skillMatch: c.skillMatch,
-        matchedSkills: c.matchedSkills,
-        workloadDuringAbsence,
+        employee: e,
+        utilization,
+        availableCapacity: Math.max(0, 100 - utilization),
+        projectedCapacity,
+        windowCapacityHours,
+        windowScheduledHours,
+        windowAvailableHours,
+        coverageHours,
+        skillMatch,
+        matchedSkills,
         onLeave,
         overloaded,
         assignable,
         eligible,
         excludeReason,
+        reasons,
       };
     })
     .sort(
@@ -355,6 +407,7 @@ function coverageCandidatesForItem(
         Number(b.assignable) - Number(a.assignable) ||
         Number(b.eligible) - Number(a.eligible) ||
         b.skillMatch - a.skillMatch ||
+        b.windowAvailableHours - a.windowAvailableHours ||
         a.projectedCapacity - b.projectedCapacity
     );
 }
@@ -411,19 +464,23 @@ export function computeAbsenceImpact(params: {
   tickets: AssignedTicket[];
   startLabel: string;
   endLabel: string;
+  getEntry: WorkLogLookup;
+  events?: CalendarEvent[];
 }): AbsenceImpact | null {
-  const { employee, unitEmployees, tickets, startLabel, endLabel } = params;
+  const { employee, unitEmployees, tickets, startLabel, endLabel, getEntry, events = [] } = params;
   const start = parseLooseDate(startLabel);
   const end = parseLooseDate(endLabel);
   if (!start || !end || start > end) return null;
 
   const peers = unitEmployees.filter((e) => e.id !== employee.id);
-  const affectedWork = computeAffectedWork(employee, tickets, start, end);
+  const affectedWork = computeAffectedWork(employee, tickets, start, end, getEntry);
 
   const candidatesByItem = new Map<string, CoverageCandidate[]>();
+  const coveragePlanByItem = new Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number; dailyHours: number }>();
   affectedWork.forEach((item) => {
     const ticket = item.ticketId ? tickets.find((t) => t.id === item.ticketId) : undefined;
-    candidatesByItem.set(item.id, coverageCandidatesForItem(item, ticket, employee, peers, tickets, start, end));
+    candidatesByItem.set(item.id, coverageCandidatesForItem(item, ticket, employee, peers, tickets, getEntry, events, start, end));
+    if (ticket) coveragePlanByItem.set(item.id, computeCoveragePlan(employee, ticket, getEntry, start, end));
   });
 
   const urgentItems = affectedWork.filter((i) => i.risk === "Critical" || i.risk === "High");
@@ -450,10 +507,13 @@ export function computeAbsenceImpact(params: {
     employee,
     start,
     end,
+    turnoverWorkingDays: countWorkingDays(start, end),
     affectedWork: [...affectedWork].sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk]),
-    totalEstimatedHours: affectedWork.reduce((sum, w) => sum + w.remainingHours, 0),
+    totalEstimatedHours: Math.round(affectedWork.reduce((sum, w) => sum + w.remainingHours, 0) * 10) / 10,
+    totalCoverageHours: Math.round(affectedWork.reduce((sum, w) => sum + w.coverageHours, 0) * 10) / 10,
     deadlinesAtRisk: affectedWork.filter((w) => w.dueDate && (w.risk === "Critical" || w.risk === "High")).length,
     candidatesByItem,
+    coveragePlanByItem,
     primaryCandidateId,
   };
 }

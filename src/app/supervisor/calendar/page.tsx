@@ -1,7 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { CalendarRange, LayoutGrid } from "lucide-react";
 import { CalendarView, type CalendarItem, type TicketDeadlineState } from "@/components/calendar/CalendarView";
+import { WorkloadView } from "@/components/calendar/WorkloadView";
 import { TaskDetailPanel } from "@/components/work/TaskDetailPanel";
 import { useSupervisorSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
@@ -19,12 +21,13 @@ function ticketDeadlineState(t: AssignedTicket): TicketDeadlineState {
 export default function SupervisorCalendarPage() {
   const { unit } = useSupervisorSession();
   const { employees } = useEmployees();
-  const { tickets, updateTicketStatus, updateTicketPriority, updateTicketSkills, setTicketAssignees, setTicketEffortSplit } = useTickets();
+  const { tickets, updateTicketStatus, updateTicketPriority, updateTicketSkills, setTicketAssignees, setTicketEffortSplit, setTicketDependency, setTicketCoverage } = useTickets();
   const { events, addEvent } = useCalendarEvents();
   const unitEmployees = useMemo(() => getUnitTeam(unit, employees), [employees, unit]);
   const currentSupervisor = getDepartmentSupervisor(unit, employees);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [view, setView] = useState<"calendar" | "workload">("calendar");
 
   const unitTickets = useMemo(() => ticketsForUnit(tickets, unit), [tickets, unit]);
   const detailTicket = openTicketId ? unitTickets.find((t) => t.id === openTicketId) ?? null : null;
@@ -92,12 +95,62 @@ export default function SupervisorCalendarPage() {
     return list;
   }, [unitEmployees, unitTickets, unit, events, currentSupervisor]);
 
+  const toggle = (
+    <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1">
+      <button
+        onClick={() => setView("calendar")}
+        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+          view === "calendar" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+        }`}
+      >
+        <CalendarRange className="h-3.5 w-3.5" />
+        Calendar
+      </button>
+      <button
+        onClick={() => setView("workload")}
+        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+          view === "workload" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+        }`}
+      >
+        <LayoutGrid className="h-3.5 w-3.5" />
+        Workload
+      </button>
+    </div>
+  );
+
+  if (view === "workload") {
+    return (
+      <>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h1 className="text-2xl font-semibold text-ink tracking-tight">Workload</h1>
+            <p className="mt-1 text-sm text-ink-muted">
+              {unit} · each person&rsquo;s scheduled tasks against their available working time. Planned workload, not a
+              productivity measure.
+            </p>
+          </div>
+          {toggle}
+        </div>
+        <div className="mt-4">
+          <WorkloadView employees={unitEmployees} />
+        </div>
+
+        {detailError && (
+          <p className="mt-4 rounded-lg border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-4 py-3 text-sm text-[var(--status-critical)]">
+            {detailError}
+          </p>
+        )}
+      </>
+    );
+  }
+
   return (
     <>
       <CalendarView
         title="Calendar"
         subtitle={`${unit} · deadlines and leave, day by day.`}
         items={items}
+        headerActions={toggle}
         onAddItem={
           currentSupervisor
             ? async (input) => {
@@ -135,6 +188,9 @@ export default function SupervisorCalendarPage() {
           onUpdateSkills={(skills) => updateTicketSkills(detailTicket.id, skills).catch(() => setDetailError("Couldn't update skills — check your connection and try again."))}
           onUpdateAssignees={(ids, split) => setTicketAssignees(detailTicket.id, ids, split).catch(() => setDetailError("Couldn't update assignees — check your connection and try again."))}
           onUpdateEffortSplit={(split) => setTicketEffortSplit(detailTicket.id, split).catch(() => setDetailError("Couldn't update the effort split — check your connection and try again."))}
+          allTickets={unitTickets}
+          onUpdateDependency={(dep) => setTicketDependency(detailTicket.id, dep).catch(() => setDetailError("Couldn't update the dependency — check your connection and try again."))}
+          onClearCoverage={() => setTicketCoverage(detailTicket.id, null).catch(() => setDetailError("Couldn't end coverage — check your connection and try again."))}
         />
       )}
     </>

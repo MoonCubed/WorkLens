@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
 import type { Department } from "@/data/types";
-import { TICKETS, type Ticket, type TicketStatus, type TicketPriority } from "@/data/tickets";
+import { TICKETS, type Ticket, type TicketStatus, type TicketPriority, type TicketCoverage } from "@/data/tickets";
 import { supabase } from "@/lib/supabase";
 import { useSupabaseTable } from "@/store/use-supabase-table";
 import { todayLabel } from "@/lib/date";
@@ -52,6 +52,12 @@ interface TicketsContextValue {
   setTicketAssignees: (id: string, employeeIds: string[], effortSplit?: Record<string, number>) => Promise<void>;
   /** Records how a co-assigned ticket's estimated effort is split ({ employeeId: hours }). */
   setTicketEffortSplit: (id: string, effortSplit: Record<string, number>) => Promise<void>;
+  /** Sets (or clears, with null) the prerequisite ticket this one depends on. */
+  setTicketDependency: (id: string, dependsOnTicketId: string | null) => Promise<void>;
+  /** Sets (or clears, with null) a time-boxed coverage plan — the covering employee
+   * carries the ticket only for the frozen days inside the leave window; ownership
+   * stays with the original owner. */
+  setTicketCoverage: (id: string, coverage: TicketCoverage | null) => Promise<void>;
 }
 
 const TicketsContext = createContext<TicketsContextValue | null>(null);
@@ -169,6 +175,30 @@ export function TicketsProvider({ children }: { children: ReactNode }) {
     [refetch]
   );
 
+  const setTicketDependency = useCallback(
+    async (id: string, dependsOnTicketId: string | null) => {
+      const { error: updateError } = await supabase
+        .from(TABLE)
+        .update({ dependsOnTicketId: dependsOnTicketId || null, activityAt: nowIso() })
+        .eq("id", id);
+      if (updateError) throw updateError;
+      await refetch();
+    },
+    [refetch]
+  );
+
+  const setTicketCoverage = useCallback(
+    async (id: string, coverage: TicketCoverage | null) => {
+      const { error: updateError } = await supabase
+        .from(TABLE)
+        .update({ coverage: coverage ?? null, activityAt: nowIso() })
+        .eq("id", id);
+      if (updateError) throw updateError;
+      await refetch();
+    },
+    [refetch]
+  );
+
   const value = useMemo(
     () => ({
       tickets,
@@ -183,6 +213,8 @@ export function TicketsProvider({ children }: { children: ReactNode }) {
       assignTicketToEmployee,
       setTicketAssignees,
       setTicketEffortSplit,
+      setTicketDependency,
+      setTicketCoverage,
     }),
     [
       tickets,
@@ -197,6 +229,8 @@ export function TicketsProvider({ children }: { children: ReactNode }) {
       assignTicketToEmployee,
       setTicketAssignees,
       setTicketEffortSplit,
+      setTicketDependency,
+      setTicketCoverage,
     ]
   );
 

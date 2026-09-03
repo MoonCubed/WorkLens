@@ -15,6 +15,7 @@ import type { SkillLevel } from "@/data/types";
 import { useEmployees } from "@/store/employees-store";
 import { useSupervisorSession } from "@/store/session-store";
 import { useWorkLog } from "@/store/work-log-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import { getDepartmentSupervisor } from "@/lib/hr";
 import { computeEmployeeCapacity, computeEmployeeWeeklyCapacity, ticketEffortForEmployee } from "@/lib/capacityEngine";
 import { ticketDueLabel, seedTicketDueLabel, adhocDueLabel } from "@/lib/due";
@@ -31,6 +32,7 @@ export default function EmployeeDetailsPage() {
   const employee = employees.find((e) => e.id === params.id);
   const { tickets, updateTicketStatus } = useTickets();
   const { getEntry } = useWorkLog();
+  const { events: calendarEvents } = useCalendarEvents();
   const { requests: skillChangeRequests } = useSkillChangeRequests();
   const pendingSkillChanges = skillChangeRequests.filter((r) => r.employeeId === params.id && r.status === "Pending");
   const { unit } = useSupervisorSession();
@@ -121,9 +123,9 @@ export default function EmployeeDetailsPage() {
   // The employee's actual current workload — live remaining hours across assigned
   // work, and the leave-adjusted available hours for the week (same formula as
   // every other capacity figure in the app).
-  const capacity = computeEmployeeCapacity(employee, tickets, getEntry);
+  const capacity = computeEmployeeCapacity(employee, tickets, getEntry, calendarEvents);
   // Week-by-week capacity — the supervisor's primary capacity view for this person.
-  const weeklyCapacity = computeEmployeeWeeklyCapacity(employee, tickets, getEntry, 8);
+  const weeklyCapacity = computeEmployeeWeeklyCapacity(employee, tickets, getEntry, 8, undefined, calendarEvents);
   const initials = employee.name.split(" ").map((n) => n[0]).slice(0, 2).join("");
 
   return (

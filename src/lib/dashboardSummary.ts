@@ -1,5 +1,6 @@
 import type { Department, Employee, LeaveEvent } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
+import type { CalendarEvent } from "@/store/calendar-events-store";
 import { ticketsForUnit } from "@/store/tickets-store";
 import {
   computeEmployeeCapacity,
@@ -115,7 +116,12 @@ function buildUnitWorkItems(unitEmployees: Employee[], tickets: AssignedTicket[]
           employeeName: e.name,
           title: t.title,
           dueDate,
-          remainingHours: itemRemainingHours(ticketEffortForEmployee(t, e.id), status === "Completed", entry.progress),
+          remainingHours: itemRemainingHours(
+            ticketEffortForEmployee(t, e.id),
+            status === "Completed",
+            entry.progress,
+            entry.remainingHours
+          ),
           status,
           bucket: deliveryBucket(status, dueDate),
           progress: entry.progress,
@@ -134,7 +140,7 @@ function buildUnitWorkItems(unitEmployees: Employee[], tickets: AssignedTicket[]
         employeeName: e.name,
         title: a.name,
         dueDate,
-        remainingHours: itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress),
+        remainingHours: itemRemainingHours(a.estimatedHours, status === "Completed", entry.progress, entry.remainingHours),
         status,
         bucket: deliveryBucket(status, dueDate),
         completedDate: status === "Completed" ? (entry.completedAt ?? null) : null,
@@ -175,7 +181,8 @@ export function computeDashboardSummary(
   employees: Employee[],
   tickets: AssignedTicket[],
   getEntry: WorkLogLookup,
-  handoverRequests: { employeeId: string; status: string }[] = []
+  handoverRequests: { employeeId: string; status: string }[] = [],
+  calendarEvents: CalendarEvent[] = []
 ): DashboardSummary {
   // The supervisor owns the team's capacity — they are not a team member and are
   // excluded from every count, capacity total and progress figure here.
@@ -185,7 +192,7 @@ export function computeDashboardSummary(
 
   const employeeCapacities: EmployeeCapacityRow[] = unitEmployees
     .map((employee) => {
-      const capacity = computeEmployeeCapacity(employee, tickets, getEntry);
+      const capacity = computeEmployeeCapacity(employee, tickets, getEntry, calendarEvents);
       const activeItems = workItems.filter((i) => i.employeeId === employee.id && i.status !== "Completed").length;
       return {
         employee,

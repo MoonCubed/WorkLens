@@ -25,10 +25,29 @@ export interface SkillChangeRequest {
   skillLevel?: SkillLevel | null;
   /** The employee's current level for "remove" / "update", for the reviewer's context. */
   previousLevel?: SkillLevel | null;
+  /** Why the employee is asking — e.g. a completed certification. Shown to the
+   * reviewing supervisor. */
+  justification?: string;
   status: SkillChangeStatus;
   submittedAt: string;
   reviewedAt?: string | null;
 }
+
+// One pending skill-change request seeded for the demo, with a certification-backed
+// justification — shows the Skills approval workflow end to end.
+const SEED_REQUESTS: SkillChangeRequest[] = [
+  {
+    id: "SKL-demo-1",
+    employeeId: "tariq-al-mutairi",
+    kind: "add",
+    skillName: "Kubernetes",
+    skillLevel: "Advanced",
+    justification: "Completed a professional certification (Certified Kubernetes Administrator) and received a certificate for this skill.",
+    status: "Pending",
+    submittedAt: "01 Sep 2026",
+    reviewedAt: null,
+  },
+];
 
 interface SkillChangeRequestsContextValue {
   requests: SkillChangeRequest[];
@@ -43,11 +62,12 @@ interface SkillChangeRequestsContextValue {
 const SkillChangeRequestsContext = createContext<SkillChangeRequestsContextValue | null>(null);
 
 export function SkillChangeRequestsProvider({ children }: { children: ReactNode }) {
-  const { rows: requests, loading, error, refetch } = useSupabaseTable<SkillChangeRequest>(TABLE, []);
+  const { rows: requests, loading, error, refetch } = useSupabaseTable<SkillChangeRequest>(TABLE, SEED_REQUESTS);
 
   const submit = useCallback(
     async (input: Omit<SkillChangeRequest, "id" | "status" | "submittedAt" | "reviewedAt">) => {
       const created: SkillChangeRequest = {
+        justification: "",
         ...input,
         id: `SKL-${Date.now().toString(36)}`,
         status: "Pending",

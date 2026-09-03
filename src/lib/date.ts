@@ -199,6 +199,21 @@ export function isSlaDerived(explicitDeadline: string | null | undefined): boole
   return !explicitDeadline || !parseLooseDate(explicitDeadline);
 }
 
+/** "Today" / "Yesterday" / "3 days ago" / "in 2 days" for a "26 Aug 2026"-style date
+ * (or any parseable date). Used for the "Last updated: …" progress-freshness label.
+ * Returns null when the value can't be parsed. */
+export function relativeDayLabel(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = parseLooseDate(value);
+  if (!date) return null;
+  const days = daysBetween(todayStart(), new Date(date.getFullYear(), date.getMonth(), date.getDate()));
+  if (days === 0) return "Today";
+  if (days === -1) return "Yesterday";
+  if (days < -1) return `${-days} days ago`;
+  if (days === 1) return "Tomorrow";
+  return `in ${days} days`;
+}
+
 export type DueStatus = "Overdue" | "Due Soon" | "On Track";
 
 /** Due-soon window, in days, used to flag upcoming deadlines. */

@@ -8,7 +8,7 @@ import { todayStart, todayLabel, toInputDateValue, formatDisplayDate, startOfWee
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-export type CalendarItemKind = "Ticket" | "Leave" | "Custom" | "Planned";
+export type CalendarItemKind = "Ticket" | "Leave" | "Custom" | "Planned" | "Appointment" | "Adhoc" | "Coverage";
 export type CalendarItemPriority = "High" | "Medium" | "Low";
 
 export const CUSTOM_ITEM_TYPES = ["Task", "Meeting", "Reminder", "Personal", "Other"] as const;
@@ -40,20 +40,27 @@ function chipStyle(item: CalendarItem): string {
   if (item.kind === "Ticket") {
     if (item.ticketState === "closed") return "bg-gray-100 border-gray-400 text-gray-600";
     if (item.ticketState === "overdue") return "bg-[var(--status-critical-bg)] border-[var(--status-critical-border)] text-[var(--status-critical)]";
+    // High-priority operational work reads with a stronger fill than the rest.
+    if (item.priority === "High") return "bg-brand-600 border-brand-800 text-white";
     return "bg-brand-100 border-brand-600 text-brand-900";
   }
   if (item.kind === "Leave") return "bg-yellow-100 border-yellow-500 text-yellow-900";
   if (item.kind === "Planned") return "bg-emerald-100 border-emerald-600 text-emerald-900";
-  return "bg-purple-100 border-purple-600 text-purple-900";
+  if (item.kind === "Coverage") return "bg-[var(--accent-teal-bg)] border-[var(--accent-teal)] text-[color:var(--accent-teal)]";
+  if (item.kind === "Appointment") return "bg-purple-100 border-purple-600 text-purple-900";
+  if (item.kind === "Adhoc") return "bg-[var(--status-serious-bg)] border-[var(--status-serious-border)] text-[var(--status-serious)]";
+  return "bg-slate-100 border-slate-400 text-slate-700";
 }
 
 const LEGEND: { label: string; dot: string }[] = [
-  { label: "Planned work (hours that day)", dot: "bg-emerald-600" },
-  { label: "Ticket deadline (open)", dot: "bg-brand-600" },
-  { label: "Ticket deadline (closed)", dot: "bg-gray-400" },
-  { label: "Ticket deadline (overdue)", dot: "bg-[var(--status-critical)]" },
-  { label: "Leave / unavailable", dot: "bg-yellow-500" },
-  { label: "Added by you", dot: "bg-purple-600" },
+  { label: "Planned / project work (hours that day)", dot: "bg-emerald-600" },
+  { label: "IT-Demand ticket (operational)", dot: "bg-brand-600" },
+  { label: "High-priority / overdue", dot: "bg-[var(--status-critical)]" },
+  { label: "Ad-hoc work", dot: "bg-[var(--status-serious)]" },
+  { label: "Turnover coverage", dot: "bg-[var(--accent-teal)]" },
+  { label: "Appointment / meeting (blocks capacity)", dot: "bg-purple-600" },
+  { label: "Leave / official availability", dot: "bg-yellow-500" },
+  { label: "Note / reminder", dot: "bg-slate-400" },
 ];
 
 // Overdue first, then leave, then planned-work summary, then ticket deadlines
@@ -63,9 +70,12 @@ const PRIORITY_RANK: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
 function itemSortRank(item: CalendarItem): number {
   if (item.kind === "Ticket" && item.ticketState === "overdue") return 0;
   if (item.kind === "Leave") return 1;
-  if (item.kind === "Planned") return 2;
-  if (item.kind === "Ticket") return 3 + (PRIORITY_RANK[item.priority ?? "Low"] ?? 2);
-  return 7;
+  if (item.kind === "Appointment") return 2;
+  if (item.kind === "Coverage") return 3;
+  if (item.kind === "Planned") return 4;
+  if (item.kind === "Ticket") return 5 + (PRIORITY_RANK[item.priority ?? "Low"] ?? 2);
+  if (item.kind === "Adhoc") return 9;
+  return 10;
 }
 function sortItems(items: CalendarItem[]): CalendarItem[] {
   return [...items].sort((a, b) => itemSortRank(a) - itemSortRank(b));
@@ -101,11 +111,15 @@ export function CalendarView({
   subtitle,
   items,
   onAddItem,
+  headerActions,
 }: {
   title: string;
   subtitle: string;
   items: CalendarItem[];
   onAddItem?: (input: { title: string; date: string; priority: CalendarItemPriority; itemType: string; note: string }) => Promise<void>;
+  /** Right-aligned controls shown next to the title (e.g. a Calendar / Workload view
+   * toggle). */
+  headerActions?: React.ReactNode;
 }) {
   const [view, setView] = useState<"month" | "week" | "day">("month");
   const [cursor, setCursor] = useState(() => todayStart());
@@ -132,7 +146,7 @@ export function CalendarView({
       deadlines: inRange.filter((i) => i.kind === "Ticket").length,
       overdue: inRange.filter((i) => i.kind === "Ticket" && i.ticketState === "overdue").length,
       leaveDays: inRange.filter((i) => i.kind === "Leave").length,
-      personal: inRange.filter((i) => i.kind === "Custom").length,
+      personal: inRange.filter((i) => i.kind === "Custom" || i.kind === "Appointment").length,
     };
   }, [items, view, cursor]);
 
@@ -162,15 +176,18 @@ export function CalendarView({
           <h1 className="text-2xl font-semibold text-ink tracking-tight">{title}</h1>
           <p className="mt-1 text-sm text-ink-muted">{subtitle}</p>
         </div>
-        {onAddItem && (
-          <button
-            onClick={() => setShowAdd(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-brand-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
-          >
-            <Plus className="h-4 w-4" strokeWidth={2} />
-            Add
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {headerActions}
+          {onAddItem && (
+            <button
+              onClick={() => setShowAdd(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-brand-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
+            >
+              <Plus className="h-4 w-4" strokeWidth={2} />
+              Add
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">

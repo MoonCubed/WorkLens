@@ -5,7 +5,7 @@ import { ChevronDown, ChevronUp, CalendarCheck2, PauseCircle, Lock, PlayCircle }
 import { PriorityBadge } from "@/components/ui/StatusBadge";
 import type { WorkflowStatus } from "@/data/types";
 import { TICKET_STATUS_OPTIONS, type TicketStatus } from "@/data/tickets";
-import { getDueStatus, type DueStatus } from "@/lib/date";
+import { getDueStatus, relativeDayLabel, type DueStatus } from "@/lib/date";
 import { unifiedItemStatus } from "@/lib/capacityEngine";
 import { useWorkLog } from "@/store/work-log-store";
 import { CommentsThread } from "@/components/work/CommentsThread";
@@ -56,7 +56,7 @@ export function WorkItemRow({
    * that opens the full task detail panel. */
   onOpenDetails?: (ticketId: string) => void;
 }) {
-  const { getEntry, setWorkflowStatus, setProgress } = useWorkLog();
+  const { getEntry, setWorkflowStatus, setProgress, setEffort } = useWorkLog();
   const entry = getEntry(row.key);
   const [expanded, setExpanded] = useState(false);
   // A move into Completed / On Hold is confirmed first (see StatusChangeDialog).
@@ -82,7 +82,15 @@ export function WorkItemRow({
   const resumedFromHold = rawStatus === "On Hold" && effectiveStatus === "In Progress";
   const completedDate = isTicket ? (row.ticketResolvedDate ?? entry.completedAt ?? null) : entry.completedAt ?? null;
   const progress = entry.progress ?? 0;
-  const remainingHours = complete ? 0 : Math.round(row.estimatedHours * (1 - progress / 100) * 10) / 10;
+  // Remaining effort: the employee's logged figure wins over estimate × (1 − progress),
+  // so a task that turned out bigger/smaller reschedules from the real number.
+  const remainingOverride = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
+  const remainingHours = complete
+    ? 0
+    : remainingOverride != null
+      ? remainingOverride
+      : Math.round(row.estimatedHours * (1 - progress / 100) * 10) / 10;
+  const freshness = relativeDayLabel(entry.progressUpdatedAt);
 
   /** Route a status change: Completed / On Hold pause for confirmation, others apply now. */
   function requestStatus(next: WorkflowStatus | TicketStatus) {
@@ -124,11 +132,17 @@ export function WorkItemRow({
             ) : (
               <>
                 <span>Due: {row.deadline}</span>
-                <span className="tabular">{remainingHours}h remaining</span>
+                <span className="tabular">
+                  {remainingHours}h remaining
+                  {remainingOverride != null && <span className="text-brand-700"> · updated</span>}
+                </span>
                 <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${DUE_STYLES[due]}`}>
                   {due}
                 </span>
                 <span className="tabular text-ink-muted">{progress}% done</span>
+                <span className={freshness && /days ago/.test(freshness) && !/^[1-3] /.test(freshness) ? "text-[var(--status-warning)]" : "text-ink-muted"}>
+                  {freshness ? `updated ${freshness.toLowerCase()}` : "no progress logged"}
+                </span>
                 {onHold && (holdStart || holdEnd) && (
                   <span className="inline-flex items-center gap-1 rounded-full border border-border-strong bg-brand-50/60 px-2 py-0.5 text-[11px] font-medium text-ink-secondary">
                     <PauseCircle className="h-3 w-3" />
@@ -209,6 +223,43 @@ export function WorkItemRow({
                 className="w-full accent-brand-700"
               />
               {isTicket && <p className="mt-1 text-xs text-ink-muted">Your own progress on this ticket — shared with anyone else assigned to it.</p>}
+
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-secondary">Worked so far (h)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.5}
+                    defaultValue={entry.actualHours ?? ""}
+                    placeholder="—"
+                    onBlur={(e) => {
+                      const v = e.target.value.trim();
+                      setEffort(row.key, { actualHours: v === "" ? null : Number(v) }).catch(() => {});
+                    }}
+                    className="input py-1.5 text-xs"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ink-secondary">Remaining (h)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.5}
+                    defaultValue={remainingOverride ?? ""}
+                    placeholder={`${Math.round(row.estimatedHours * (1 - progress / 100) * 10) / 10} (from progress)`}
+                    onBlur={(e) => {
+                      const v = e.target.value.trim();
+                      setEffort(row.key, { remainingHours: v === "" ? null : Number(v) }).catch(() => {});
+                    }}
+                    className="input py-1.5 text-xs"
+                  />
+                </label>
+              </div>
+              <p className="mt-1 text-[11px] text-ink-muted">
+                Estimate {row.estimatedHours}h. Set a remaining figure if the work turned out bigger or smaller — future
+                scheduling uses it. {freshness ? `Last updated ${freshness.toLowerCase()}.` : ""}
+              </p>
             </div>
           )}
           <CommentsThread workLogKey={row.key} currentUserName={currentUserName} />

@@ -87,6 +87,20 @@ where "assignedEmployeeId" is not null and "assignedEmployeeIds" = '[]'::jsonb;
 -- Safe to re-run.
 alter table tickets add column if not exists "effortSplit" jsonb;
 alter table tickets add column if not exists "activityAt" text;
+
+-- Basic task dependencies: "dependsOnTicketId" points at a prerequisite ticket. While
+-- that prerequisite is not Completed, the dependent ticket's work is not scheduled
+-- before the prerequisite's due date, so dependent effort never lands ahead of the
+-- work it relies on. Deliberately lightweight — a single optional link, not a
+-- project-management dependency graph. Safe to re-run.
+alter table tickets add column if not exists "dependsOnTicketId" text;
+
+-- Time-boxed turnover coverage. When a supervisor accepts a turnover request, the
+-- covering employee takes the ticket's planned days ONLY for the leave window, at the
+-- owner's original per-day rate ("constant task-time distribution") — never a
+-- permanent transfer. The frozen plan (owner, cover, window, per-day allocations) is
+-- stored here as jsonb; clearing it hands the days back to the owner. Safe to re-run.
+alter table tickets add column if not exists coverage jsonb;
 update tickets set status = 'Completed' where status in ('Resolved', 'Closed');
 update tickets set status = 'In Progress' where status not in ('In Progress', 'On Hold', 'Completed');
 
@@ -189,6 +203,17 @@ alter table work_log_entries add column if not exists "completedAt" text;
 alter table work_log_entries add column if not exists "holdStartDate" text;
 alter table work_log_entries add column if not exists "holdEndDate" text;
 
+-- Actual vs estimated effort. "actualHours" is the time the assignee has actually
+-- worked on the item so far; "remainingHours" is their current estimate of the work
+-- left. When "remainingHours" is set it overrides the progress-derived remaining
+-- figure everywhere future scheduling is calculated, so a task that turned out
+-- larger or smaller than its original estimate reschedules from the real number.
+-- "progressUpdatedAt" ("26 Aug 2026" style) records when progress / effort was last
+-- touched, powering the "Last updated: 2 days ago" freshness indicator. Safe to re-run.
+alter table work_log_entries add column if not exists "actualHours" numeric;
+alter table work_log_entries add column if not exists "remainingHours" numeric;
+alter table work_log_entries add column if not exists "progressUpdatedAt" text;
+
 -- Collapse any earlier workflowStatus values (Blocked, Not Started, ...) onto the
 -- current set. Runs here, after the table is guaranteed to exist; a no-op on a fresh
 -- (empty) database.
@@ -254,6 +279,30 @@ alter table calendar_events add column if not exists priority text not null defa
 alter table calendar_events add column if not exists "itemType" text not null default 'Task';
 alter table calendar_events add column if not exists note text not null default '';
 
+-- Employee calendar events / appointments carry an optional start + end time (24h
+-- "HH:MM"). When both are set the entry is a timed personal commitment ("Doctor
+-- Appointment · 09:00–10:00") that reduces the author's available working capacity
+-- for that day, reflected everywhere capacity is shown. Untimed entries stay plain
+-- calendar notes and never affect capacity. These are never WorkLens tasks and never
+-- change the employee's official working-hours profile. Safe to re-run.
+alter table calendar_events add column if not exists "startTime" text;
+alter table calendar_events add column if not exists "endTime" text;
+
+-- Plan My Day: the employee-confirmed order + hour allocation for one day. One row per
+-- (employee, day), id "<employeeId>:<YYYY-MM-DD>". The suggestion is generated from the
+-- existing schedule/capacity/priority logic; nothing is stored until the employee
+-- confirms. Daily Tasks shows the saved plan for that day; weekly/overall capacity
+-- stays derived from the shared engine (a day plan only re-orders within the day).
+create table if not exists day_plans (
+  id text primary key,
+  "employeeId" text not null,
+  date text not null,
+  "availableHours" numeric not null default 0,
+  allocations jsonb not null default '[]',
+  note text not null default '',
+  "createdAt" text not null
+);
+
 -- Task adjustment requests — an employee asks their supervisor to extend a deadline,
 -- change the estimated effort, revisit an assignment, etc. The supervisor reviews on
 -- the Tasks page; the underlying task is only changed if they approve.
@@ -280,11 +329,15 @@ create table if not exists skill_change_requests (
   "skillName" text not null,
   "skillLevel" text,                     -- target level for 'add' / 'update'
   "previousLevel" text,                  -- current level for 'remove' / 'update'
+  justification text not null default '', -- why the employee is asking (e.g. a certification)
   status text not null default 'Pending', -- 'Pending' | 'Approved' | 'Rejected'
   "submittedAt" text not null,
   "reviewedAt" text,
   "createdAt" timestamptz not null default now()
 );
+-- Migration for projects that already ran an earlier version of this file, before the
+-- employee could attach a justification to a skill-change request. Safe to re-run.
+alter table skill_change_requests add column if not exists justification text not null default '';
 
 -- ============================================================================
 -- Row Level Security
@@ -305,15 +358,17 @@ alter table calendar_events enable row level security;
 alter table skills enable row level security;
 alter table task_adjustment_requests enable row level security;
 alter table skill_change_requests enable row level security;
+alter table day_plans enable row level security;
 
 -- RLS policies alone aren't enough — Postgres also requires the base table-level
 -- privilege grant. New tables don't always inherit Supabase's default grants for
 -- anon/authenticated, which surfaces as "permission denied for table X" even with
 -- correct RLS policies in place. Grant explicitly so this isn't environment-dependent.
-grant select, insert, update on employees, tickets, handover_requests, work_log_entries, calendar_events, skills, task_adjustment_requests, skill_change_requests to anon, authenticated;
--- The HR System is the one place allowed to remove a person from the master
--- dataset, so employees (alone) also needs the delete privilege + policy.
-grant delete on employees to anon, authenticated;
+grant select, insert, update on employees, tickets, handover_requests, work_log_entries, calendar_events, skills, task_adjustment_requests, skill_change_requests, day_plans to anon, authenticated;
+-- The HR System removes a person from the master dataset; employees also edit/delete
+-- their own calendar events; Plan My Day clears a saved day plan — so these tables
+-- also need the delete privilege + a matching policy below.
+grant delete on employees, calendar_events, day_plans to anon, authenticated;
 
 drop policy if exists "anon select" on employees;
 drop policy if exists "anon insert" on employees;
@@ -351,9 +406,20 @@ create policy "anon update" on work_log_entries for update to anon, authenticate
 drop policy if exists "anon select" on calendar_events;
 drop policy if exists "anon insert" on calendar_events;
 drop policy if exists "anon update" on calendar_events;
+drop policy if exists "anon delete" on calendar_events;
 create policy "anon select" on calendar_events for select to anon, authenticated using (true);
 create policy "anon insert" on calendar_events for insert to anon, authenticated with check (true);
 create policy "anon update" on calendar_events for update to anon, authenticated using (true) with check (true);
+create policy "anon delete" on calendar_events for delete to anon, authenticated using (true);
+
+drop policy if exists "anon select" on day_plans;
+drop policy if exists "anon insert" on day_plans;
+drop policy if exists "anon update" on day_plans;
+drop policy if exists "anon delete" on day_plans;
+create policy "anon select" on day_plans for select to anon, authenticated using (true);
+create policy "anon insert" on day_plans for insert to anon, authenticated with check (true);
+create policy "anon update" on day_plans for update to anon, authenticated using (true) with check (true);
+create policy "anon delete" on day_plans for delete to anon, authenticated using (true);
 
 drop policy if exists "anon select" on skills;
 drop policy if exists "anon insert" on skills;
@@ -393,6 +459,14 @@ end $$;
 do $$
 begin
   alter publication supabase_realtime add table skill_change_requests;
+exception
+  when duplicate_object then null;
+end $$;
+
+-- Same, for day_plans (added after the earlier table sets were already published).
+do $$
+begin
+  alter publication supabase_realtime add table day_plans;
 exception
   when duplicate_object then null;
 end $$;

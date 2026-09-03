@@ -40,6 +40,16 @@ interface WorkLogRow {
   /** The hold window when workflowStatus is "On Hold". */
   holdStartDate?: string | null;
   holdEndDate?: string | null;
+  /** Time actually worked on the item so far, employee-logged (hours). Display only. */
+  actualHours?: number | null;
+  /** The employee's current estimate of the effort left (hours). When set, this
+   * overrides the progress-derived remaining figure everywhere future scheduling is
+   * calculated — a task larger/smaller than its original estimate reschedules from
+   * the real number. */
+  remainingHours?: number | null;
+  /** "26 Aug 2026"-style date progress / effort was last updated — powers the
+   * "Last updated: 2 days ago" freshness indicator. */
+  progressUpdatedAt?: string | null;
   comments: WorkLogComment[];
 }
 
@@ -49,6 +59,9 @@ export interface WorkLogEntry {
   completedAt?: string | null;
   holdStartDate?: string | null;
   holdEndDate?: string | null;
+  actualHours?: number | null;
+  remainingHours?: number | null;
+  progressUpdatedAt?: string | null;
   comments: WorkLogComment[];
 }
 
@@ -68,6 +81,10 @@ interface WorkLogContextValue {
    * Setting it On Hold records the given hold window; any other status clears it. */
   setWorkflowStatus: (key: string, status: WorkflowStatus, hold?: HoldWindow) => Promise<void>;
   setProgress: (key: string, progress: number) => Promise<void>;
+  /** Log actual time worked and/or the current remaining-effort estimate. `remaining`
+   * (when a number) becomes the scheduling source of truth for this item; pass `null`
+   * to clear it and fall back to the progress-derived figure. Stamps `progressUpdatedAt`. */
+  setEffort: (key: string, patch: { actualHours?: number | null; remainingHours?: number | null }) => Promise<void>;
   addComment: (key: string, text: string, author: string) => Promise<void>;
 }
 
@@ -87,6 +104,9 @@ export function WorkLogProvider({ children }: { children: ReactNode }) {
             completedAt: row.completedAt ?? null,
             holdStartDate: row.holdStartDate ?? null,
             holdEndDate: row.holdEndDate ?? null,
+            actualHours: row.actualHours ?? null,
+            remainingHours: row.remainingHours ?? null,
+            progressUpdatedAt: row.progressUpdatedAt ?? null,
             comments: row.comments ?? [],
           }
         : EMPTY_ENTRY;
@@ -120,7 +140,27 @@ export function WorkLogProvider({ children }: { children: ReactNode }) {
   );
 
   const setProgress = useCallback(
-    (key: string, progress: number) => upsertEntry(key, { progress: Math.min(100, Math.max(0, Math.round(progress))) }),
+    (key: string, progress: number) =>
+      upsertEntry(key, {
+        progress: Math.min(100, Math.max(0, Math.round(progress))),
+        progressUpdatedAt: todayLabel(),
+      }),
+    [upsertEntry]
+  );
+
+  const setEffort = useCallback(
+    (key: string, patch: { actualHours?: number | null; remainingHours?: number | null }) => {
+      const next: Partial<Omit<WorkLogRow, "employeeId" | "itemId">> = { progressUpdatedAt: todayLabel() };
+      if ("actualHours" in patch) {
+        next.actualHours =
+          patch.actualHours == null ? null : Math.max(0, Math.round(patch.actualHours * 10) / 10);
+      }
+      if ("remainingHours" in patch) {
+        next.remainingHours =
+          patch.remainingHours == null ? null : Math.max(0, Math.round(patch.remainingHours * 10) / 10);
+      }
+      return upsertEntry(key, next);
+    },
     [upsertEntry]
   );
 
@@ -133,8 +173,8 @@ export function WorkLogProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ loading, error, getEntry, setWorkflowStatus, setProgress, addComment }),
-    [loading, error, getEntry, setWorkflowStatus, setProgress, addComment]
+    () => ({ loading, error, getEntry, setWorkflowStatus, setProgress, setEffort, addComment }),
+    [loading, error, getEntry, setWorkflowStatus, setProgress, setEffort, addComment]
   );
 
   return <WorkLogContext.Provider value={value}>{children}</WorkLogContext.Provider>;

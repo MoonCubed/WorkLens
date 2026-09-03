@@ -7,7 +7,9 @@ const UNIT_KEY = "worklens-demo:supervisor-unit";
 const EMPLOYEE_KEY = "worklens-demo:employee-id";
 
 const DEFAULT_UNIT: Department = "IT Service Support";
-const DEFAULT_EMPLOYEE_ID = "sara-al-qahtani";
+// Default to a member of the demo unit (IT Service Support) so a direct visit to
+// /employee — before choosing a persona on the login — lands somewhere coherent.
+const DEFAULT_EMPLOYEE_ID = "layla-al-zahrani";
 
 interface SupervisorSessionValue {
   unit: Department;

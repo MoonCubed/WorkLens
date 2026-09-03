@@ -19,6 +19,7 @@ export default function MySkillsPage() {
   const { requests, submit } = useSkillChangeRequests();
   const [skillName, setSkillName] = useState("");
   const [skillLevel, setSkillLevel] = useState<SkillLevel>("Beginner");
+  const [justification, setJustification] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -49,10 +50,11 @@ export default function MySkillsPage() {
       return;
     }
     await raise(
-      { employeeId: me.id, kind: "add", skillName: name, skillLevel },
+      { employeeId: me.id, kind: "add", skillName: name, skillLevel, justification: justification.trim() },
       `Requested to add “${name}” — waiting for supervisor approval.`
     );
     setSkillName("");
+    setJustification("");
   }
 
   async function requestRemove(name: string, previousLevel: SkillLevel) {
@@ -166,6 +168,18 @@ export default function MySkillsPage() {
               Request Skill
             </button>
           </div>
+          <label className="mt-2 block">
+            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-secondary">
+              Justification <span className="normal-case text-ink-muted">(e.g. a completed certification)</span>
+            </span>
+            <textarea
+              value={justification}
+              onChange={(e) => setJustification(e.target.value)}
+              rows={2}
+              placeholder="Completed a professional certification and received a certificate for this skill."
+              className="input resize-none text-sm"
+            />
+          </label>
         </div>
 
         {me.knowledgeAreas.length > 0 && (
@@ -201,6 +215,7 @@ export default function MySkillsPage() {
                         ? `Remove “${r.skillName}”`
                         : `Change “${r.skillName}” · ${r.previousLevel} → ${r.skillLevel}`}
                   </p>
+                  {r.justification && <p className="mt-0.5 text-xs italic text-ink-secondary">&ldquo;{r.justification}&rdquo;</p>}
                   <p className="text-xs text-ink-muted mt-0.5">Submitted {r.submittedAt}</p>
                 </div>
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-warning)]">

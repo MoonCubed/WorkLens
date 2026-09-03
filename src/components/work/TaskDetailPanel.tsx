@@ -41,6 +41,9 @@ export function TaskDetailPanel({
   onUpdateAssignees,
   onUpdateEffortSplit,
   onRequestAdjustment,
+  allTickets,
+  onUpdateDependency,
+  onClearCoverage,
 }: {
   ticket: AssignedTicket;
   employees: Employee[];
@@ -60,6 +63,12 @@ export function TaskDetailPanel({
   onUpdateAssignees: (employeeIds: string[], effortSplit?: Record<string, number>) => void;
   onUpdateEffortSplit?: (effortSplit: Record<string, number>) => void;
   onRequestAdjustment?: (draft: AdjustmentDraft) => Promise<void>;
+  /** All tickets for the unit — the choices for "depends on". Supervisor view only. */
+  allTickets?: AssignedTicket[];
+  /** Set / clear the prerequisite ticket. Supervisor view only. */
+  onUpdateDependency?: (dependsOnTicketId: string | null) => void;
+  /** Clear a time-boxed turnover coverage plan. Supervisor view only. */
+  onClearCoverage?: () => void;
 }) {
   const assigneeIds = ticket.assignedEmployeeIds ?? [];
   const assignees = assigneeIds
@@ -338,6 +347,57 @@ export function TaskDetailPanel({
               : "Priority and required skills are set by your supervisor."}
           </p>
         </div>
+
+        {ticket.coverage && (
+          <div className="mt-6 rounded-lg border border-[var(--accent-teal)] bg-[var(--accent-teal-bg)] p-3.5 text-xs">
+            <p className="text-sm font-semibold text-[color:var(--accent-teal)]">Turnover coverage active</p>
+            <p className="mt-1 text-ink-secondary">
+              <span className="font-medium text-ink">{ticket.coverage.coveringName}</span> is covering{" "}
+              <span className="font-medium text-ink">{ticket.coverage.ownerName}</span> on this task from{" "}
+              {ticket.coverage.startDate} – {ticket.coverage.endDate} ({ticket.coverage.hours}h across{" "}
+              {ticket.coverage.allocations.length} day{ticket.coverage.allocations.length === 1 ? "" : "s"}, at the owner&rsquo;s
+              usual daily rate). Ownership stays with {ticket.coverage.ownerName.split(" ")[0]}.
+            </p>
+            {onClearCoverage && (
+              <button
+                onClick={onClearCoverage}
+                className="mt-2 rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:bg-brand-50"
+              >
+                End coverage now
+              </button>
+            )}
+          </div>
+        )}
+
+        {(metaEditable && onUpdateDependency && allTickets) || ticket.dependsOnTicketId ? (
+          <div className="mt-6">
+            <h3 className="mb-2 text-sm font-semibold text-ink">Depends On</h3>
+            {metaEditable && onUpdateDependency && allTickets ? (
+              <select
+                value={ticket.dependsOnTicketId ?? ""}
+                onChange={(e) => onUpdateDependency(e.target.value || null)}
+                className="input max-w-[320px]"
+              >
+                <option value="">No prerequisite</option>
+                {allTickets
+                  .filter((t) => t.id !== ticket.id)
+                  .map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.title} ({t.id}){t.status === "Completed" ? " — done" : ""}
+                    </option>
+                  ))}
+              </select>
+            ) : (
+              <p className="text-xs text-ink-secondary">
+                {allTickets?.find((t) => t.id === ticket.dependsOnTicketId)?.title ?? ticket.dependsOnTicketId}
+              </p>
+            )}
+            <p className="mt-1.5 text-xs text-ink-muted">
+              While the prerequisite isn&rsquo;t completed, this task&rsquo;s work isn&rsquo;t scheduled before the
+              prerequisite&rsquo;s due date.
+            </p>
+          </div>
+        ) : null}
 
         {currentEmployeeId && onRequestAdjustment && (
           <AdjustmentRequestForm ticket={ticket} onSubmit={onRequestAdjustment} />

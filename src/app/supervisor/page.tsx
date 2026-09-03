@@ -12,6 +12,7 @@ import { useSupervisorSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { useHandoverRequests } from "@/store/handover-requests-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import { computeDashboardSummary, type AttentionTone, type DashboardSummary } from "@/lib/dashboardSummary";
 import { computeTeamWeeklyCapacity } from "@/lib/capacityEngine";
 import { WeeklyCapacityChart } from "@/components/charts/WeeklyCapacityChart";
@@ -31,18 +32,19 @@ export default function SupervisorDashboardPage() {
   const { employees } = useEmployees();
   const { getEntry } = useWorkLog();
   const { requests: handoverRequests } = useHandoverRequests();
+  const { events } = useCalendarEvents();
   const [openKpi, setOpenKpi] = useState<KpiKey | null>(null);
 
   const summary = useMemo(
-    () => computeDashboardSummary(unit, employees, tickets, getEntry, handoverRequests),
-    [unit, employees, tickets, getEntry, handoverRequests]
+    () => computeDashboardSummary(unit, employees, tickets, getEntry, handoverRequests, events),
+    [unit, employees, tickets, getEntry, handoverRequests, events]
   );
 
   // Team capacity week by week — from the same evenly-distributed task schedule that
   // drives every capacity number. The supervisor's primary capacity view.
   const weeklyCapacity = useMemo(
-    () => computeTeamWeeklyCapacity(summary.unitEmployees, tickets, getEntry, 8),
-    [summary.unitEmployees, tickets, getEntry]
+    () => computeTeamWeeklyCapacity(summary.unitEmployees, tickets, getEntry, 8, undefined, events),
+    [summary.unitEmployees, tickets, getEntry, events]
   );
 
   // Completed work is deliberately absent — it drops out the moment a task's status

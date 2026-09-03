@@ -1,13 +1,14 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Bell, Briefcase, CalendarClock, AlertTriangle, Gauge, X, ChevronRight } from "lucide-react";
+import { Bell, Briefcase, CalendarClock, AlertTriangle, Gauge, X, ChevronRight, Repeat2 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { KpiCard } from "@/components/ui/KpiCard";
 import { StatusBadge, PriorityBadge } from "@/components/ui/StatusBadge";
 import { TaskDetailPanel } from "@/components/work/TaskDetailPanel";
 import { DailyTasks } from "@/components/employee/DailyTasks";
-import { getDueStatus, parseLooseDate } from "@/lib/date";
+import { PlanMyDay } from "@/components/employee/PlanMyDay";
+import { getDueStatus, parseLooseDate, relativeDayLabel } from "@/lib/date";
 import {
   computeEmployeeWorkItems,
   computeEmployeeCapacity,
@@ -19,6 +20,7 @@ import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useTickets } from "@/store/tickets-store";
 import { useWorkLog } from "@/store/work-log-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
 
 const STATUS_STYLES: Record<DisplayStatus | "Overdue", string> = {
@@ -33,6 +35,14 @@ const STATUS_STYLES: Record<DisplayStatus | "Overdue", string> = {
 function activeStatusLabel(status: DisplayStatus, dueDate: string | null): DisplayStatus | "Overdue" {
   if (status === "In Progress" && dueDate && getDueStatus(dueDate) === "Overdue") return "Overdue";
   return status;
+}
+
+/** Muted normally; amber once progress hasn't been touched in a while, so stale
+ * tasks stand out. Never a "performance" signal — just data freshness. */
+function freshnessTone(updatedAt: string | null): string {
+  if (!updatedAt) return "text-[var(--status-warning)]";
+  const label = relativeDayLabel(updatedAt) ?? "";
+  return /days ago/.test(label) && !/^[1-3] days ago/.test(label) ? "text-[var(--status-warning)]" : "text-ink-muted";
 }
 
 /** Ascending by due date (items without a parseable date sort last). */
@@ -50,6 +60,7 @@ export default function EmployeeDashboardPage() {
   const me = employees.find((e) => e.id === employeeId) ?? employees[0];
   const { tickets, updateTicketStatus, updateTicketPriority, updateTicketSkills, setTicketAssignees, setTicketEffortSplit } = useTickets();
   const { getEntry } = useWorkLog();
+  const { events } = useCalendarEvents();
   const { submit: submitAdjustment } = useTaskAdjustments();
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [openKpi, setOpenKpi] = useState<KpiKey | null>(null);
@@ -57,10 +68,10 @@ export default function EmployeeDashboardPage() {
 
   const firstName = me.name.split(" ")[0];
   // One capacity calculation, shared by every number on this page.
-  const capacity = useMemo(() => computeEmployeeCapacity(me, tickets, getEntry), [me, tickets, getEntry]);
+  const capacity = useMemo(() => computeEmployeeCapacity(me, tickets, getEntry, events), [me, tickets, getEntry, events]);
   const availPct = capacity.availablePercent;
 
-  const workItems = useMemo(() => computeEmployeeWorkItems(me, tickets, getEntry), [me, tickets, getEntry]);
+  const workItems = useMemo(() => computeEmployeeWorkItems(me, tickets, getEntry, events), [me, tickets, getEntry, events]);
   const activeWorkItems = useMemo(() => workItems.filter((i) => i.status !== "Completed"), [workItems]);
   const overdueItems = useMemo(
     () => activeWorkItems.filter((i) => i.dueDate && getDueStatus(i.dueDate) === "Overdue").sort(byDueDate),
@@ -88,11 +99,14 @@ export default function EmployeeDashboardPage() {
 
   return (
     <div className="max-w-6xl space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold text-ink tracking-tight">Good morning, {firstName}</h1>
-        <p className="mt-1 text-sm text-ink-muted">
-          What needs your attention, and what&rsquo;s scheduled day by day this week. Click a metric for details.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-ink tracking-tight">Good morning, {firstName}</h1>
+          <p className="mt-1 text-sm text-ink-muted">
+            What needs your attention, and what&rsquo;s scheduled day by day. Click a metric for details.
+          </p>
+        </div>
+        <PlanMyDay employee={me} onOpenTicket={(id) => setOpenTicketId(id)} />
       </div>
 
       {detailError && (
@@ -165,10 +179,30 @@ export default function EmployeeDashboardPage() {
                 }`}
               >
                 <div className="min-w-0">
-                  <p className="text-sm font-medium text-ink truncate">{item.title}</p>
+                  <p className="flex items-center gap-1.5 text-sm font-medium text-ink truncate">
+                    {item.title}
+                    {item.isCoverage && (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--accent-teal)] bg-[var(--accent-teal-bg)] px-1.5 py-0.5 text-[10px] font-medium text-[color:var(--accent-teal)]">
+                        <Repeat2 className="h-3 w-3" />
+                        Covering {item.coverageOwnerName?.split(" ")[0]}
+                      </span>
+                    )}
+                  </p>
                   <p className="text-xs text-ink-muted mt-0.5">
-                    {item.type} · Due {item.dueDate ?? "No deadline"}
+                    {item.isCoverage ? `Turnover coverage · through ${item.dueDate}` : `${item.type} · Due ${item.dueDate ?? "No deadline"}`}
+                    {item.remainingHours > 0 && ` · ${item.remainingHours}h`}
+                    {item.coveredAway && (
+                      <span className="text-[color:var(--accent-teal)]"> · covered {item.coveredAway.start}–{item.coveredAway.end} by {item.coveredAway.coveringName.split(" ")[0]}</span>
+                    )}
                     {item.resumedFromHold && <span className="text-brand-700"> · resumed after hold</span>}
+                    {!item.isCoverage && (
+                      <>
+                        {" · "}
+                        <span className={freshnessTone(item.progressUpdatedAt)}>
+                          {item.progressUpdatedAt ? `updated ${relativeDayLabel(item.progressUpdatedAt)?.toLowerCase()}` : "no progress logged"}
+                        </span>
+                      </>
+                    )}
                   </p>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
@@ -184,7 +218,7 @@ export default function EmployeeDashboardPage() {
       </Card>
 
       <Card>
-        <CardHeader title="Daily Tasks" subtitle="Your scheduled work for this week — each task's effort spread evenly across the working days until its deadline" />
+        <CardHeader title="Daily Tasks" subtitle="Your scheduled work day by day — navigate between days and into future weeks. Each task's remaining effort is spread across the working days until its deadline." />
         <DailyTasks employee={me} onOpenTicket={(id) => setOpenTicketId(id)} />
       </Card>
 

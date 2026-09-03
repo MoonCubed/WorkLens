@@ -7,6 +7,23 @@ import { useSupabaseTable } from "./use-supabase-table";
 
 const TABLE = "handover_requests";
 
+// One realistic pending request seeded for the demo: Layla has active migration work
+// scheduled during her leave, and there are teammates free on those dates to cover it.
+const SEED_REQUESTS: HandoverRequest[] = [
+  {
+    id: "HR-demo-1",
+    employeeId: "layla-al-zahrani",
+    note: "Pre-booked family travel. I've coordinated cover with Tariq for the Terraform migration and cost work.",
+    startDate: "13 Sep 2026",
+    endDate: "17 Sep 2026",
+    affectedWork: [],
+    status: "Pending Supervisor Review",
+    submittedAt: "01 Sep 2026",
+    leaveType: "Leave",
+    preferredEmployeeId: "tariq-al-mutairi",
+  },
+];
+
 export interface HandoverRequest {
   id: string;
   employeeId: string;
@@ -39,7 +56,7 @@ interface HandoverRequestsContextValue {
 const HandoverRequestsContext = createContext<HandoverRequestsContextValue | null>(null);
 
 export function HandoverRequestsProvider({ children }: { children: ReactNode }) {
-  const { rows: requests, loading, error, refetch } = useSupabaseTable<HandoverRequest>(TABLE, []);
+  const { rows: requests, loading, error, refetch } = useSupabaseTable<HandoverRequest>(TABLE, SEED_REQUESTS);
 
   const submitRequest = useCallback(
     async (input: Omit<HandoverRequest, "id" | "status" | "submittedAt">) => {

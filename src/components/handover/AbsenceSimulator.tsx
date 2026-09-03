@@ -1,15 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import { Repeat2, Loader2, AlertTriangle, CheckCircle2, Award, ChevronDown, ChevronUp, ShieldAlert, Flame, Sparkles, MessageSquare } from "lucide-react";
+import { Repeat2, Loader2, CheckCircle2, ChevronDown, ChevronUp, ShieldAlert, Flame, Sparkles, MessageSquare, CalendarClock, RotateCcw } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { CommentsThread } from "@/components/work/CommentsThread";
 import { useWorkLog } from "@/store/work-log-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import { computeAbsenceImpact, type AbsenceImpact, type AffectedWorkItem, type CoverageCandidate, type RiskLevel } from "@/lib/absenceImpact";
-import { CAPACITY_THRESHOLDS, OVERLOAD_THRESHOLD } from "@/data/config";
-import { formatDisplayDate, toInputDateValue } from "@/lib/date";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
+import { formatDisplayDate, toInputDateValue, todayLabel } from "@/lib/date";
 import type { Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
+import type { TicketCoverage } from "@/data/tickets";
 import { useTickets } from "@/store/tickets-store";
 
 const RISK_STYLES: Record<RiskLevel, { symbol: string; label: string; text: string }> = {
@@ -27,6 +29,8 @@ export function AbsenceSimulator({
   initialStart,
   initialEnd,
   preferredEmployeeId,
+  pendingRequestId,
+  onApproveLeave,
 }: {
   unitEmployees: Employee[];
   tickets: AssignedTicket[];
@@ -37,31 +41,29 @@ export function AbsenceSimulator({
   /** The peer the requesting employee nominated for the turnover — highlighted in the
    * coverage lists as a recommendation; the supervisor still decides. */
   preferredEmployeeId?: string;
+  /** When this simulator was opened from a pending handover request, its id — so
+   * "Confirm Handover Plan" also approves the leave. */
+  pendingRequestId?: string;
+  /** Approve the leave (add the leave event, mark the request reviewed). */
+  onApproveLeave?: (requestId: string, start: string, end: string) => Promise<void>;
 }) {
-  const { assignTicketToEmployee } = useTickets();
   const { getEntry } = useWorkLog();
+  const { events } = useCalendarEvents();
+  const { setTicketCoverage } = useTickets();
   const [employeeId, setEmployeeId] = useState(initialEmployeeId ?? unitEmployees[0]?.id ?? "");
   const [startInput, setStartInput] = useState(initialStart ? toInputDateValue(initialStart) : "");
   const [endInput, setEndInput] = useState(initialEnd ? toInputDateValue(initialEnd) : "");
   const [loading, setLoading] = useState(false);
-  // "Review" jumps here with a request already picked — computed synchronously on first
-  // render (the parent remounts this component via `key` for each such jump), so it
-  // reads as a direct drill-down rather than a fresh action requiring another click.
   const [impact, setImpact] = useState<AbsenceImpact | null>(() => {
     if (!initialEmployeeId || !initialStart || !initialEnd) return null;
     const e = unitEmployees.find((x) => x.id === initialEmployeeId);
     if (!e) return null;
-    return computeAbsenceImpact({
-      employee: e,
-      unitEmployees,
-      tickets,
-      startLabel: initialStart,
-      endLabel: initialEnd,
-    });
+    return computeAbsenceImpact({ employee: e, unitEmployees, tickets, startLabel: initialStart, endLabel: initialEnd, getEntry, events });
   });
   const [showAlternatives, setShowAlternatives] = useState<Record<string, boolean>>({});
   const [showNotes, setShowNotes] = useState<Record<string, boolean>>({});
-  const [assignments, setAssignments] = useState<Record<string, string>>({});
+  /** itemId -> covering employee id (locally, reflecting what we've applied). */
+  const [coverBy, setCoverBy] = useState<Record<string, string>>({});
   const [confirmed, setConfirmed] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [confirmedCount, setConfirmedCount] = useState(0);
@@ -69,40 +71,72 @@ export function AbsenceSimulator({
 
   const employee = unitEmployees.find((e) => e.id === employeeId);
 
+  function refreshImpact(emp: Employee, startLabel: string, endLabel: string) {
+    return computeAbsenceImpact({ employee: emp, unitEmployees, tickets, startLabel, endLabel, getEntry, events });
+  }
+
   function handleSimulate() {
     if (!employee || !startInput || !endInput) return;
     setLoading(true);
     setConfirmed(false);
     setConfirmedCount(0);
-    setAssignments({});
+    setCoverBy({});
     setShowAlternatives({});
     setShowNotes({});
     setActionError(null);
     window.setTimeout(() => {
       setImpact(
-        computeAbsenceImpact({
+        refreshImpact(
           employee,
-          unitEmployees,
-          tickets,
-          startLabel: formatDisplayDate(new Date(`${startInput}T00:00:00`)),
-          endLabel: formatDisplayDate(new Date(`${endInput}T00:00:00`)),
-        })
+          formatDisplayDate(new Date(`${startInput}T00:00:00`)),
+          formatDisplayDate(new Date(`${endInput}T00:00:00`))
+        )
       );
       setLoading(false);
-    }, 600);
+    }, 500);
   }
 
-  async function handleAssign(item: AffectedWorkItem, candidate: CoverageCandidate) {
+  /** Build and store the time-boxed coverage plan for one affected ticket. */
+  async function applyCoverage(item: AffectedWorkItem, candidate: CoverageCandidate) {
+    if (!impact || !item.ticketId) return;
     setActionError(null);
-    if (item.ticketId) {
-      try {
-        await assignTicketToEmployee(item.ticketId, candidate.employee.id);
-      } catch {
-        setActionError("Couldn't reassign this ticket — check your connection and try again.");
-        return;
-      }
+    const plan = impact.coveragePlanByItem.get(item.id);
+    if (!plan || plan.allocations.length === 0) {
+      setActionError("Nothing planned inside the leave window for this task — no coverage needed.");
+      return;
     }
-    setAssignments((prev) => ({ ...prev, [item.id]: candidate.employee.id }));
+    const coverage: TicketCoverage = {
+      coveringEmployeeId: candidate.employee.id,
+      ownerId: impact.employee.id,
+      ownerName: impact.employee.name,
+      coveringName: candidate.employee.name,
+      startDate: formatDisplayDate(impact.start),
+      endDate: formatDisplayDate(impact.end),
+      allocations: plan.allocations,
+      hours: plan.hours,
+      createdAt: todayLabel(),
+    };
+    try {
+      await setTicketCoverage(item.ticketId, coverage);
+      setCoverBy((prev) => ({ ...prev, [item.id]: candidate.employee.id }));
+    } catch {
+      setActionError("Couldn't set up coverage — check your connection and try again.");
+    }
+  }
+
+  async function clearCoverage(item: AffectedWorkItem) {
+    if (!item.ticketId) return;
+    setActionError(null);
+    try {
+      await setTicketCoverage(item.ticketId, null);
+      setCoverBy((prev) => {
+        const next = { ...prev };
+        delete next[item.id];
+        return next;
+      });
+    } catch {
+      setActionError("Couldn't clear coverage — check your connection and try again.");
+    }
   }
 
   async function handleConfirmPlan() {
@@ -110,41 +144,49 @@ export function AbsenceSimulator({
     setActionError(null);
     setConfirming(true);
     let applied = 0;
-    for (const item of impact.affectedWork) {
-      if (item.risk === "Low") continue;
-      const currentOwnerIds = assignments[item.id]
-        ? [assignments[item.id]]
-        : (item.ticketId ? tickets.find((t) => t.id === item.ticketId)?.assignedEmployeeIds : undefined) ?? [];
-      const list = impact.candidatesByItem.get(item.id) ?? [];
-      const top = list.find((c) => c.eligible) ?? list.find((c) => c.assignable && !c.overloaded);
-      if (!top || currentOwnerIds.includes(top.employee.id)) continue;
-      await handleAssign(item, top);
-      applied += 1;
+    try {
+      for (const item of impact.affectedWork) {
+        if (item.risk === "Low" || !item.ticketId) continue;
+        if (coverBy[item.id]) {
+          applied += 1;
+          continue;
+        }
+        const list = impact.candidatesByItem.get(item.id) ?? [];
+        const top = list.find((c) => c.eligible) ?? list.find((c) => c.assignable && !c.overloaded);
+        if (!top) continue;
+        await applyCoverage(item, top);
+        applied += 1;
+      }
+      if (pendingRequestId && onApproveLeave) {
+        await onApproveLeave(pendingRequestId, formatDisplayDate(impact.start), formatDisplayDate(impact.end));
+      }
+      setConfirmedCount(applied);
+      setConfirmed(true);
+    } catch {
+      setActionError("Couldn't confirm the handover plan — check your connection and try again.");
+    } finally {
+      setConfirming(false);
     }
-    setConfirmedCount(applied);
-    setConfirming(false);
-    setConfirmed(true);
   }
 
   const preferredEmployee = preferredEmployeeId ? unitEmployees.find((e) => e.id === preferredEmployeeId) : undefined;
   const primaryCandidate =
     impact && impact.primaryCandidateId ? unitEmployees.find((e) => e.id === impact.primaryCandidateId) : undefined;
-  const urgentItems = impact ? impact.affectedWork.filter((i) => i.risk === "Critical" || i.risk === "High") : [];
   const itemsNeedingCoverage = impact ? impact.affectedWork.filter((i) => i.risk !== "Low") : [];
-  // Coverage is "found" whenever there's anyone in the unit who can take it on — a
-  // missing skill match is a ranking concern, not a blocker.
   const coverageFoundCount = itemsNeedingCoverage.filter((i) => (impact?.candidatesByItem.get(i.id) ?? []).some((c) => c.assignable)).length;
-  const anyCoverageSuggested = coverageFoundCount > 0;
   const nameFor = (id: string) => unitEmployees.find((e) => e.id === id)?.name ?? id;
 
   return (
     <div className="space-y-6">
       <Card>
-        <CardHeader title="Simulate an Absence" subtitle="See what work is affected, what deadlines are at risk, and who can cover it." />
+        <CardHeader
+          title={pendingRequestId ? "Review Turnover Request" : "Simulate an Absence"}
+          subtitle="What work is affected during the leave, who can cover it on those dates, and the plan to accept."
+        />
         <div className="grid gap-5 sm:grid-cols-3">
           <label className="block">
             <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-secondary">Employee</span>
-            <select value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} className="input">
+            <select value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} className="input" disabled={!!pendingRequestId}>
               {unitEmployees.map((e) => (
                 <option key={e.id} value={e.id}>
                   {e.name}
@@ -153,42 +195,45 @@ export function AbsenceSimulator({
             </select>
           </label>
           <label className="block">
-            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-secondary">Unavailable From</span>
-            <input type="date" value={startInput} onChange={(e) => setStartInput(e.target.value)} className="input" />
+            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-secondary">Leave from</span>
+            <input type="date" value={startInput} onChange={(e) => setStartInput(e.target.value)} className="input" disabled={!!pendingRequestId} />
           </label>
           <label className="block">
-            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-secondary">Unavailable Until</span>
-            <input type="date" value={endInput} min={startInput || undefined} onChange={(e) => setEndInput(e.target.value)} className="input" />
+            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-ink-secondary">Leave until</span>
+            <input type="date" value={endInput} min={startInput || undefined} onChange={(e) => setEndInput(e.target.value)} className="input" disabled={!!pendingRequestId} />
           </label>
         </div>
 
-        <div className="mt-5 flex justify-end">
-          <button
-            onClick={handleSimulate}
-            disabled={loading || !employee || !startInput || !endInput}
-            className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700 disabled:opacity-50"
-          >
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Repeat2 className="h-4 w-4" />}
-            {loading ? "Simulating…" : "Simulate Impact"}
-          </button>
-        </div>
+        {!pendingRequestId && (
+          <div className="mt-5 flex justify-end">
+            <button
+              onClick={handleSimulate}
+              disabled={loading || !employee || !startInput || !endInput}
+              className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700 disabled:opacity-50"
+            >
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Repeat2 className="h-4 w-4" />}
+              {loading ? "Simulating…" : "Simulate Impact"}
+            </button>
+          </div>
+        )}
 
         {impact && !loading && (
           <div className="mt-5">
             <p className="mb-2.5 text-xs text-ink-muted">
-              <span className="font-medium text-ink">{impact.employee.name}&rsquo;s</span> absence, {formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)}
+              <span className="font-medium text-ink">{impact.employee.name}</span> · leave {formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)} ·{" "}
+              {impact.turnoverWorkingDays} working day{impact.turnoverWorkingDays === 1 ? "" : "s"} to cover
             </p>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <SummaryStatCard label="Work Items Affected" value={String(impact.affectedWork.length)} tone="neutral" />
-              <SummaryStatCard label="Hours Remaining" value={`${impact.totalEstimatedHours}h`} tone="neutral" />
+              <SummaryStatCard label="Hours to Cover" value={`${impact.totalCoverageHours}h`} tone="neutral" />
               <SummaryStatCard
                 label="Deadlines at Risk"
                 value={String(impact.deadlinesAtRisk)}
                 tone={impact.deadlinesAtRisk > 0 ? "critical" : "good"}
               />
               <SummaryStatCard
-                label="Suitable Coverage"
-                value={String(coverageFoundCount)}
+                label="Coverage Available"
+                value={`${coverageFoundCount}/${itemsNeedingCoverage.length}`}
                 tone={itemsNeedingCoverage.length === 0 || coverageFoundCount === itemsNeedingCoverage.length ? "good" : "critical"}
               />
             </div>
@@ -208,43 +253,47 @@ export function AbsenceSimulator({
             title="Preferred cover (from the employee's request)"
             subtitle="A recommendation the employee coordinated — the supervisor still makes the final call."
           />
-          <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
+          <p className="text-sm">
             <span className="font-medium text-ink">{preferredEmployee.name}</span>
-            <span className="text-ink-secondary">
-              Current utilization: <span className="font-medium text-ink">{preferredEmployee.currentUtilization}%</span>
-            </span>
-            {preferredEmployee.currentUtilization >= CAPACITY_THRESHOLDS.atRisk.max && (
-              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--status-critical)]">
-                <ShieldAlert className="h-3.5 w-3.5" />
-                Already at/above the {CAPACITY_THRESHOLDS.atRisk.max}% overload threshold
-              </span>
-            )}
-          </div>
+            {impact &&
+              (() => {
+                const c = impact.affectedWork
+                  .flatMap((i) => impact.candidatesByItem.get(i.id) ?? [])
+                  .find((c) => c.employee.id === preferredEmployee.id);
+                if (!c) return null;
+                return (
+                  <span className="ml-2 text-ink-secondary">
+                    {c.onLeave
+                      ? "— on leave during the turnover window, so not eligible"
+                      : `— ${c.windowAvailableHours}h free during the leave, ${c.projectedCapacity}% projected`}
+                  </span>
+                );
+              })()}
+          </p>
         </Card>
       )}
 
       {impact && !loading && (
         <>
-          {/* Affected Work — the main section */}
           <div>
-            <h3 className="text-sm font-semibold text-ink mb-3">Affected Work</h3>
+            <h3 className="text-sm font-semibold text-ink mb-1">Affected Work</h3>
+            <p className="mb-3 text-xs text-ink-muted">
+              Coverage is time-boxed to the leave window and keeps the task&rsquo;s existing per-day plan — ownership does
+              not transfer.
+            </p>
             {impact.affectedWork.length === 0 ? (
               <Card>
                 <p className="text-sm text-ink-muted py-4 text-center">
-                  None of {impact.employee.name}&rsquo;s work has planned effort during this period — nothing needs handover.
+                  None of {impact.employee.name}&rsquo;s work has planned effort during this leave — nothing needs
+                  covering. You can still approve the leave below.
                 </p>
               </Card>
             ) : (
               <div className="space-y-3">
                 {impact.affectedWork.map((item) => {
                   const allCandidates = impact.candidatesByItem.get(item.id) ?? [];
-                  // Everyone who can be assigned — the same "all employees, ranked by
-                  // suitability" experience as Unassigned Tasks. Only people on leave
-                  // during the absence are excluded.
                   const candidates = allCandidates.filter((c) => c.assignable);
-                  const liveOwnerIds =
-                    (item.ticketId ? tickets.find((t) => t.id === item.ticketId)?.assignedEmployeeIds : undefined) ?? [];
-                  const assignedIds = assignments[item.id] ? [assignments[item.id]] : liveOwnerIds;
+                  const coveringId = coverBy[item.id] ?? null;
                   const top = candidates[0];
                   const alternates = candidates.slice(1);
                   const altOpen = !!showAlternatives[item.id];
@@ -253,105 +302,112 @@ export function AbsenceSimulator({
                   const noteKey = `${impact.employee.id}:${item.id}`;
                   const noteCount = getEntry(noteKey).comments.length;
                   const risk = RISK_STYLES[item.risk];
-                  // Ownership: the absent employee still owns this work; a coverage
-                  // employee is picked to keep it moving during the leave.
-                  const handoverToId = assignments[item.id] ?? null;
 
                   return (
                     <Card key={item.id}>
-                      <p className="text-sm font-semibold text-ink">{item.title}</p>
-                      <p className="mt-1 text-xs text-ink-secondary">
-                        {item.type} · {item.priority} Priority ·{" "}
-                        <span className={`font-medium ${risk.text}`}>
-                          <span aria-hidden="true">{risk.symbol}</span> {risk.label}
-                        </span>
-                      </p>
-
-                      {/* Who leads and who owns this work — always visible so the
-                          supervisor knows the chain even after picking coverage. */}
-                      <div className="mt-3 rounded-lg border border-border bg-brand-50/40 p-3 text-xs">
-                        <div className="grid gap-1.5 sm:grid-cols-2">
-                          <p>
-                            <span className="text-ink-muted">Primary Project Leader: </span>
-                            <span className="font-medium text-ink">{currentUserName}</span>
-                          </p>
-                          <p>
-                            <span className="text-ink-muted">Current Owner: </span>
-                            <span className="font-medium text-ink">{impact.employee.name}</span>
-                          </p>
-                          <p>
-                            <span className="text-ink-muted">Status: </span>
-                            <span className="font-medium text-ink">{item.status}</span>
-                          </p>
-                          <p>
-                            <span className="text-ink-muted">Handover To: </span>
-                            <span className="font-medium text-ink">
-                              {handoverToId ? nameFor(handoverToId) : "— not selected"}
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                          <p className="text-sm font-semibold text-ink">{item.title}</p>
+                          <p className="mt-1 text-xs text-ink-secondary">
+                            {item.type} · {item.priority} Priority ·{" "}
+                            <span className={`font-medium ${risk.text}`}>
+                              <span aria-hidden="true">{risk.symbol}</span> {risk.label}
                             </span>
                           </p>
                         </div>
-                        <p className="mt-1.5 text-ink-muted">
-                          {impact.employee.name} is going on leave {formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)} and
-                          still owns this task — coverage keeps it moving; the status and ownership don&rsquo;t change.
+                        {coveringId && (
+                          <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-good)]">
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            Covered by {nameFor(coveringId).split(" ")[0]}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* The turnover at a glance — everything the supervisor needs to decide. */}
+                      <div className="mt-3 grid gap-x-4 gap-y-1.5 rounded-lg border border-border bg-brand-50/40 p-3 text-xs sm:grid-cols-2">
+                        <Row label="Original owner" value={impact.employee.name} />
+                        <Row label="Coverage employee" value={coveringId ? nameFor(coveringId) : "— not selected"} />
+                        <Row label="Leave period" value={`${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)}`} />
+                        <Row
+                          label="Turnover period"
+                          value={
+                            item.turnoverStart
+                              ? `${item.turnoverStart} – ${item.turnoverEnd} · ${item.turnoverWorkingDays} day${item.turnoverWorkingDays === 1 ? "" : "s"}`
+                              : `${item.turnoverWorkingDays} working day${item.turnoverWorkingDays === 1 ? "" : "s"}`
+                          }
+                        />
+                        <Row label="Deadline" value={item.dueDate ?? "No deadline"} />
+                        <Row label="Remaining effort" value={`${item.remainingHours}h`} />
+                        <Row label="Planned effort during leave" value={`${item.coverageHours}h (owner's rate, unchanged)`} />
+                        <Row label="Status" value={item.status} />
+                      </div>
+
+                      <p className="mt-2 text-xs text-ink-muted">{item.riskExplanation}</p>
+
+                      {!item.ticketId ? (
+                        <p className="mt-3 rounded-lg border border-border bg-brand-50/40 p-3 text-xs text-ink-secondary">
+                          Ad-hoc work — coordinate cover directly with the team. It isn&rsquo;t a tracked ticket, so
+                          there&rsquo;s no time-boxed reassignment to apply.
                         </p>
-                      </div>
-
-                      <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
-                        <Detail label="Remaining effort" value={`${item.remainingHours}h`} />
-                        <Detail label="Due date" value={item.dueDate ?? "No deadline"} />
-                        <Detail label="Absence overlap" value={`${item.overlapDays} day${item.overlapDays === 1 ? "" : "s"}`} />
-                      </div>
-
+                      ) : (
                       <div className="mt-3 text-xs">
-                        <p className="font-medium uppercase tracking-wide text-ink-secondary">Risk</p>
-                        <p className="mt-0.5 text-ink-secondary">{item.riskExplanation}</p>
-                      </div>
-
-                      <div className="mt-3 text-xs">
-                        <p className="font-medium uppercase tracking-wide text-ink-secondary mb-1">Coverage</p>
-                        {!needsCoverage && candidates.length > 0 ? (
+                        <p className="font-medium uppercase tracking-wide text-ink-secondary mb-1">
+                          Coverage — ranked by availability on the leave dates
+                        </p>
+                        {!needsCoverage && candidates.length > 0 && (
                           <p className="mb-2 flex items-center gap-1.5 text-[var(--status-good)]">
                             <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                            No coverage strictly required — you can still assign someone below.
+                            No coverage strictly required — you can still assign someone.
                           </p>
-                        ) : null}
+                        )}
                         {top ? (
                           <div className="rounded-lg border border-brand-100 bg-brand-50/50 p-3">
                             <p className="flex items-center gap-1 text-[11px] font-medium text-brand-700">
                               <Sparkles className="h-3 w-3" />
-                              Suggested coverage (ranked by suitability)
+                              Suggested cover
                             </p>
                             <p className="mt-1.5 text-sm font-medium text-ink">{top.employee.name}</p>
-                            <p className="text-xs text-ink-secondary">
-                              Current capacity {top.utilization}% → {top.projectedCapacity}% after assignment · {top.skillMatch}% skill match
-                            </p>
+                            <ul className="mt-1 space-y-0.5 text-xs text-ink-secondary">
+                              {top.reasons.map((r, i) => (
+                                <li key={i}>· {r}</li>
+                              ))}
+                            </ul>
                             {top.projectedCapacity > OVERLOAD_THRESHOLD && (
                               <p className="mt-1 flex items-start gap-1.5 font-medium text-[var(--status-critical)]">
                                 <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                                Covering this would take {top.employee.name.split(" ")[0]} past the {OVERLOAD_THRESHOLD}% overload threshold.
+                                Covering this would overload {top.employee.name.split(" ")[0]} during the leave.
                               </p>
                             )}
-                            {top.skillMatch === 0 && (
-                              <p className="mt-1 text-ink-muted">No skill match — ranked highest on capacity. Assign anyone below if you prefer.</p>
-                            )}
-                            <button
-                              onClick={() => handleAssign(item, top)}
-                              disabled={assignedIds.includes(top.employee.id)}
-                              className="mt-2.5 rounded-lg bg-brand-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
-                            >
-                              {assignedIds.includes(top.employee.id) ? "Assigned" : `Assign to ${top.employee.name.split(" ")[0]}`}
-                            </button>
+                            <div className="mt-2.5 flex items-center gap-2">
+                              <button
+                                onClick={() => applyCoverage(item, top)}
+                                disabled={coveringId === top.employee.id}
+                                className="rounded-lg bg-brand-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                              >
+                                {coveringId === top.employee.id ? "Assigned" : `Assign coverage to ${top.employee.name.split(" ")[0]}`}
+                              </button>
+                              {coveringId && (
+                                <button
+                                  onClick={() => clearCoverage(item)}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:bg-brand-50"
+                                >
+                                  <RotateCcw className="h-3 w-3" />
+                                  Clear
+                                </button>
+                              )}
+                            </div>
                           </div>
                         ) : (
                           <p className="flex items-center gap-1.5 text-[var(--status-critical)]">
                             <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
-                            Everyone in the unit is on leave during this period.
+                            Everyone else in the unit is on leave during this window.
                           </p>
                         )}
                       </div>
+                      )}
 
                       <div className="mt-3.5 flex items-center gap-4 border-t border-border pt-3">
-                        {candidates.length > 1 && (
+                        {item.ticketId && candidates.length > 1 && (
                           <button
                             onClick={() => setShowAlternatives((prev) => ({ ...prev, [item.id]: !prev[item.id] }))}
                             className="flex items-center gap-1 text-xs font-medium text-brand-700 hover:text-brand-800"
@@ -372,11 +428,16 @@ export function AbsenceSimulator({
                       {altOpen && (
                         <div className="mt-3 border-t border-border pt-3">
                           <p className="mb-2 text-xs text-ink-muted">
-                            All employees in the unit, ranked by suitability. You can assign any of them.
+                            All employees in the unit, ranked by their availability on the leave dates.
                           </p>
                           <div className="space-y-2">
                             {alternates.map((c) => (
-                              <CoverageCandidateRow key={c.employee.id} candidate={c} assigned={assignedIds.includes(c.employee.id)} onAssign={() => handleAssign(item, c)} />
+                              <CoverageCandidateRow
+                                key={c.employee.id}
+                                candidate={c}
+                                assigned={coveringId === c.employee.id}
+                                onAssign={() => applyCoverage(item, c)}
+                              />
                             ))}
                           </div>
                         </div>
@@ -394,80 +455,77 @@ export function AbsenceSimulator({
             )}
           </div>
 
-          {/* Continuity Plan */}
           <Card>
-            <CardHeader title="Continuity Plan" subtitle={`${impact.employee.name} · ${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)}`} />
+            <CardHeader
+              title="Continuity Plan"
+              subtitle={`${impact.employee.name} · ${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)}`}
+            />
             <div className="space-y-3 text-xs">
-              <div>
-                <p className="font-semibold uppercase tracking-wide text-ink-secondary mb-1">Before Leave</p>
-                {urgentItems.length === 0 ? (
-                  <p className="text-ink-muted">No action needed — this work can safely stay with {impact.employee.name}.</p>
-                ) : (
-                  <ul className="space-y-1">
-                    {urgentItems.map((i) => {
-                      const covered = !!assignments[i.id] || (impact.candidatesByItem.get(i.id) ?? []).some((c) => c.assignable);
-                      return (
-                        <li key={i.id} className={`flex items-start gap-1.5 ${covered ? "text-[var(--status-good)]" : "text-[var(--status-warning)]"}`}>
-                          {covered ? <CheckCircle2 className="h-3.5 w-3.5 mt-0.5 shrink-0" /> : <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />}
-                          {covered ? `Reassign ${i.title}` : `Review ${i.title}`}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-              </div>
-
-              <div>
-                <p className="font-semibold uppercase tracking-wide text-ink-secondary mb-1">During Leave</p>
-                {primaryCandidate ? (
-                  <p className="text-ink-secondary">
-                    <span className="font-medium text-ink">{primaryCandidate.name}</span> will cover{" "}
-                    {impact.affectedWork
-                      .filter((i) => {
-                        const list = impact.candidatesByItem.get(i.id) ?? [];
-                        const pick = list.find((c) => c.eligible) ?? list.find((c) => c.assignable);
-                        return pick?.employee.id === primaryCandidate.id;
-                      })
-                      .map((i) => `${i.title} (${i.remainingHours}h)`)
-                      .join(", ")}
-                  </p>
-                ) : (
-                  <p className="text-ink-muted">No coverage currently identified</p>
-                )}
-              </div>
-
-              <div>
-                <p className="font-semibold uppercase tracking-wide text-ink-secondary mb-1">After Return</p>
-                <p className="text-ink-secondary">
-                  Original ownership returns to <span className="font-medium text-ink">{impact.employee.name}</span>
-                </p>
-              </div>
+              <PlanLine
+                label="During the leave"
+                body={
+                  primaryCandidate || Object.keys(coverBy).length > 0 ? (
+                    <ul className="mt-1 space-y-0.5 text-ink-secondary">
+                      {impact.affectedWork
+                        .filter((i) => i.risk !== "Low")
+                        .map((i) => {
+                          const cid = coverBy[i.id] ?? (impact.candidatesByItem.get(i.id) ?? []).find((c) => c.eligible)?.employee.id;
+                          return (
+                            <li key={i.id}>
+                              <span className="font-medium text-ink">{cid ? nameFor(cid).split(" ")[0] : "— unassigned"}</span> covers{" "}
+                              {i.title} ({i.coverageHours}h across {i.turnoverWorkingDays} day{i.turnoverWorkingDays === 1 ? "" : "s"})
+                            </li>
+                          );
+                        })}
+                    </ul>
+                  ) : (
+                    <span className="text-ink-muted"> No coverage identified yet.</span>
+                  )
+                }
+              />
+              <PlanLine
+                label="After return"
+                body={
+                  <span className="text-ink-secondary">
+                    {" "}
+                    All tasks stay owned by <span className="font-medium text-ink">{impact.employee.name}</span>; coverage
+                    ends automatically on {formatDisplayDate(impact.end)}.
+                  </span>
+                }
+              />
             </div>
 
             {confirmed ? (
               <div className="mt-4 flex items-center gap-2 rounded-lg border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-3.5 py-3">
-                <Award className="h-4 w-4 shrink-0 text-[var(--status-good)]" />
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--status-good)]" />
                 <p className="text-xs font-medium text-[var(--status-good)]">
-                  {confirmedCount > 0
-                    ? `Handover plan confirmed — ${confirmedCount} item${confirmedCount === 1 ? "" : "s"} reassigned to the recommended coverage.`
-                    : "Handover plan confirmed — recommended coverage was already assigned."}
+                  Turnover accepted — {confirmedCount} task{confirmedCount === 1 ? "" : "s"} covered for the leave window
+                  {pendingRequestId && onApproveLeave ? ", and the leave is approved" : ""}.
                 </p>
               </div>
-            ) : anyCoverageSuggested ? (
-              <div className="mt-4 flex justify-end">
-                <button
-                  onClick={handleConfirmPlan}
-                  disabled={confirming}
-                  className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700 disabled:opacity-50"
-                >
-                  {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Flame className="h-4 w-4" />}
-                  {confirming ? "Confirming…" : "Confirm Handover Plan"}
-                </button>
-              </div>
             ) : (
-              <p className="mt-4 text-right text-xs text-ink-muted">
-                No suggested coverage yet — nothing to confirm.
-              </p>
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                {pendingRequestId && onApproveLeave && impact.affectedWork.length === 0 && (
+                  <button
+                    onClick={handleConfirmPlan}
+                    disabled={confirming}
+                    className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                  >
+                    {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <CalendarClock className="h-4 w-4" />}
+                    Approve leave (no coverage needed)
+                  </button>
+                )}
+                {impact.affectedWork.length > 0 && (
+                  <button
+                    onClick={handleConfirmPlan}
+                    disabled={confirming || coverageFoundCount === 0}
+                    className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                  >
+                    {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Flame className="h-4 w-4" />}
+                    {confirming ? "Confirming…" : pendingRequestId ? "Accept Turnover & Approve Leave" : "Apply Coverage Plan"}
+                  </button>
+                )}
+              </div>
             )}
           </Card>
         </>
@@ -488,6 +546,24 @@ function SummaryStatCard({ label, value, tone }: { label: string; value: string;
     <div className={`rounded-lg border p-3 ${styles.box}`}>
       <p className="text-[11px] font-medium uppercase tracking-wide text-ink-secondary">{label}</p>
       <p className={`mt-1 text-xl font-semibold tabular ${styles.text}`}>{value}</p>
+    </div>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <p>
+      <span className="text-ink-muted">{label}: </span>
+      <span className="font-medium text-ink">{value}</span>
+    </p>
+  );
+}
+
+function PlanLine({ label, body }: { label: string; body: React.ReactNode }) {
+  return (
+    <div>
+      <p className="font-semibold uppercase tracking-wide text-ink-secondary">{label}</p>
+      {body}
     </div>
   );
 }
@@ -532,18 +608,15 @@ function CoverageCandidateRow({
         </button>
       </div>
       <div className="mt-2.5 grid grid-cols-3 gap-2.5 text-xs">
-        <Detail label="Current Capacity" value={`${candidate.utilization}%`} />
-        <Detail label="After Assignment" value={`${candidate.projectedCapacity}%`} />
-        <Detail label="Skill Match" value={`${candidate.skillMatch}%`} />
+        <Detail label="Free in window" value={`${Math.max(0, candidate.windowAvailableHours)}h`} />
+        <Detail label="After cover" value={`${candidate.projectedCapacity}%`} />
+        <Detail label="Skill match" value={`${candidate.skillMatch}%`} />
       </div>
-      {candidate.projectedCapacity > OVERLOAD_THRESHOLD && (
-        <p className="mt-2 flex items-start gap-1.5 text-xs font-medium text-[var(--status-critical)]">
+      {candidate.excludeReason && (
+        <p className="mt-2 flex items-start gap-1.5 text-xs font-medium text-[var(--status-warning)]">
           <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          Would exceed the {OVERLOAD_THRESHOLD}% overload threshold ({candidate.projectedCapacity}%).
+          {candidate.excludeReason}
         </p>
-      )}
-      {candidate.skillMatch === 0 && (
-        <p className="mt-1 text-xs text-ink-muted">No matching skill — assignable, but not a skills-based recommendation.</p>
       )}
     </div>
   );
