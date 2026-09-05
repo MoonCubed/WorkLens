@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Repeat2, Loader2, CheckCircle2, ChevronDown, ChevronUp, ShieldAlert, Flame, Sparkles, MessageSquare, CalendarClock, RotateCcw } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { CommentsThread } from "@/components/work/CommentsThread";
@@ -9,10 +9,13 @@ import { useCalendarEvents } from "@/store/calendar-events-store";
 import { computeAbsenceImpact, type AbsenceImpact, type AffectedWorkItem, type CoverageCandidate, type RiskLevel } from "@/lib/absenceImpact";
 import { OVERLOAD_THRESHOLD } from "@/data/config";
 import { formatDisplayDate, toInputDateValue, todayLabel } from "@/lib/date";
+import { withErrorDetail } from "@/lib/errorMessage";
 import type { Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
 import type { TicketCoverage } from "@/data/tickets";
 import { useTickets } from "@/store/tickets-store";
+import { EmployeeCapacityHover } from "@/components/employee/EmployeeCapacityHover";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 
 const RISK_STYLES: Record<RiskLevel, { symbol: string; label: string; text: string }> = {
   Critical: { symbol: "●", label: "Critical", text: "text-[var(--status-critical)]" },
@@ -54,16 +57,20 @@ export function AbsenceSimulator({
   const [startInput, setStartInput] = useState(initialStart ? toInputDateValue(initialStart) : "");
   const [endInput, setEndInput] = useState(initialEnd ? toInputDateValue(initialEnd) : "");
   const [loading, setLoading] = useState(false);
-  const [impact, setImpact] = useState<AbsenceImpact | null>(() => {
-    if (!initialEmployeeId || !initialStart || !initialEnd) return null;
-    const e = unitEmployees.find((x) => x.id === initialEmployeeId);
-    if (!e) return null;
-    return computeAbsenceImpact({ employee: e, unitEmployees, tickets, startLabel: initialStart, endLabel: initialEnd, getEntry, events });
-  });
+  // The confirmed (employee, window) the impact is computed for — set once by
+  // "Simulate Impact" (or immediately, reviewing a pending request). Kept separate
+  // from the form inputs so adjusting the date fields doesn't recompute mid-edit.
+  const [committed, setCommitted] = useState<{ employeeId: string; start: string; end: string } | null>(
+    initialEmployeeId && initialStart && initialEnd ? { employeeId: initialEmployeeId, start: initialStart, end: initialEnd } : null
+  );
   const [showAlternatives, setShowAlternatives] = useState<Record<string, boolean>>({});
   const [showNotes, setShowNotes] = useState<Record<string, boolean>>({});
-  /** itemId -> covering employee id (locally, reflecting what we've applied). */
-  const [coverBy, setCoverBy] = useState<Record<string, string>>({});
+  /** ticketId -> the PROPOSED coverage plan for this session. Purely local: merged onto
+   * `tickets` so every other affected item's projected capacity reflects it live, but
+   * NOTHING is written to the database and no real assignment changes until the
+   * supervisor clicks "Apply Coverage Plan". */
+  const [coverageOverrides, setCoverageOverrides] = useState<Record<string, TicketCoverage>>({});
+  const [showApplyConfirm, setShowApplyConfirm] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [confirmedCount, setConfirmedCount] = useState(0);
@@ -71,8 +78,22 @@ export function AbsenceSimulator({
 
   const employee = unitEmployees.find((e) => e.id === employeeId);
 
-  function refreshImpact(emp: Employee, startLabel: string, endLabel: string) {
-    return computeAbsenceImpact({ employee: emp, unitEmployees, tickets, startLabel, endLabel, getEntry, events });
+  const patchedTickets = useMemo(() => {
+    if (Object.keys(coverageOverrides).length === 0) return tickets;
+    return tickets.map((t) => (coverageOverrides[t.id] ? { ...t, coverage: coverageOverrides[t.id] } : t));
+  }, [tickets, coverageOverrides]);
+
+  // Recomputed live off `patchedTickets` — so it always reflects every coverage
+  // selection made so far in this session, not just what's already saved.
+  const impact = useMemo<AbsenceImpact | null>(() => {
+    if (!committed) return null;
+    const emp = unitEmployees.find((e) => e.id === committed.employeeId);
+    if (!emp) return null;
+    return computeAbsenceImpact({ employee: emp, unitEmployees, tickets: patchedTickets, startLabel: committed.start, endLabel: committed.end, getEntry, events });
+  }, [committed, unitEmployees, patchedTickets, getEntry, events]);
+
+  function coveringIdFor(item: AffectedWorkItem): string | null {
+    return (item.ticketId && coverageOverrides[item.ticketId]?.coveringEmployeeId) || null;
   }
 
   function handleSimulate() {
@@ -80,24 +101,25 @@ export function AbsenceSimulator({
     setLoading(true);
     setConfirmed(false);
     setConfirmedCount(0);
-    setCoverBy({});
+    setCoverageOverrides({});
     setShowAlternatives({});
     setShowNotes({});
     setActionError(null);
     window.setTimeout(() => {
-      setImpact(
-        refreshImpact(
-          employee,
-          formatDisplayDate(new Date(`${startInput}T00:00:00`)),
-          formatDisplayDate(new Date(`${endInput}T00:00:00`))
-        )
-      );
+      setCommitted({
+        employeeId: employee.id,
+        start: formatDisplayDate(new Date(`${startInput}T00:00:00`)),
+        end: formatDisplayDate(new Date(`${endInput}T00:00:00`)),
+      });
       setLoading(false);
     }, 500);
   }
 
-  /** Build and store the time-boxed coverage plan for one affected ticket. */
-  async function applyCoverage(item: AffectedWorkItem, candidate: CoverageCandidate) {
+  /** PROPOSE coverage for one ticket — LOCAL ONLY. Nothing is written to the database,
+   * task ownership and the real schedule are untouched. It just updates the staged
+   * plan so every other item's projected capacity reflects it live. Persisted only
+   * when the supervisor clicks "Apply Coverage Plan". */
+  function proposeCoverage(item: AffectedWorkItem, candidate: CoverageCandidate) {
     if (!impact || !item.ticketId) return;
     setActionError(null);
     const plan = impact.coveragePlanByItem.get(item.id);
@@ -116,45 +138,32 @@ export function AbsenceSimulator({
       hours: plan.hours,
       createdAt: todayLabel(),
     };
-    try {
-      await setTicketCoverage(item.ticketId, coverage);
-      setCoverBy((prev) => ({ ...prev, [item.id]: candidate.employee.id }));
-    } catch {
-      setActionError("Couldn't set up coverage — check your connection and try again.");
-    }
+    setCoverageOverrides((prev) => ({ ...prev, [item.ticketId!]: coverage }));
   }
 
-  async function clearCoverage(item: AffectedWorkItem) {
+  /** Remove a proposed coverage — LOCAL ONLY (unless it was already applied, in which
+   * case the DB write to clear it happens when the plan is re-applied). */
+  function unproposeCoverage(item: AffectedWorkItem) {
     if (!item.ticketId) return;
     setActionError(null);
-    try {
-      await setTicketCoverage(item.ticketId, null);
-      setCoverBy((prev) => {
-        const next = { ...prev };
-        delete next[item.id];
-        return next;
-      });
-    } catch {
-      setActionError("Couldn't clear coverage — check your connection and try again.");
-    }
+    setCoverageOverrides((prev) => {
+      const next = { ...prev };
+      delete next[item.ticketId!];
+      return next;
+    });
   }
 
-  async function handleConfirmPlan() {
+  /** Apply Coverage Plan — the ONLY point anything is written. Persists every proposed
+   * coverage to its ticket, then (for a pending request) approves the leave. */
+  async function handleApplyPlan() {
     if (!impact) return;
     setActionError(null);
     setConfirming(true);
+    const entries = Object.entries(coverageOverrides);
     let applied = 0;
     try {
-      for (const item of impact.affectedWork) {
-        if (item.risk === "Low" || !item.ticketId) continue;
-        if (coverBy[item.id]) {
-          applied += 1;
-          continue;
-        }
-        const list = impact.candidatesByItem.get(item.id) ?? [];
-        const top = list.find((c) => c.eligible) ?? list.find((c) => c.assignable && !c.overloaded);
-        if (!top) continue;
-        await applyCoverage(item, top);
+      for (const [ticketId, coverage] of entries) {
+        await setTicketCoverage(ticketId, coverage);
         applied += 1;
       }
       if (pendingRequestId && onApproveLeave) {
@@ -162,8 +171,11 @@ export function AbsenceSimulator({
       }
       setConfirmedCount(applied);
       setConfirmed(true);
-    } catch {
-      setActionError("Couldn't confirm the handover plan — check your connection and try again.");
+      setShowApplyConfirm(false);
+    } catch (err) {
+      console.error("Failed to apply the coverage plan", err);
+      setActionError(withErrorDetail("Couldn't apply the coverage plan", err));
+      setShowApplyConfirm(false);
     } finally {
       setConfirming(false);
     }
@@ -288,12 +300,19 @@ export function AbsenceSimulator({
                   covering. You can still approve the leave below.
                 </p>
               </Card>
-            ) : (
+            ) : Object.keys(coverageOverrides).length > 0 ? (
+              <p className="mb-3 rounded-lg border border-brand-100 bg-brand-50/50 px-3 py-2 text-xs text-ink-secondary">
+                {Object.keys(coverageOverrides).length} coverage proposal{Object.keys(coverageOverrides).length === 1 ? "" : "s"} staged.
+                Capacity figures below are a live projection — nothing is saved and no assignment changes until you click{" "}
+                <span className="font-medium text-ink">Apply Coverage Plan</span>.
+              </p>
+            ) : null}
+            {impact.affectedWork.length > 0 && (
               <div className="space-y-3">
                 {impact.affectedWork.map((item) => {
                   const allCandidates = impact.candidatesByItem.get(item.id) ?? [];
                   const candidates = allCandidates.filter((c) => c.assignable);
-                  const coveringId = coverBy[item.id] ?? null;
+                  const coveringId = coveringIdFor(item);
                   const top = candidates[0];
                   const alternates = candidates.slice(1);
                   const altOpen = !!showAlternatives[item.id];
@@ -316,9 +335,9 @@ export function AbsenceSimulator({
                           </p>
                         </div>
                         {coveringId && (
-                          <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-good)]">
-                            <CheckCircle2 className="h-3.5 w-3.5" />
-                            Covered by {nameFor(coveringId).split(" ")[0]}
+                          <span className="inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-brand-50 px-2.5 py-1 text-xs font-medium text-brand-700">
+                            <Sparkles className="h-3.5 w-3.5" />
+                            Proposed: {nameFor(coveringId).split(" ")[0]}
                           </span>
                         )}
                       </div>
@@ -326,7 +345,7 @@ export function AbsenceSimulator({
                       {/* The turnover at a glance — everything the supervisor needs to decide. */}
                       <div className="mt-3 grid gap-x-4 gap-y-1.5 rounded-lg border border-border bg-brand-50/40 p-3 text-xs sm:grid-cols-2">
                         <Row label="Original owner" value={impact.employee.name} />
-                        <Row label="Coverage employee" value={coveringId ? nameFor(coveringId) : "— not selected"} />
+                        <Row label="Coverage employee" value={coveringId ? `${nameFor(coveringId)} (proposed)` : "— not selected"} />
                         <Row label="Leave period" value={`${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)}`} />
                         <Row
                           label="Turnover period"
@@ -366,7 +385,9 @@ export function AbsenceSimulator({
                               <Sparkles className="h-3 w-3" />
                               Suggested cover
                             </p>
-                            <p className="mt-1.5 text-sm font-medium text-ink">{top.employee.name}</p>
+                            <EmployeeCapacityHover employee={top.employee}>
+                              <p className="mt-1.5 text-sm font-medium text-ink">{top.employee.name}</p>
+                            </EmployeeCapacityHover>
                             <ul className="mt-1 space-y-0.5 text-xs text-ink-secondary">
                               {top.reasons.map((r, i) => (
                                 <li key={i}>· {r}</li>
@@ -380,19 +401,19 @@ export function AbsenceSimulator({
                             )}
                             <div className="mt-2.5 flex items-center gap-2">
                               <button
-                                onClick={() => applyCoverage(item, top)}
+                                onClick={() => proposeCoverage(item, top)}
                                 disabled={coveringId === top.employee.id}
                                 className="rounded-lg bg-brand-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
                               >
-                                {coveringId === top.employee.id ? "Assigned" : `Assign coverage to ${top.employee.name.split(" ")[0]}`}
+                                {coveringId === top.employee.id ? "Proposed" : `Propose ${top.employee.name.split(" ")[0]}`}
                               </button>
                               {coveringId && (
                                 <button
-                                  onClick={() => clearCoverage(item)}
+                                  onClick={() => unproposeCoverage(item)}
                                   className="inline-flex items-center gap-1 rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:bg-brand-50"
                                 >
                                   <RotateCcw className="h-3 w-3" />
-                                  Clear
+                                  Remove
                                 </button>
                               )}
                             </div>
@@ -436,7 +457,7 @@ export function AbsenceSimulator({
                                 key={c.employee.id}
                                 candidate={c}
                                 assigned={coveringId === c.employee.id}
-                                onAssign={() => applyCoverage(item, c)}
+                                onAssign={() => proposeCoverage(item, c)}
                               />
                             ))}
                           </div>
@@ -464,12 +485,12 @@ export function AbsenceSimulator({
               <PlanLine
                 label="During the leave"
                 body={
-                  primaryCandidate || Object.keys(coverBy).length > 0 ? (
+                  primaryCandidate || Object.keys(coverageOverrides).length > 0 ? (
                     <ul className="mt-1 space-y-0.5 text-ink-secondary">
                       {impact.affectedWork
                         .filter((i) => i.risk !== "Low")
                         .map((i) => {
-                          const cid = coverBy[i.id] ?? (impact.candidatesByItem.get(i.id) ?? []).find((c) => c.eligible)?.employee.id;
+                          const cid = coveringIdFor(i) ?? (impact.candidatesByItem.get(i.id) ?? []).find((c) => c.eligible)?.employee.id;
                           return (
                             <li key={i.id}>
                               <span className="font-medium text-ink">{cid ? nameFor(cid).split(" ")[0] : "— unassigned"}</span> covers{" "}
@@ -499,7 +520,9 @@ export function AbsenceSimulator({
               <div className="mt-4 flex items-center gap-2 rounded-lg border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-3.5 py-3">
                 <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--status-good)]" />
                 <p className="text-xs font-medium text-[var(--status-good)]">
-                  Turnover accepted — {confirmedCount} task{confirmedCount === 1 ? "" : "s"} covered for the leave window
+                  {confirmedCount > 0
+                    ? `Coverage plan applied — ${confirmedCount} task${confirmedCount === 1 ? "" : "s"} covered for the leave window`
+                    : "No coverage was needed"}
                   {pendingRequestId && onApproveLeave ? ", and the leave is approved" : ""}.
                 </p>
               </div>
@@ -507,7 +530,7 @@ export function AbsenceSimulator({
               <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
                 {pendingRequestId && onApproveLeave && impact.affectedWork.length === 0 && (
                   <button
-                    onClick={handleConfirmPlan}
+                    onClick={() => setShowApplyConfirm(true)}
                     disabled={confirming}
                     className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
                   >
@@ -516,19 +539,53 @@ export function AbsenceSimulator({
                   </button>
                 )}
                 {impact.affectedWork.length > 0 && (
-                  <button
-                    onClick={handleConfirmPlan}
-                    disabled={confirming || coverageFoundCount === 0}
-                    className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
-                  >
-                    {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Flame className="h-4 w-4" />}
-                    {confirming ? "Confirming…" : pendingRequestId ? "Accept Turnover & Approve Leave" : "Apply Coverage Plan"}
-                  </button>
+                  <div className="flex flex-col items-end gap-1">
+                    <button
+                      onClick={() => setShowApplyConfirm(true)}
+                      disabled={confirming || Object.keys(coverageOverrides).length === 0}
+                      className="inline-flex items-center gap-2 rounded-lg bg-brand-800 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                    >
+                      {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Flame className="h-4 w-4" />}
+                      {confirming ? "Applying…" : pendingRequestId ? "Accept Turnover & Approve Leave" : "Apply Coverage Plan"}
+                    </button>
+                    {Object.keys(coverageOverrides).length === 0 && (
+                      <p className="text-[11px] text-ink-muted">Propose coverage for at least one task first.</p>
+                    )}
+                  </div>
                 )}
               </div>
             )}
           </Card>
         </>
+      )}
+
+      {showApplyConfirm && impact && (
+        <ConfirmDialog
+          title={pendingRequestId ? "Accept turnover & approve leave?" : "Apply coverage plan?"}
+          busy={confirming}
+          body={
+            <>
+              {Object.keys(coverageOverrides).length > 0 ? (
+                <>
+                  This writes {Object.keys(coverageOverrides).length} time-boxed coverage assignment
+                  {Object.keys(coverageOverrides).length === 1 ? "" : "s"} for{" "}
+                  <span className="font-medium text-ink">{impact.employee.name}</span>&rsquo;s leave
+                  ({formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)}). Covering employees&rsquo;
+                  schedules and capacity update immediately.
+                </>
+              ) : (
+                <>
+                  This approves <span className="font-medium text-ink">{impact.employee.name}</span>&rsquo;s leave
+                  ({formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)}). No coverage is needed.
+                </>
+              )}
+              {pendingRequestId && onApproveLeave ? " The leave request is marked approved." : ""}
+            </>
+          }
+          confirmLabel={pendingRequestId ? "Accept & Approve" : "Apply Plan"}
+          onConfirm={handleApplyPlan}
+          onCancel={() => setShowApplyConfirm(false)}
+        />
       )}
     </div>
   );
@@ -595,7 +652,9 @@ function CoverageCandidateRow({
             {e.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
           </div>
           <div className="min-w-0 leading-tight">
-            <p className="truncate text-sm font-medium text-ink">{e.name}</p>
+            <EmployeeCapacityHover employee={e}>
+              <p className="truncate text-sm font-medium text-ink">{e.name}</p>
+            </EmployeeCapacityHover>
             <p className="truncate text-xs text-ink-muted">{e.department}</p>
           </div>
         </div>
@@ -604,7 +663,7 @@ function CoverageCandidateRow({
           disabled={assigned}
           className="shrink-0 rounded-lg bg-brand-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
         >
-          {assigned ? "Assigned" : `Assign to ${e.name.split(" ")[0]}`}
+          {assigned ? "Proposed" : `Propose ${e.name.split(" ")[0]}`}
         </button>
       </div>
       <div className="mt-2.5 grid grid-cols-3 gap-2.5 text-xs">

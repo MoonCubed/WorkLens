@@ -1,24 +1,28 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, CalendarClock, Repeat2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, CalendarClock, Repeat2, AlertTriangle } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import type { Employee } from "@/data/types";
 import { useTickets } from "@/store/tickets-store";
 import { useWorkLog } from "@/store/work-log-store";
 import { useCalendarEvents } from "@/store/calendar-events-store";
-import { computeEmployeeSchedule, computeEmployeeWeeklyCapacity, type ScheduledWorkItem } from "@/lib/capacityEngine";
-import { buildDayTimeline, minLabel, type SegmentKind } from "@/lib/dayTimeline";
+import { useDayPlans } from "@/store/day-plans-store";
+import { computeEmployeeSchedule, computeEmployeeWeeklyCapacity } from "@/lib/capacityEngine";
+import { buildDayTimeline, minLabel, LUNCH_START_MIN, LUNCH_END_MIN, type DayTimeline, type SegmentKind } from "@/lib/dayTimeline";
+import { EmployeeCapacityHover } from "@/components/employee/EmployeeCapacityHover";
 import { startOfWeek, addDays, dateKey, isWorkingDay, todayStart, weekOfYear, weekRangeLabel } from "@/lib/date";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const NAME_COL = 190;
-const LANE_HEIGHT = 26;
-const TWO_WEEK_DAYS = 14;
+const HOUR_COL = 46;
+/** Pixel height of one employee's day track (the 07:00–16:00 span). */
+const TRACK_H = 260;
 const SIX_WEEKS = 6;
 
-type Mode = "day" | "twoWeek" | "sixWeek";
-const MODE_LABEL: Record<Mode, string> = { day: "Day", twoWeek: "2 Weeks", sixWeek: "6 Weeks" };
+type Mode = "week" | "twoWeek" | "sixWeek";
+const MODE_LABEL: Record<Mode, string> = { week: "Week", twoWeek: "2 Weeks", sixWeek: "6 Weeks" };
+const MODE_DAYS: Record<"week" | "twoWeek", number> = { week: 5, twoWeek: 10 };
 
 /** Planned hours vs available hours → the one "approaching / over capacity" language. */
 function loadTone(planned: number, available: number): { text: string; cell: string } {
@@ -30,49 +34,23 @@ function loadTone(planned: number, available: number): { text: string; cell: str
   return { text: "text-ink-muted", cell: "" };
 }
 
-/** Task-block colour by meaning: overdue/at-risk = red, coverage = teal, ad-hoc =
- * slate, high priority = solid blue, everything else = light blue. */
-function itemTone(item: ScheduledWorkItem): string {
-  if (item.overdue || item.deadlineUnreachable)
-    return "border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] text-[var(--status-critical)]";
-  if (item.isCoverage) return "border-[var(--accent-teal)] bg-[var(--accent-teal-bg)] text-[color:var(--accent-teal)]";
-  if (item.blockedByDependency) return "border-border-strong bg-brand-50/60 text-ink-secondary";
-  if (item.type === "Ad-hoc") return "border-[var(--status-serious-border)] bg-[var(--status-serious-bg)] text-[var(--status-serious)]";
-  if (item.priority === "High") return "border-brand-700 bg-brand-600 text-white";
-  return "border-brand-200 bg-brand-100 text-brand-900";
-}
-
 const SEG_TONE: Record<SegmentKind, string> = {
   task: "border-brand-300 bg-brand-100 text-brand-900",
   coverage: "border-[var(--accent-teal)] bg-[var(--accent-teal-bg)] text-[color:var(--accent-teal)]",
   event: "border-purple-300 bg-purple-100 text-purple-900",
-  lunch: "border-border-strong bg-[repeating-linear-gradient(45deg,transparent,transparent_4px,var(--border)_4px,var(--border)_5px)] text-ink-muted",
+  lunch:
+    "border-border-strong bg-[repeating-linear-gradient(45deg,transparent,transparent_5px,var(--border)_5px,var(--border)_6px)] text-ink-muted",
   idle: "border-dashed border-border bg-transparent text-ink-muted",
 };
 
-interface Seg {
-  item: ScheduledWorkItem;
-  startIdx: number;
-  endIdx: number;
-  lane: number;
-}
-function packLanes(items: Omit<Seg, "lane">[]): Seg[] {
-  const sorted = [...items].sort((a, b) => a.startIdx - b.startIdx || a.endIdx - b.endIdx);
-  const laneEnds: number[] = [];
-  return sorted.map((it) => {
-    let lane = laneEnds.findIndex((end) => end < it.startIdx);
-    if (lane === -1) lane = laneEnds.length;
-    laneEnds[lane] = it.endIdx;
-    return { ...it, lane };
-  });
-}
-
 /**
- * A Float-style workload timeline: people down the side, time across the top.
- * - **Day** — the hour-by-hour plan for one day (calendar events, lunch, task blocks).
- * - **2 Weeks / 6 Weeks** — task blocks and capacity heat across the range.
- * Every number comes from `computeEmployeeSchedule` / the weekly-capacity engine — the
- * same source as every other capacity figure in WorkLens. No scheduling maths here.
+ * A Float-style workload calendar: employees as rows, **dates across the X-axis** and
+ * **clock time down the Y-axis** (07:00 at the top → 16:00 at the bottom). Each task
+ * sits in the actual time slot it's scheduled for ("Firewall audit · 2h" at 09:00–
+ * 11:00), calendar events and the 11:30–12:30 lunch break are drawn as fixed blocks,
+ * and non-working days / leave are shaded out. Everything is positioned from
+ * `computeEmployeeSchedule` + `buildDayTimeline` — the same source as every other
+ * capacity figure in WorkLens. No scheduling maths here.
  *
  * `revealEventTitlesFor` names the one employee (viewing their own workload) whose
  * personal calendar-event titles are shown; for everyone else a timed event is only
@@ -90,17 +68,28 @@ export function WorkloadView({
   const { tickets } = useTickets();
   const { getEntry } = useWorkLog();
   const { events } = useCalendarEvents();
-  const [mode, setMode] = useState<Mode>("twoWeek");
+  const { getPlan } = useDayPlans();
+  // Opens on the hour-by-hour Week view by default — the clearest "what does this
+  // person's actual working day look like" read. 2 Weeks / 6 Weeks stay one click away.
+  const [mode, setMode] = useState<Mode>("week");
   const [anchor, setAnchor] = useState<Date>(() => startOfWeek(todayStart()));
-  const [dayCursor, setDayCursor] = useState<Date>(() => {
-    let d = todayStart();
-    while (!isWorkingDay(d)) d = addDays(d, 1);
-    return d;
-  });
 
   const today = todayStart();
-  const days = useMemo(() => Array.from({ length: TWO_WEEK_DAYS }, (_, i) => addDays(anchor, i)), [anchor]);
   const weekStarts = useMemo(() => Array.from({ length: SIX_WEEKS }, (_, i) => addDays(anchor, i * 7)), [anchor]);
+
+  // The working days (Sun–Thu) shown across the X-axis for the time-grid modes.
+  const gridDays = useMemo(() => {
+    if (mode === "sixWeek") return [];
+    const want = MODE_DAYS[mode];
+    const out: Date[] = [];
+    let d = new Date(anchor);
+    // Guard against an infinite loop; 3 weeks of calendar days is plenty for 10 working days.
+    for (let i = 0; i < 30 && out.length < want; i++) {
+      if (isWorkingDay(d)) out.push(new Date(d));
+      d = addDays(d, 1);
+    }
+    return out;
+  }, [anchor, mode]);
 
   const schedules = useMemo(
     () => employees.map((employee) => ({ employee, schedule: computeEmployeeSchedule(employee, tickets, getEntry, events) })),
@@ -108,29 +97,18 @@ export function WorkloadView({
   );
 
   function step(dir: 1 | -1) {
-    if (mode === "day") {
-      setDayCursor((c) => {
-        let d = addDays(c, dir);
-        while (!isWorkingDay(d)) d = addDays(d, dir);
-        return d;
-      });
-    } else {
-      setAnchor((a) => addDays(a, dir * 7));
-    }
+    setAnchor((a) => addDays(a, dir * 7));
   }
   function goToday() {
     setAnchor(startOfWeek(todayStart()));
-    let d = todayStart();
-    while (!isWorkingDay(d)) d = addDays(d, 1);
-    setDayCursor(d);
   }
 
   const header =
-    mode === "day"
-      ? dayCursor.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })
-      : mode === "twoWeek"
-        ? `${days[0].toLocaleDateString("en-US", { month: "short", day: "numeric" })} – ${days[TWO_WEEK_DAYS - 1].toLocaleDateString("en-US", { month: "short", day: "numeric" })}`
-        : `Week ${weekOfYear(weekStarts[0])} – ${weekOfYear(weekStarts[SIX_WEEKS - 1])}`;
+    mode === "sixWeek"
+      ? `Week ${weekOfYear(weekStarts[0])} – ${weekOfYear(weekStarts[SIX_WEEKS - 1])}`
+      : gridDays.length > 0
+        ? `${gridDays[0].toLocaleDateString("en-US", { month: "short", day: "numeric" })} – ${gridDays[gridDays.length - 1].toLocaleDateString("en-US", { month: "short", day: "numeric" })}`
+        : "";
 
   return (
     <Card padded={false}>
@@ -141,7 +119,7 @@ export function WorkloadView({
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1">
-            {(["day", "twoWeek", "sixWeek"] as Mode[]).map((m) => (
+            {(["week", "twoWeek", "sixWeek"] as Mode[]).map((m) => (
               <button
                 key={m}
                 onClick={() => setMode(m)}
@@ -168,117 +146,156 @@ export function WorkloadView({
       </div>
 
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border px-4 py-2.5 text-xs text-ink-secondary">
-        <LegendSwatch className="bg-brand-100 border border-brand-300" label="Planned / project work" />
-        <LegendSwatch className="bg-brand-600" label="High priority" />
-        <LegendSwatch className="bg-[var(--status-serious-bg)] border border-[var(--status-serious-border)]" label="Ad-hoc" />
+        <LegendSwatch className="bg-brand-100 border border-brand-300" label="Task / project work" />
         <LegendSwatch className="bg-[var(--accent-teal-bg)] border border-[var(--accent-teal)]" label="Turnover coverage" />
         <LegendSwatch className="bg-purple-100 border border-purple-300" label="Calendar event" />
-        <LegendSwatch className="bg-[var(--status-critical-bg)] border border-[var(--status-critical-border)]" label="Overdue / over capacity" />
+        <LegendSwatch className="border border-border-strong bg-[repeating-linear-gradient(45deg,transparent,transparent_3px,var(--border)_3px,var(--border)_4px)]" label="Lunch 11:30–12:30" />
+        <LegendSwatch className="bg-[var(--status-warning-bg)] border border-[var(--status-warning-border)]" label="Leave / non-working" />
+        <span className="flex items-center gap-1.5"><span className="text-brand-600">●</span> Confirmed Plan My Day</span>
         <span className="ml-auto text-ink-muted">Planned workload vs available working time — not a productivity measure.</span>
       </div>
 
-      {mode === "day" ? (
-        <DayTimelineGrid schedules={schedules} date={dayCursor} revealEventTitlesFor={revealEventTitlesFor} />
+      {employees.length === 0 ? (
+        <p className="px-4 py-6 text-center text-sm text-ink-muted">No employees to show.</p>
+      ) : mode === "sixWeek" ? (
+        <SixWeekGrid schedules={schedules} weekStarts={weekStarts} anchor={anchor} tickets={tickets} getEntry={getEntry} events={events} />
       ) : (
-        <RangeGrid
-          mode={mode}
-          schedules={schedules}
-          days={days}
-          weekStarts={weekStarts}
-          anchor={anchor}
-          today={today}
-          tickets={tickets}
-          getEntry={getEntry}
-          events={events}
-          revealEventTitlesFor={revealEventTitlesFor}
-        />
+        <TimeGrid schedules={schedules} days={gridDays} today={today} anchor={anchor} tickets={tickets} getEntry={getEntry} events={events} getPlan={getPlan} revealEventTitlesFor={revealEventTitlesFor} />
       )}
-
-      {employees.length === 0 && <p className="px-4 py-6 text-center text-sm text-ink-muted">No employees to show.</p>}
     </Card>
   );
 }
 
-// ---------------------------------------------------------------- Day (hour timeline)
+// ------------------------------------------------------------ Week / 2-week time grid
 
-function DayTimelineGrid({
+function TimeGrid({
   schedules,
-  date,
+  days,
+  today,
+  anchor,
+  tickets,
+  getEntry,
+  events,
+  getPlan,
   revealEventTitlesFor,
 }: {
   schedules: { employee: Employee; schedule: ReturnType<typeof computeEmployeeSchedule> }[];
-  date: Date;
+  days: Date[];
+  today: Date;
+  anchor: Date;
+  tickets: Parameters<typeof computeEmployeeWeeklyCapacity>[1];
+  getEntry: Parameters<typeof computeEmployeeWeeklyCapacity>[2];
+  events: Parameters<typeof computeEmployeeWeeklyCapacity>[5];
+  getPlan: ReturnType<typeof useDayPlans>["getPlan"];
   revealEventTitlesFor?: string;
 }) {
-  const timelines = schedules.map(({ employee, schedule }) => ({ employee, tl: buildDayTimeline(schedule, employee, date) }));
-  const dayStart = timelines[0]?.tl.dayStartMin ?? 7 * 60;
-  const dayEnd = timelines[0]?.tl.dayEndMin ?? 16 * 60;
-  const span = Math.max(1, dayEnd - dayStart);
-  const hourMarks: number[] = [];
-  for (let h = Math.ceil(dayStart / 60) * 60; h <= dayEnd; h += 60) hourMarks.push(h);
+  const rows = useMemo(
+    () =>
+      schedules.map(({ employee, schedule }) => ({
+        employee,
+        timelines: days.map((d) => buildDayTimeline(schedule, employee, d, getPlan(employee.id, dateKey(d)))),
+        weekly: computeEmployeeWeeklyCapacity(employee, tickets, getEntry, 1, anchor, events)[0],
+        loggedHours: Math.round(schedule.items.reduce((s, it) => s + (getEntry(it.key).actualHours ?? 0), 0) * 10) / 10,
+        revealEvents: revealEventTitlesFor === employee.id,
+      })),
+    [schedules, days, anchor, tickets, getEntry, events, getPlan, revealEventTitlesFor]
+  );
+
+  // One shared clock scale for the whole grid so every row lines up.
+  const { gridStart, gridEnd } = useMemo(() => {
+    let s = 7 * 60;
+    let e = 16 * 60;
+    rows.forEach((r) =>
+      r.timelines.forEach((tl) => {
+        s = Math.min(s, tl.dayStartMin);
+        e = Math.max(e, tl.dayEndMin);
+      })
+    );
+    return { gridStart: s, gridEnd: e };
+  }, [rows]);
+  const span = Math.max(60, gridEnd - gridStart);
+
+  // Hourly gridlines; label every hour (the span is short enough).
+  const hourMarks = useMemo(() => {
+    const marks: number[] = [];
+    for (let m = Math.ceil(gridStart / 60) * 60; m <= gridEnd; m += 60) marks.push(m);
+    return marks;
+  }, [gridStart, gridEnd]);
+
+  const dayColMin = 116;
+  const gridMinWidth = NAME_COL + HOUR_COL + days.length * dayColMin;
+  const pct = (min: number) => `${((min - gridStart) / span) * 100}%`;
 
   return (
     <div className="overflow-x-auto">
-      <div style={{ minWidth: NAME_COL + 560 }}>
-        {/* Hour axis */}
-        <div className="flex border-b border-border">
-          <div style={{ width: NAME_COL }} className="sticky left-0 z-10 shrink-0 bg-brand-50/60 px-4 py-2 text-xs font-medium uppercase tracking-wide text-ink-secondary">
+      <div style={{ minWidth: gridMinWidth }}>
+        {/* Day header (X-axis) */}
+        <div className="flex border-b border-border bg-brand-50/40">
+          <div style={{ width: NAME_COL }} className="sticky left-0 z-20 shrink-0 bg-brand-50/60 px-4 py-2 text-xs font-medium uppercase tracking-wide text-ink-secondary">
             Employee
           </div>
-          <div className="relative flex-1 bg-brand-50/40">
-            {hourMarks.map((m) => (
-              <span
-                key={m}
-                className="absolute top-0 -translate-x-1/2 py-1.5 text-[10px] tabular text-ink-muted"
-                style={{ left: `${((m - dayStart) / span) * 100}%` }}
-              >
-                {minLabel(m)}
-              </span>
-            ))}
-            <div className="py-1.5 text-[10px] opacity-0">.</div>
-          </div>
+          <div style={{ width: HOUR_COL }} className="shrink-0" />
+          {days.map((d, i) => {
+            const isToday = dateKey(d) === dateKey(today);
+            return (
+              <div key={i} className={`flex-1 border-l border-border px-1 py-1.5 text-center ${isToday ? "bg-brand-100" : ""}`}>
+                <div className="text-[10px] uppercase text-ink-muted">{WEEKDAYS[d.getDay()]}</div>
+                <div className={`text-xs tabular ${isToday ? "font-semibold text-brand-800" : "text-ink-secondary"}`}>
+                  {d.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
-        {timelines.map(({ employee, tl }) => {
-          const reveal = revealEventTitlesFor === employee.id;
-          const over = tl.plannedHours + tl.eventHours > tl.availableHours + tl.eventHours + 0.1 || tl.unplacedHours > 0.1;
+        {rows.map(({ employee, timelines, weekly, loggedHours, revealEvents }) => {
+          const weekPlanned = timelines.reduce((s, tl) => s + tl.plannedHours, 0);
+          const weekAvail = timelines.reduce((s, tl) => s + tl.availableHours, 0);
+          const tone = loadTone(weekPlanned, weekAvail);
+          const unplaced = Math.round(timelines.reduce((s, tl) => s + tl.unplacedHours, 0) * 10) / 10;
           return (
             <div key={employee.id} className="flex border-b border-border last:border-0">
-              <div style={{ width: NAME_COL }} className="sticky left-0 z-10 shrink-0 bg-surface px-4 py-3">
-                <p className="truncate text-sm font-medium text-ink">{employee.name}</p>
-                <p className={`text-[11px] ${over ? "text-[var(--status-warning)]" : "text-ink-muted"}`}>
-                  {tl.onLeave
-                    ? "On leave"
-                    : `${tl.plannedHours}h planned · ${tl.availableHours}h available${tl.eventHours > 0 ? ` · ${tl.eventHours}h events` : ""}`}
+              {/* Name / week capacity */}
+              <div style={{ width: NAME_COL }} className="sticky left-0 z-20 shrink-0 bg-surface px-4 py-3">
+                <EmployeeCapacityHover employee={employee}>
+                  <p className="truncate text-sm font-medium text-ink">{employee.name}</p>
+                </EmployeeCapacityHover>
+                <p className={`mt-0.5 text-[11px] ${tone.text}`}>
+                  {weekly ? `${weekly.scheduledHours}h / ${weekly.workingHours}h this week · ${weekly.utilization}%` : `${weekPlanned}h planned`}
                 </p>
-                {tl.unplacedHours > 0.1 && <p className="text-[11px] text-[var(--status-warning)]">+{tl.unplacedHours}h doesn&rsquo;t fit today</p>}
-              </div>
-              <div className="relative flex-1 py-2" style={{ minHeight: 46 }}>
-                {/* Hour gridlines */}
-                {hourMarks.map((m) => (
-                  <div key={m} className="absolute inset-y-0 border-l border-border/40" style={{ left: `${((m - dayStart) / span) * 100}%` }} />
-                ))}
-                {tl.segments.map((s, i) => {
-                  const left = ((s.startMin - dayStart) / span) * 100;
-                  const width = ((s.endMin - s.startMin) / span) * 100;
-                  const title = s.kind === "event" && !reveal ? "Personal commitment" : s.title;
-                  return (
-                    <div
-                      key={i}
-                      title={`${minLabel(s.startMin)}–${minLabel(s.endMin)} · ${title}${s.hours ? ` · ${s.hours}h` : ""}`}
-                      style={{ left: `${left}%`, width: `calc(${width}% - 2px)`, marginLeft: 1 }}
-                      className={`absolute inset-y-2 flex items-center overflow-hidden whitespace-nowrap rounded-md border px-1.5 text-[11px] font-medium ${SEG_TONE[s.kind]}`}
-                    >
-                      <span className="truncate">{title}</span>
-                    </div>
-                  );
-                })}
-                {tl.segments.length === 0 && (
-                  <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-[11px] text-ink-muted/70">
-                    Nothing scheduled
-                  </span>
+                <p className="mt-0.5 text-[11px] text-ink-muted">
+                  {loggedHours > 0 ? `${loggedHours}h actually logged` : "no time logged yet"}
+                </p>
+                {unplaced > 0.1 && (
+                  <p className="mt-0.5 flex items-center gap-1 text-[11px] text-[var(--status-warning)]">
+                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                    {unplaced}h won&rsquo;t fit
+                  </p>
                 )}
               </div>
+
+              {/* Hour gutter (Y-axis) */}
+              <div style={{ width: HOUR_COL, height: TRACK_H }} className="relative shrink-0">
+                {hourMarks.map((m) => (
+                  <span key={m} className="absolute right-1 -translate-y-1/2 text-[9px] tabular text-ink-muted" style={{ top: pct(m) }}>
+                    {minLabel(m)}
+                  </span>
+                ))}
+              </div>
+
+              {/* One column per day */}
+              {timelines.map((tl, di) => (
+                <DayTrack
+                  key={di}
+                  tl={tl}
+                  date={days[di]}
+                  isToday={dateKey(days[di]) === dateKey(today)}
+                  gridStart={gridStart}
+                  span={span}
+                  hourMarks={hourMarks}
+                  revealEvents={revealEvents}
+                />
+              ))}
             </div>
           );
         })}
@@ -287,184 +304,169 @@ function DayTimelineGrid({
   );
 }
 
-// ---------------------------------------------------------------- 2-week / 6-week
+function DayTrack({
+  tl,
+  date,
+  isToday,
+  gridStart,
+  span,
+  hourMarks,
+  revealEvents,
+}: {
+  tl: DayTimeline;
+  date: Date;
+  isToday: boolean;
+  gridStart: number;
+  span: number;
+  hourMarks: number[];
+  revealEvents: boolean;
+}) {
+  const pct = (min: number) => ((min - gridStart) / span) * 100;
+  const blocks = tl.segments.filter((s) => s.kind !== "idle");
 
-function RangeGrid({
-  mode,
+  return (
+    <div
+      className={`relative flex-1 border-l border-border ${isToday ? "bg-brand-50/50" : ""}`}
+      style={{ height: TRACK_H }}
+    >
+      {/* Hour gridlines */}
+      {hourMarks.map((m) => (
+        <div key={m} className="pointer-events-none absolute inset-x-0 border-t border-border/40" style={{ top: `${pct(m)}%` }} />
+      ))}
+      {/* Lunch band — always drawn so the 11:30–12:30 break is unmistakable. */}
+      <div
+        className="pointer-events-none absolute inset-x-0 bg-[repeating-linear-gradient(45deg,transparent,transparent_5px,var(--border)_5px,var(--border)_6px)]"
+        style={{ top: `${pct(LUNCH_START_MIN)}%`, height: `${pct(LUNCH_END_MIN) - pct(LUNCH_START_MIN)}%` }}
+      />
+
+      {tl.onLeave ? (
+        <div className="absolute inset-0 flex items-center justify-center bg-[var(--status-warning-bg)]/70 text-[11px] font-medium text-[var(--status-warning)]">
+          On leave
+        </div>
+      ) : !tl.isWorkingDay ? (
+        <div className="absolute inset-0 flex items-center justify-center bg-brand-50/60 text-[11px] text-ink-muted">Non-working</div>
+      ) : (
+        <>
+          {blocks.map((s, i) => {
+            const top = pct(s.startMin);
+            const height = Math.max(2.5, pct(s.endMin) - pct(s.startMin));
+            const label = s.kind === "event" && !revealEvents ? "Personal commitment" : s.title;
+            const tiny = height < 9;
+            return (
+              <div
+                key={i}
+                title={`${minLabel(s.startMin)}–${minLabel(s.endMin)} · ${label}${s.hours ? ` · ${s.hours}h` : ""}`}
+                className={`absolute inset-x-0.5 overflow-hidden rounded-[5px] border px-1 text-[10px] font-medium leading-tight ${SEG_TONE[s.kind]} ${tiny ? "py-0" : "py-0.5"}`}
+                style={{ top: `${top}%`, height: `${height}%` }}
+              >
+                {s.kind === "lunch" ? (
+                  <span className="truncate">Lunch</span>
+                ) : (
+                  <span className="flex items-center gap-1">
+                    {s.kind === "coverage" && <Repeat2 className="h-2.5 w-2.5 shrink-0" />}
+                    {s.kind === "event" && <CalendarClock className="h-2.5 w-2.5 shrink-0" />}
+                    <span className="truncate">
+                      {label}
+                      {s.hours > 0 && !tiny ? ` · ${s.hours}h` : ""}
+                    </span>
+                  </span>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Day total, pinned to the bottom of the track. */}
+          <div className="absolute inset-x-0 bottom-0 border-t border-border/60 bg-surface/80 px-1 py-0.5 text-center text-[10px] tabular text-ink-muted">
+            {tl.fromConfirmedPlan && <span className="mr-1 text-brand-600" title="From this employee's confirmed Plan My Day">●</span>}
+            {tl.plannedHours > 0 ? `${tl.plannedHours}h planned` : "—"}
+          </div>
+        </>
+      )}
+
+      {/* Non-descriptive but keeps very empty columns from collapsing visually */}
+      {tl.isWorkingDay && !tl.onLeave && blocks.length === 0 && (
+        <span className="pointer-events-none absolute left-1 top-1 text-[10px] text-ink-muted/70">Open</span>
+      )}
+      <span className="sr-only">{date.toDateString()}</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------- 6-week heat
+
+function SixWeekGrid({
   schedules,
-  days,
   weekStarts,
   anchor,
-  today,
   tickets,
   getEntry,
   events,
-  revealEventTitlesFor,
 }: {
-  mode: "twoWeek" | "sixWeek";
   schedules: { employee: Employee; schedule: ReturnType<typeof computeEmployeeSchedule> }[];
-  days: Date[];
   weekStarts: Date[];
   anchor: Date;
-  today: Date;
   tickets: Parameters<typeof computeEmployeeWeeklyCapacity>[1];
   getEntry: Parameters<typeof computeEmployeeWeeklyCapacity>[2];
   events: Parameters<typeof computeEmployeeWeeklyCapacity>[5];
-  revealEventTitlesFor?: string;
 }) {
-  const rows = useMemo(() => {
-    return schedules.map(({ employee, schedule }) => {
-      const dayPlans = schedule.planForRange(anchor, TWO_WEEK_DAYS);
-      const planByKey = new Map(dayPlans.map((p) => [p.key, p]));
-      const segRaw: Omit<Seg, "lane">[] = [];
-      schedule.items.forEach((item) => {
-        if (item.remainingHours <= 0) return;
-        const idxs = days.map((d, i) => (item.workingDayKeys.includes(dateKey(d)) ? i : -1)).filter((i) => i >= 0);
-        if (idxs.length === 0) return;
-        segRaw.push({ item, startIdx: idxs[0], endIdx: idxs[idxs.length - 1] });
-      });
-      const segs = packLanes(segRaw);
-      const weekly = computeEmployeeWeeklyCapacity(employee, tickets, getEntry, SIX_WEEKS, anchor, events);
-      return { employee, planByKey, segs, weekly, revealEvents: revealEventTitlesFor === employee.id };
-    });
-  }, [schedules, days, anchor, tickets, getEntry, events, revealEventTitlesFor]);
-
-  const gridMinWidth = NAME_COL + (mode === "twoWeek" ? TWO_WEEK_DAYS * 64 : SIX_WEEKS * 120);
+  const rows = useMemo(
+    () =>
+      schedules.map(({ employee }) => ({
+        employee,
+        weekly: computeEmployeeWeeklyCapacity(employee, tickets, getEntry, SIX_WEEKS, anchor, events),
+      })),
+    [schedules, anchor, tickets, getEntry, events]
+  );
+  const gridMinWidth = NAME_COL + SIX_WEEKS * 120;
 
   return (
     <div className="overflow-x-auto">
       <div style={{ minWidth: gridMinWidth }}>
-        <div className="flex border-b border-border">
-          <div style={{ width: NAME_COL }} className="sticky left-0 z-10 shrink-0 bg-brand-50/60 px-4 py-2 text-xs font-medium uppercase tracking-wide text-ink-secondary">
+        <div className="flex border-b border-border bg-brand-50/40">
+          <div style={{ width: NAME_COL }} className="sticky left-0 z-20 shrink-0 bg-brand-50/60 px-4 py-2 text-xs font-medium uppercase tracking-wide text-ink-secondary">
             Employee
           </div>
-          <div className="flex flex-1 bg-brand-50/40">
-            {mode === "twoWeek"
-              ? days.map((d, i) => {
-                  const isToday = dateKey(d) === dateKey(today);
-                  return (
-                    <div key={i} className={`flex-1 border-l border-border px-1 py-1.5 text-center ${!isWorkingDay(d) ? "bg-brand-50/70" : ""} ${isToday ? "bg-brand-100" : ""}`}>
-                      <div className="text-[10px] uppercase text-ink-muted">{WEEKDAYS[d.getDay()]}</div>
-                      <div className={`text-xs tabular ${isToday ? "font-semibold text-brand-800" : "text-ink-secondary"}`}>{d.getDate()}</div>
-                    </div>
-                  );
-                })
-              : weekStarts.map((w, i) => (
-                  <div key={i} className="flex-1 border-l border-border px-1 py-1.5 text-center">
-                    <div className="text-[10px] uppercase text-ink-muted">W{weekOfYear(w)}</div>
-                    <div className="text-[11px] tabular text-ink-secondary">{weekRangeLabel(w)}</div>
-                  </div>
-                ))}
+          <div className="flex flex-1">
+            {weekStarts.map((w, i) => (
+              <div key={i} className="flex-1 border-l border-border px-1 py-1.5 text-center">
+                <div className="text-[10px] uppercase text-ink-muted">W{weekOfYear(w)}</div>
+                <div className="text-[11px] tabular text-ink-secondary">{weekRangeLabel(w)}</div>
+              </div>
+            ))}
           </div>
         </div>
 
-        {rows.map(({ employee, planByKey, segs, weekly, revealEvents }) => {
-          const laneCount = Math.max(1, ...segs.map((s) => s.lane + 1));
-          return (
-            <div key={employee.id} className="flex border-b border-border last:border-0">
-              <div style={{ width: NAME_COL }} className="sticky left-0 z-10 shrink-0 bg-surface px-4 py-2.5">
+        {rows.map(({ employee, weekly }) => (
+          <div key={employee.id} className="flex border-b border-border last:border-0">
+            <div style={{ width: NAME_COL }} className="sticky left-0 z-20 shrink-0 bg-surface px-4 py-2.5">
+              <EmployeeCapacityHover employee={employee}>
                 <p className="truncate text-sm font-medium text-ink">{employee.name}</p>
-                <p className="text-[11px] text-ink-muted">
-                  {weekly[0] ? `${weekly[0].scheduledHours}h / ${weekly[0].workingHours}h · wk ${weekly[0].weekNumber}` : ""}
-                </p>
-              </div>
-              <div className="relative flex-1">
-                <div className="absolute inset-0 flex">
-                  {mode === "twoWeek"
-                    ? days.map((d, i) => {
-                        const plan = planByKey.get(dateKey(d));
-                        const working = isWorkingDay(d);
-                        const tone = working && !plan?.onLeave ? loadTone(plan?.totalHours ?? 0, plan?.availableHours ?? 0) : { cell: "bg-brand-50/40" };
-                        return <div key={i} className={`flex-1 border-l border-border ${tone.cell} ${dateKey(d) === dateKey(today) ? "ring-1 ring-inset ring-brand-200" : ""}`} />;
-                      })
-                    : weekly.map((wk, i) => {
-                        const tone = loadTone(wk.scheduledHours, wk.workingHours);
-                        return <div key={i} className={`flex-1 border-l border-border ${tone.cell} ${wk.isCurrent ? "ring-1 ring-inset ring-brand-200" : ""}`} />;
-                      })}
-                </div>
-
-                {mode === "twoWeek" ? (
-                  <div className="relative" style={{ minHeight: laneCount * LANE_HEIGHT + 34 }}>
-                    {segs.map((seg) => {
-                      const left = (seg.startIdx / TWO_WEEK_DAYS) * 100;
-                      const width = ((seg.endIdx - seg.startIdx + 1) / TWO_WEEK_DAYS) * 100;
-                      const status = seg.item.overdue
-                        ? "Overdue"
-                        : seg.item.deadlineUnreachable
-                          ? "Deadline risk"
-                          : seg.item.blockedByDependency
-                            ? "Waiting on dependency"
-                            : seg.item.isCoverage
-                              ? `Covering for ${seg.item.coverageOwnerName ?? ""}`
-                              : seg.item.status === "On Hold"
-                                ? "On Hold"
-                                : "In Progress";
-                      return (
-                        <div
-                          key={seg.item.key}
-                          title={`${seg.item.title} · ${seg.item.dailyHours}h/day · ${status} · due ${seg.item.deadline.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`}
-                          style={{ left: `${left}%`, width: `calc(${width}% - 4px)`, marginLeft: 2, top: seg.lane * LANE_HEIGHT + 6 }}
-                          className={`absolute flex h-[22px] items-center gap-1 overflow-hidden whitespace-nowrap rounded-md border px-1.5 text-[11px] font-medium ${itemTone(seg.item)}`}
-                        >
-                          {seg.item.isCoverage && <Repeat2 className="h-3 w-3 shrink-0" />}
-                          <span className="truncate">{seg.item.title}</span>
-                          <span className="shrink-0 tabular opacity-80">{seg.item.dailyHours}h</span>
-                        </div>
-                      );
-                    })}
-
-                    <div className="absolute inset-x-0 bottom-0 flex">
-                      {days.map((d, i) => {
-                        const plan = planByKey.get(dateKey(d));
-                        if (!isWorkingDay(d)) return <div key={i} className="flex-1" />;
-                        if (plan?.onLeave)
-                          return (
-                            <div key={i} className="flex-1 border-l border-border/50 py-0.5 text-center text-[10px] font-medium text-[var(--status-warning)]">
-                              Leave
-                            </div>
-                          );
-                        const tone = loadTone(plan?.totalHours ?? 0, plan?.availableHours ?? 0);
-                        return (
-                          <div key={i} className="flex-1 border-l border-border/50 py-0.5 text-center">
-                            <span className={`text-[10px] font-semibold tabular ${tone.text}`}>{plan?.totalHours ?? 0}</span>
-                            {plan && plan.eventHours > 0 && (
-                              <span
-                                className="ml-0.5 inline-flex items-center text-purple-500"
-                                title={
-                                  revealEvents
-                                    ? plan.calendarEvents.map((e) => `${e.title} ${e.startTime}–${e.endTime}`).join(", ")
-                                    : `${plan.eventHours}h personal time`
-                                }
-                              >
-                                <CalendarClock className="h-2.5 w-2.5" />
-                              </span>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                    {segs.length === 0 && (
-                      <span className="pointer-events-none absolute left-2 top-2 text-[11px] text-ink-muted/70">No scheduled work in this window</span>
-                    )}
-                  </div>
-                ) : (
-                  <div className="relative flex" style={{ minHeight: 52 }}>
-                    {weekly.map((wk, i) => {
-                      const tone = loadTone(wk.scheduledHours, wk.workingHours);
-                      return (
-                        <div key={i} className="flex flex-1 flex-col items-center justify-center border-l border-border/50 py-2">
-                          <span className={`text-sm font-semibold tabular ${tone.text}`}>{wk.scheduledHours}h</span>
-                          <span className="text-[10px] text-ink-muted">of {wk.workingHours}h · {wk.utilization}%</span>
-                          <span className="text-[10px] text-ink-muted">{wk.taskCount} task{wk.taskCount === 1 ? "" : "s"}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+              </EmployeeCapacityHover>
+              <p className="text-[11px] text-ink-muted">
+                {weekly[0] ? `${weekly[0].scheduledHours}h / ${weekly[0].workingHours}h · wk ${weekly[0].weekNumber}` : ""}
+              </p>
             </div>
-          );
-        })}
+            <div className="flex flex-1">
+              {weekly.map((wk, i) => {
+                const tone = loadTone(wk.scheduledHours, wk.workingHours);
+                return (
+                  <div
+                    key={i}
+                    className={`flex flex-1 flex-col items-center justify-center border-l border-border/50 py-2 ${tone.cell} ${wk.isCurrent ? "ring-1 ring-inset ring-brand-200" : ""}`}
+                  >
+                    <span className={`text-sm font-semibold tabular ${tone.text}`}>{wk.scheduledHours}h</span>
+                    <span className="text-[10px] text-ink-muted">
+                      of {wk.workingHours}h · {wk.utilization}%
+                    </span>
+                    <span className="text-[10px] text-ink-muted">
+                      {wk.taskCount} task{wk.taskCount === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );

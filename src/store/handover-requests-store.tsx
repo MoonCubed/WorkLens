@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
 import type { LeaveEvent } from "@/data/types";
 import { supabase } from "@/lib/supabase";
+import { todayLabel } from "@/lib/date";
 import { useSupabaseTable } from "./use-supabase-table";
 
 const TABLE = "handover_requests";
@@ -24,6 +25,8 @@ const SEED_REQUESTS: HandoverRequest[] = [
   },
 ];
 
+export type HandoverStatus = "Pending Supervisor Review" | "Approved" | "Rejected";
+
 export interface HandoverRequest {
   id: string;
   employeeId: string;
@@ -33,8 +36,15 @@ export interface HandoverRequest {
   startDate: string;
   endDate: string;
   affectedWork: string[];
-  status: "Pending Supervisor Review" | "Reviewed";
+  /** The supervisor's actual decision — never a generic "Reviewed". Rows written by an
+   * earlier build may still carry the legacy "Reviewed" value; the UI treats that as a
+   * decided-but-unspecified outcome. */
+  status: HandoverStatus | "Reviewed";
   submittedAt: string;
+  /** Set when the supervisor decides. */
+  reviewedAt?: string | null;
+  /** The supervisor's justification — required on a rejection, shown to the employee. */
+  decisionNote?: string | null;
   /** The handover workflow uses the single generic type "Leave"; approving a request
    * (see the supervisor's Handover page) adds a matching "Leave" entry to the
    * employee's `leaveEvents`, which is what the calendar and HR's Employee Calendar
@@ -50,7 +60,9 @@ interface HandoverRequestsContextValue {
   loading: boolean;
   error: string | null;
   submitRequest: (input: Omit<HandoverRequest, "id" | "status" | "submittedAt">) => Promise<void>;
-  markReviewed: (id: string) => Promise<void>;
+  /** Record the supervisor's decision. A rejection must carry a justification; it is
+   * stored on the request and shown to the employee. */
+  resolve: (id: string, decision: "Approved" | "Rejected", decisionNote?: string) => Promise<void>;
 }
 
 const HandoverRequestsContext = createContext<HandoverRequestsContextValue | null>(null);
@@ -73,9 +85,12 @@ export function HandoverRequestsProvider({ children }: { children: ReactNode }) 
     [refetch]
   );
 
-  const markReviewed = useCallback(
-    async (id: string) => {
-      const { error: updateError } = await supabase.from(TABLE).update({ status: "Reviewed" }).eq("id", id);
+  const resolve = useCallback(
+    async (id: string, decision: "Approved" | "Rejected", decisionNote?: string) => {
+      const { error: updateError } = await supabase
+        .from(TABLE)
+        .update({ status: decision, decisionNote: decisionNote?.trim() || null, reviewedAt: todayLabel() })
+        .eq("id", id);
       if (updateError) throw updateError;
       await refetch();
     },
@@ -83,8 +98,8 @@ export function HandoverRequestsProvider({ children }: { children: ReactNode }) 
   );
 
   const value = useMemo(
-    () => ({ requests, loading, error, submitRequest, markReviewed }),
-    [requests, loading, error, submitRequest, markReviewed]
+    () => ({ requests, loading, error, submitRequest, resolve }),
+    [requests, loading, error, submitRequest, resolve]
   );
 
   return <HandoverRequestsContext.Provider value={value}>{children}</HandoverRequestsContext.Provider>;

@@ -31,6 +31,7 @@ import {
 import { ticketDueLabel, adhocDueLabel } from "@/lib/due";
 import { availableCapacity } from "@/lib/capacity";
 import type { CalendarEvent } from "@/store/calendar-events-store";
+import { OVERLOAD_THRESHOLD } from "@/data/config";
 
 export interface WorkLogLookup {
   (key: string): {
@@ -311,8 +312,15 @@ export interface ScheduledWorkItem {
    * even while held (those days are simply all after `heldUntil`). Empty only when
    * there is genuinely nothing to schedule (no remaining hours). */
   workingDayKeys: string[];
-  /** `remainingHours ÷ workingDayKeys.length` — the even per-day distribution. */
+  /** `remainingHours ÷ workingDayKeys.length` — the even per-day AVERAGE. Kept for
+   * simple "≈Xh/day" displays; the real, possibly uneven, per-day amount is `dayHours`. */
   dailyHours: number;
+  /** The real hours landing on each of `workingDayKeys`, keyed by date. Starts as the
+   * even `dailyHours` split, then — for non-fixed items — is reshaped by
+   * `applyRoomAwareDistribution` to favour days/weeks where the employee actually has
+   * spare capacity over ones already full, without ever moving work past its deadline
+   * or changing the total. Always sums to ~`remainingHours`. */
+  dayHours: Record<string, number>;
 }
 
 export interface DayAllocation {
@@ -424,12 +432,14 @@ function buildScheduledItem(params: {
   const extra = { blockedByDependency, dependencyTitle: blockedByDependency ? dependencyTitle : null, remainingOverridden, isCoverage, coverageOwnerName, coveredAway };
 
   if (remainingHours <= 0) {
-    return { ...rest, ...extra, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable: false, overdue: false, workingDayKeys: [], dailyHours: 0 };
+    return { ...rest, ...extra, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable: false, overdue: false, workingDayKeys: [], dailyHours: 0, dayHours: {} };
   }
 
-  // A coverage item runs on its frozen days at the owner's original rate.
+  // A coverage item runs on its frozen days at the owner's original rate — fixed, and
+  // deliberately excluded from the room-aware reshaping pass below.
   if (forceDayKeys) {
     const keys = forceDayKeys.slice();
+    const rate = keys.length ? Math.round((remainingHours / keys.length) * 100) / 100 : 0;
     return {
       ...rest,
       ...extra,
@@ -440,7 +450,8 @@ function buildScheduledItem(params: {
       deadlineUnreachable: false,
       overdue: false,
       workingDayKeys: keys,
-      dailyHours: keys.length ? Math.round((remainingHours / keys.length) * 100) / 100 : 0,
+      dailyHours: rate,
+      dayHours: Object.fromEntries(keys.map((k) => [k, rate])),
     };
   }
 
@@ -452,13 +463,16 @@ function buildScheduledItem(params: {
   if (deadlineUnreachable) workingDayKeys = [dateKey(from)];
 
   const overdue = !heldNow && deadline.getTime() < today.getTime();
-  // The per-day rate is fixed by the full plan; handing some days to a cover removes
-  // them from this schedule without compressing what's left onto fewer days.
+  // The baseline even rate — `applyRoomAwareDistribution` (run once per employee, after
+  // every item is built) reshapes `dayHours` from this to favour days/weeks with spare
+  // capacity; this average is kept for simple "≈Xh/day" displays. Handing some days to
+  // a cover removes them from this schedule without compressing what's left onto fewer days.
   const dailyHours = Math.round((remainingHours / workingDayKeys.length) * 100) / 100;
   if (excludeDayKeys && excludeDayKeys.size > 0) {
     workingDayKeys = workingDayKeys.filter((k) => !excludeDayKeys.has(k));
   }
-  return { ...rest, ...extra, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable, overdue, workingDayKeys, dailyHours };
+  const dayHours = Object.fromEntries(workingDayKeys.map((k) => [k, dailyHours]));
+  return { ...rest, ...extra, heldUntil, heldNow, resumesOn, resumedFromHold, deadlineUnreachable, overdue, workingDayKeys, dailyHours, dayHours };
 }
 
 /** Display progress for an item — the employee-logged remaining figure, expressed as a
@@ -470,50 +484,161 @@ function progressForItem(estimate: number, progress: number | undefined, remaini
   return Math.min(100, Math.max(0, progress ?? 0));
 }
 
-/**
- * The frozen day-by-day plan for handing a ticket to a cover during the owner's leave.
- * Takes the OWNER's real deadline-driven schedule for the ticket, keeps its per-day
- * rate, and returns just the working days that fall inside `[leaveStart, leaveEnd]`.
- * The cover carries exactly this — the same planned daily workload the owner had for
- * those days — so temporarily changing who does the work never compresses the schedule.
- */
-export function computeCoveragePlan(
-  owner: Employee,
-  ticket: AssignedTicket,
-  getEntry: WorkLogLookup,
-  leaveStart: Date,
-  leaveEnd: Date
-): { allocations: { dateKey: string; hours: number }[]; hours: number; dailyHours: number } {
-  if (isItemComplete(undefined, ticket.status)) return { allocations: [], hours: 0, dailyHours: 0 };
-  const entry = getEntry(`${owner.id}:${ticket.id}`);
-  const effort = ticketEffortForEmployee(ticket, owner.id);
-  const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
-  const remaining = itemRemainingHours(effort, false, entry.progress, override);
-  if (remaining <= 0) return { allocations: [], hours: 0, dailyHours: 0 };
+// ============================================================================
+// Room-aware distribution — the "capacity across the whole future period" pass.
+//
+// Every item starts with the even `dailyHours` split (above). This pass then reshapes
+// each FLEXIBLE item's `dayHours` — never its total, never past its deadline, never
+// before today — to prefer days where the employee actually has spare capacity that
+// day over days already full from their OTHER work, instead of blindly spreading
+// every item's hours uniformly regardless of what else is scheduled. An employee
+// pinned at capacity this week but with room next week naturally has new work land
+// mostly next week; an employee with genuinely no room anywhere before a deadline
+// still gets the plain even split (the existing overload/at-risk signal stays visible
+// — nothing is hidden by the reshaping).
+//
+// Fixed items (turnover coverage, `isCoverage`) are a frozen commitment agreed at
+// acceptance time — they still occupy their days (reducing room for everyone else that
+// day) but are never themselves reshaped.
+//
+// Processing order is earliest-deadline-first: the most time-pressured item gets first
+// claim on near-term room, and items with more slack naturally get pushed toward
+// whatever room is left — which is exactly "prefer future capacity when there is any".
+// ============================================================================
 
-  const today = todayStart();
-  let from = itemStartDate(ticket.raisedDate);
-  if (from < today) from = today;
-  const heldUntil = ticket.status === "On Hold" && ticket.holdEndDate ? parseLooseDate(ticket.holdEndDate) : null;
-  if (heldUntil) {
-    const after = addDays(heldUntil, 1);
-    if (after > from) from = after;
+const ITEM_PRIORITY_RANK: Record<ScheduledWorkItem["priority"], number> = { High: 0, Medium: 1, Low: 2 };
+
+function applyRoomAwareDistribution(employee: Employee, items: ScheduledWorkItem[], events: CalendarEvent[]): void {
+  const active = items.filter((i) => i.remainingHours > 0 && i.workingDayKeys.length > 0);
+  if (active.length === 0) return;
+
+  const perDay = (employee.weeklyHours || 40) / 5;
+  const ceilingCache = new Map<string, number>();
+  function ceiling(key: string): number {
+    let val = ceilingCache.get(key);
+    if (val === undefined) {
+      const date = dateFromKey(key);
+      val = isOnLeaveDate(employee, date) ? 0 : Math.max(0, Math.round((perDay - calendarEventHoursOn(events, employee.id, date)) * 100) / 100);
+      ceilingCache.set(key, val);
+    }
+    return val;
   }
-  const deadline = resolveDueDate(ticket.expectedResolutionDate, ticket.priority, ticket.raisedDate);
-  const allKeys = deadline < from ? [dateKey(from)] : scheduledWorkingDayKeys(from, deadline, owner);
-  const rate = allKeys.length ? Math.round((remaining / allKeys.length) * 100) / 100 : 0;
 
-  const ls = new Date(leaveStart.getFullYear(), leaveStart.getMonth(), leaveStart.getDate());
-  const le = new Date(leaveEnd.getFullYear(), leaveEnd.getMonth(), leaveEnd.getDate());
-  const coveredKeys = allKeys.filter((k) => {
-    const d = dateFromKey(k);
-    return d >= ls && d <= le;
+  // Hours already claimed on each day, across items processed so far.
+  const used = new Map<string, number>();
+
+  // Fixed commitments claim their days first but are never themselves redistributed.
+  const fixed = active.filter((i) => i.isCoverage);
+  const flexible = active.filter((i) => !i.isCoverage);
+  fixed.forEach((item) => {
+    item.workingDayKeys.forEach((key) => used.set(key, (used.get(key) ?? 0) + (item.dayHours[key] ?? item.dailyHours)));
   });
-  return {
-    allocations: coveredKeys.map((k) => ({ dateKey: k, hours: rate })),
-    hours: Math.round(rate * coveredKeys.length * 10) / 10,
-    dailyHours: rate,
-  };
+
+  // Earliest deadline first (ties: higher priority, then key) — the most time-pressured
+  // work gets first claim on near-term room; looser-deadline work gets what's left,
+  // which naturally lands more in the future when the near term is already full.
+  flexible.sort(
+    (a, b) =>
+      a.deadline.getTime() - b.deadline.getTime() ||
+      ITEM_PRIORITY_RANK[a.priority] - ITEM_PRIORITY_RANK[b.priority] ||
+      a.key.localeCompare(b.key)
+  );
+
+  // Distributes `hours` across a subset of the item's days, proportionally to each
+  // day's room, with the last day absorbing rounding drift so the total is exact.
+  function proportionalSplit(days: string[], rooms: number[], totalRoom: number, hours: number): Record<string, number> {
+    const out: Record<string, number> = {};
+    let assigned = 0;
+    days.forEach((key, idx) => {
+      const share =
+        idx === days.length - 1
+          ? Math.round((hours - assigned) * 100) / 100
+          : Math.round((hours * (rooms[idx] / totalRoom)) * 100) / 100;
+      out[key] = Math.max(0, share);
+      assigned += out[key];
+    });
+    return out;
+  }
+
+  flexible.forEach((item) => {
+    const rooms = item.workingDayKeys.map((key) => Math.max(0, Math.round((ceiling(key) - (used.get(key) ?? 0)) * 100) / 100));
+    const totalRoom = Math.round(rooms.reduce((s, r) => s + r, 0) * 100) / 100;
+
+    // Prefer weeks that AREN'T already loaded to the overload threshold (from more
+    // urgent work claimed so far) over ones that are — "an employee at capacity this
+    // week may still be a good candidate if they have room before the deadline" means
+    // new flexible work should skip a full week entirely when a calmer one is available,
+    // not just nudge the full week a little higher.
+    const weekOf = (key: string) => dateKey(startOfWeek(dateFromKey(key)));
+    const weekLoad = new Map<string, { used: number; capacity: number }>();
+    item.workingDayKeys.forEach((key) => {
+      const wk = weekOf(key);
+      const entry = weekLoad.get(wk) ?? { used: 0, capacity: 0 };
+      entry.used += used.get(key) ?? 0;
+      entry.capacity += ceiling(key);
+      weekLoad.set(wk, entry);
+    });
+    const comfortable = (key: string) => {
+      const load = weekLoad.get(weekOf(key));
+      return !load || load.capacity <= 0 || load.used / load.capacity < OVERLOAD_THRESHOLD / 100;
+    };
+
+    let dayHours: Record<string, number>;
+    const comfortableIdx = item.workingDayKeys.map((k, i) => (comfortable(k) ? i : -1)).filter((i) => i >= 0);
+    const comfortableRoom = Math.round(comfortableIdx.reduce((s, i) => s + rooms[i], 0) * 100) / 100;
+
+    if (comfortableRoom >= item.remainingHours - 0.05 && comfortableIdx.length > 0 && comfortableIdx.length < item.workingDayKeys.length) {
+      // Calmer weeks in the window have enough room on their own — keep the already-busy
+      // week(s) at zero for this item and land the work entirely in the calmer time.
+      const days = comfortableIdx.map((i) => item.workingDayKeys[i]);
+      const dayRooms = comfortableIdx.map((i) => rooms[i]);
+      dayHours = {};
+      item.workingDayKeys.forEach((k) => (dayHours[k] = 0));
+      Object.assign(dayHours, proportionalSplit(days, dayRooms, comfortableRoom, item.remainingHours));
+    } else if (totalRoom >= item.remainingHours - 0.05 && totalRoom > 0) {
+      // No single calmer subset covers it — spread across the whole window by room,
+      // which still favours whatever slack exists over already-full days.
+      dayHours = proportionalSplit(item.workingDayKeys, rooms, totalRoom, item.remainingHours);
+    } else {
+      // No genuine slack anywhere in the window (even spread across the whole thing
+      // wouldn't fit) — keep the plain even split so overload stays visible rather
+      // than being hidden by an attempted reshape.
+      dayHours = { ...item.dayHours };
+    }
+
+    item.workingDayKeys.forEach((key) => used.set(key, (used.get(key) ?? 0) + (dayHours[key] ?? 0)));
+    // Drop any day the reshape left at zero — `workingDayKeys` means "days this item
+    // actually has hours on" everywhere else in the app (week membership, turnover
+    // day counts, calendar rows), so a day it no longer touches shouldn't linger in it.
+    item.workingDayKeys = item.workingDayKeys.filter((key) => (dayHours[key] ?? 0) > 0.01);
+    item.dayHours = dayHours;
+  });
+}
+
+/**
+ * The hours one already-scheduled item (real ticket or ad-hoc work) contributes on
+ * each working day within `[start, end]` — read straight from its actual, real
+ * schedule (`item.dayHours`, after room-aware distribution), never recomputed
+ * separately. Used to freeze a turnover coverage plan onto exactly the owner's real
+ * planned days/hours for the leave window, and to show "planned effort during the
+ * leave" for any affected item — so a cover always receives precisely what the owner
+ * would actually have done those days, never a compressed or re-derived approximation.
+ */
+export function itemHoursInRange(
+  item: ScheduledWorkItem,
+  start: Date,
+  end: Date
+): { allocations: { dateKey: string; hours: number }[]; hours: number } {
+  const s = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const e = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  const allocations = item.workingDayKeys
+    .filter((k) => {
+      const d = dateFromKey(k);
+      return d >= s && d <= e;
+    })
+    .sort()
+    .map((k) => ({ dateKey: k, hours: item.dayHours[k] ?? item.dailyHours }));
+  return { allocations, hours: Math.round(allocations.reduce((sum, a) => sum + a.hours, 0) * 10) / 10 };
 }
 
 /** The task schedule for one employee — see the block comment above. `events` (the
@@ -635,6 +760,12 @@ export function computeEmployeeSchedule(
     );
   });
 
+  // Reshape each item's day-by-day hours to favour days/weeks where this employee
+  // actually has spare capacity over ones already full from their other work — see
+  // the block comment above `applyRoomAwareDistribution`. Totals, deadlines and the
+  // held/coverage/dependency windows already computed above are never changed by this.
+  applyRoomAwareDistribution(employee, items, events);
+
   // Everything not currently paused by an active hold window — used where "what's
   // being worked right now" matters (a held task's hours still appear on their
   // scheduled future days regardless).
@@ -644,7 +775,7 @@ export function computeEmployeeSchedule(
   items.forEach((item) => {
     item.workingDayKeys.forEach((k) => {
       const list = byDay.get(k) ?? [];
-      list.push({ item, hours: item.dailyHours });
+      list.push({ item, hours: item.dayHours[k] ?? item.dailyHours });
       byDay.set(k, list);
     });
   });
@@ -693,11 +824,11 @@ export function computeEmployeeSchedule(
   const currentWeekHoursByKey = new Map<string, number>();
   let weeklyScheduledHours = 0;
   items.forEach((item) => {
-    const inWeek = item.workingDayKeys.filter((k) => {
+    const inWeekKeys = item.workingDayKeys.filter((k) => {
       const d = dateFromKey(k);
       return d >= weekStart && d <= weekEnd;
-    }).length;
-    const hrs = Math.round(item.dailyHours * inWeek * 100) / 100;
+    });
+    const hrs = Math.round(inWeekKeys.reduce((s, k) => s + (item.dayHours[k] ?? item.dailyHours), 0) * 100) / 100;
     currentWeekHoursByKey.set(item.key, hrs);
     weeklyScheduledHours += hrs;
   });
@@ -906,11 +1037,10 @@ export function scheduledHoursBetween(schedule: EmployeeSchedule, start: Date, e
   const e = new Date(end.getFullYear(), end.getMonth(), end.getDate());
   let hours = 0;
   schedule.items.forEach((item) => {
-    const inRange = item.workingDayKeys.filter((k) => {
+    item.workingDayKeys.forEach((k) => {
       const d = dateFromKey(k);
-      return d >= s && d <= e;
-    }).length;
-    hours += item.dailyHours * inRange;
+      if (d >= s && d <= e) hours += item.dayHours[k] ?? item.dailyHours;
+    });
   });
   return Math.round(hours * 10) / 10;
 }
@@ -922,12 +1052,12 @@ function scheduledHoursInWeek(schedule: EmployeeSchedule, weekStart: Date, weekE
   // land in whatever week they fall in, so its hours show up from the resume week on
   // and are absent from the weeks it's held.
   schedule.items.forEach((item) => {
-    const inWeek = item.workingDayKeys.filter((k) => {
+    const inWeekKeys = item.workingDayKeys.filter((k) => {
       const d = dateFromKey(k);
       return d >= weekStart && d <= weekEnd;
-    }).length;
-    if (inWeek > 0) {
-      hours += item.dailyHours * inWeek;
+    });
+    if (inWeekKeys.length > 0) {
+      hours += inWeekKeys.reduce((s, k) => s + (item.dayHours[k] ?? item.dailyHours), 0);
       taskCount += 1;
     }
   });
@@ -1024,9 +1154,47 @@ export function projectedUtilization(
   return Math.round(((activeHours + Math.max(0, extraWeeklyHours)) / denom) * 100);
 }
 
-/** Resulting utilization if `employee` picked up `ticket` — the ticket's deadline-driven
- * weekly load added on top of their current capacity. Already-assigned tickets add nothing.
- * The single calculation behind every "After Assignment: N%" figure in the app. */
+/**
+ * The full weekly-utilization trajectory for `employee` if they took on `ticket` —
+ * built by cloning the ticket with the hypothetical assignment and running it through
+ * the EXACT SAME schedule/weekly-capacity engine as every other capacity figure (with
+ * the same room-aware distribution), so a candidate ranking or "before/after" warning
+ * can never disagree with what actually happens once the assignment is made. This is
+ * what lets an employee at capacity *this* week still be a good candidate when they
+ * have room before the ticket's deadline: the extra hours land wherever the engine
+ * would actually schedule them, not blindly onto the current week.
+ */
+export function projectedWeeklyTrajectoryForTicket(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  ticket: AssignedTicket,
+  events: CalendarEvent[] = [],
+  weeks = 8
+): { before: WeeklyCapacityPoint[]; after: WeeklyCapacityPoint[] } {
+  const before = computeEmployeeWeeklyCapacity(employee, tickets, getEntry, weeks, todayStart(), events);
+  const currentIds = ticket.assignedEmployeeIds ?? [];
+  const alreadyOwns = currentIds.includes(employee.id);
+
+  let hypothetical = tickets;
+  if (!alreadyOwns) {
+    const nextIds = Array.from(new Set([...currentIds, employee.id])).slice(0, 2);
+    const patched: AssignedTicket = { ...ticket, assignedEmployeeIds: nextIds };
+    if (nextIds.length === 2 && !ticket.effortSplit) {
+      const half = Math.round((ticket.estimatedHours / 2) * 10) / 10;
+      patched.effortSplit = Object.fromEntries(nextIds.map((id) => [id, half]));
+    }
+    hypothetical = tickets.some((t) => t.id === ticket.id)
+      ? tickets.map((t) => (t.id === ticket.id ? patched : t))
+      : [...tickets, patched];
+  }
+  const after = computeEmployeeWeeklyCapacity(employee, hypothetical, getEntry, weeks, todayStart(), events);
+  return { before, after };
+}
+
+/** The single-number "after this week" figure — the trajectory's first week, so it can
+ * never disagree with the fuller breakdown. The one calculation behind every "After
+ * Assignment: N%" figure in the app. */
 export function projectedUtilizationForTicket(
   employee: Employee,
   tickets: AssignedTicket[],
@@ -1034,13 +1202,8 @@ export function projectedUtilizationForTicket(
   ticket: AssignedTicket,
   events: CalendarEvent[] = []
 ): number {
-  const currentIds = ticket.assignedEmployeeIds ?? [];
-  if (currentIds.includes(employee.id)) return computeEmployeeCapacity(employee, tickets, getEntry, events).utilization;
-  // Effort this employee would carry: whole estimate as sole owner, half if joining
-  // someone already on it (the assign flows here replace, not co-assign, but be safe).
-  const effort = currentIds.length >= 1 ? Math.round((ticket.estimatedHours / 2) * 10) / 10 : ticket.estimatedHours;
-  const extra = ticketWeeklyRequiredHours(ticket, employee, effort);
-  return projectedUtilization(employee, tickets, getEntry, extra, events);
+  const { after } = projectedWeeklyTrajectoryForTicket(employee, tickets, getEntry, ticket, events, 1);
+  return after[0]?.utilization ?? employee.currentUtilization;
 }
 
 export interface EmployeeWorkItem {

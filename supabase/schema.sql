@@ -176,6 +176,13 @@ alter table handover_requests add column if not exists "leaveType" text not null
 -- only; the supervisor still makes the final assignment.
 alter table handover_requests add column if not exists "preferredEmployeeId" text;
 alter table handover_requests alter column "leaveType" set default 'Leave';
+-- The supervisor's decision is now recorded explicitly ("Approved" / "Rejected")
+-- rather than a generic "Reviewed", with the date and — for a rejection — the
+-- required justification the employee sees. Rows written by an earlier build keep
+-- their legacy "Reviewed" status; the UI treats it as a decided-but-unspecified
+-- outcome and never writes it again. Safe to re-run.
+alter table handover_requests add column if not exists "reviewedAt" text;
+alter table handover_requests add column if not exists "decisionNote" text;
 
 create table if not exists work_log_entries (
   "employeeId" text not null,
@@ -302,6 +309,11 @@ create table if not exists day_plans (
   note text not null default '',
   "createdAt" text not null
 );
+-- Plan My Day blocks now carry a start/end time (30-min grid) inside `allocations`
+-- (jsonb — no column change). `confirmedAt` is stamped once the employee runs the
+-- end-of-day "did you work these hours?" check and the confirmed hours have been
+-- added to each task's actual effort. Safe to re-run.
+alter table day_plans add column if not exists "confirmedAt" text;
 
 -- Task adjustment requests — an employee asks their supervisor to extend a deadline,
 -- change the estimated effort, revisit an assignment, etc. The supervisor reviews on
@@ -338,6 +350,9 @@ create table if not exists skill_change_requests (
 -- Migration for projects that already ran an earlier version of this file, before the
 -- employee could attach a justification to a skill-change request. Safe to re-run.
 alter table skill_change_requests add column if not exists justification text not null default '';
+-- The supervisor's justification when they REJECT a skill-change request — required
+-- on rejection and shown to the employee. Safe to re-run.
+alter table skill_change_requests add column if not exists "decisionNote" text;
 
 -- ============================================================================
 -- Row Level Security

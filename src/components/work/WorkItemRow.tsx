@@ -7,6 +7,7 @@ import type { WorkflowStatus } from "@/data/types";
 import { TICKET_STATUS_OPTIONS, type TicketStatus } from "@/data/tickets";
 import { getDueStatus, relativeDayLabel, type DueStatus } from "@/lib/date";
 import { unifiedItemStatus } from "@/lib/capacityEngine";
+import { snapHours } from "@/lib/increments";
 import { useWorkLog } from "@/store/work-log-store";
 import { CommentsThread } from "@/components/work/CommentsThread";
 import { StatusChangeDialog, type HoldDates } from "@/components/work/StatusChangeDialog";
@@ -59,6 +60,10 @@ export function WorkItemRow({
   const { getEntry, setWorkflowStatus, setProgress, setEffort } = useWorkLog();
   const entry = getEntry(row.key);
   const [expanded, setExpanded] = useState(false);
+  // Progress is now typed in as a number (0–100). While the field is being edited the
+  // draft holds the raw text; committed on blur / Enter (clamped + validated), then
+  // cleared so the field tracks the shared value again (incl. realtime updates).
+  const [progressDraft, setProgressDraft] = useState<string | null>(null);
   // A move into Completed / On Hold is confirmed first (see StatusChangeDialog).
   const [pending, setPending] = useState<"Completed" | "On Hold" | null>(null);
 
@@ -211,18 +216,47 @@ export function WorkItemRow({
             <div className="mb-4">
               <div className="mb-1.5 flex items-center justify-between text-xs">
                 <span className="font-medium uppercase tracking-wide text-ink-secondary">Progress</span>
-                <span className="tabular font-medium text-ink">{progress}% · {remainingHours}h remaining of {row.estimatedHours}h</span>
+                <span className="tabular font-medium text-ink">{remainingHours}h remaining of {row.estimatedHours}h</span>
               </div>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={5}
-                value={progress}
-                onChange={(e) => setProgress(row.key, Number(e.target.value)).catch(() => {})}
-                className="w-full accent-brand-700"
-              />
-              {isTicket && <p className="mt-1 text-xs text-ink-muted">Your own progress on this ticket — shared with anyone else assigned to it.</p>}
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-1.5 text-xs text-ink-secondary">
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={progressDraft ?? String(progress)}
+                    onChange={(e) => setProgressDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                    }}
+                    onBlur={() => {
+                      if (progressDraft === null) return;
+                      const n = Math.max(0, Math.min(100, Math.round(Number(progressDraft) || 0)));
+                      setProgressDraft(null);
+                      if (n !== (entry.progress ?? 0)) setProgress(row.key, n).catch(() => {});
+                    }}
+                    className="input w-16 py-1 text-center text-sm tabular"
+                    aria-label="Progress percent"
+                  />
+                  <span className="font-medium">%</span>
+                </label>
+                {/* Visual bar — a read-out of the number above, not the input control. */}
+                <div
+                  className="h-2 flex-1 overflow-hidden rounded-full bg-brand-100"
+                  role="progressbar"
+                  aria-valuenow={progress}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div className="h-full rounded-full bg-brand-700 transition-all" style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} />
+                </div>
+              </div>
+              {progressDraft !== null && (Number(progressDraft) < 0 || Number(progressDraft) > 100) ? (
+                <p className="mt-1 text-xs font-medium text-[var(--status-critical)]">Enter a value between 0 and 100.</p>
+              ) : isTicket ? (
+                <p className="mt-1 text-xs text-ink-muted">Your own progress on this ticket — shared with anyone else assigned to it.</p>
+              ) : null}
 
               <div className="mt-3 grid grid-cols-2 gap-3">
                 <label className="block">
@@ -235,7 +269,9 @@ export function WorkItemRow({
                     placeholder="—"
                     onBlur={(e) => {
                       const v = e.target.value.trim();
-                      setEffort(row.key, { actualHours: v === "" ? null : Number(v) }).catch(() => {});
+                      const snapped = v === "" ? null : snapHours(Number(v));
+                      if (snapped != null) e.target.value = String(snapped);
+                      setEffort(row.key, { actualHours: snapped }).catch(() => {});
                     }}
                     className="input py-1.5 text-xs"
                   />
@@ -250,7 +286,9 @@ export function WorkItemRow({
                     placeholder={`${Math.round(row.estimatedHours * (1 - progress / 100) * 10) / 10} (from progress)`}
                     onBlur={(e) => {
                       const v = e.target.value.trim();
-                      setEffort(row.key, { remainingHours: v === "" ? null : Number(v) }).catch(() => {});
+                      const snapped = v === "" ? null : snapHours(Number(v));
+                      if (snapped != null) e.target.value = String(snapped);
+                      setEffort(row.key, { remainingHours: snapped }).catch(() => {});
                     }}
                     className="input py-1.5 text-xs"
                   />

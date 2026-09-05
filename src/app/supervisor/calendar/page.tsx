@@ -27,7 +27,9 @@ export default function SupervisorCalendarPage() {
   const currentSupervisor = getDepartmentSupervisor(unit, employees);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
-  const [view, setView] = useState<"calendar" | "workload">("calendar");
+  // Workload View opens by default (Float-style, hour-by-hour) — the Calendar (month/
+  // week/day) view stays one click away via the toggle.
+  const [view, setView] = useState<"workload" | "calendar">("workload");
 
   const unitTickets = useMemo(() => ticketsForUnit(tickets, unit), [tickets, unit]);
   const detailTicket = openTicketId ? unitTickets.find((t) => t.id === openTicketId) ?? null : null;
@@ -98,15 +100,6 @@ export default function SupervisorCalendarPage() {
   const toggle = (
     <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1">
       <button
-        onClick={() => setView("calendar")}
-        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-          view === "calendar" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
-        }`}
-      >
-        <CalendarRange className="h-3.5 w-3.5" />
-        Calendar
-      </button>
-      <button
         onClick={() => setView("workload")}
         className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
           view === "workload" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
@@ -114,6 +107,15 @@ export default function SupervisorCalendarPage() {
       >
         <LayoutGrid className="h-3.5 w-3.5" />
         Workload
+      </button>
+      <button
+        onClick={() => setView("calendar")}
+        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+          view === "calendar" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+        }`}
+      >
+        <CalendarRange className="h-3.5 w-3.5" />
+        Calendar
       </button>
     </div>
   );

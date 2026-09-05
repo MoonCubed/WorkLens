@@ -8,10 +8,12 @@
 // skipped to avoid double-counting a unit's real tickets under two different systems.
 //
 // Turnover coverage is TIME-BOXED: the covering employee carries a ticket's planned
-// days only for the owner's leave window, at the owner's own per-day rate (see
-// `computeCoveragePlan` in capacityEngine). Candidates are therefore weighed against
-// their availability, leave, calendar events and existing scheduled workload ON THE
-// LEAVE DATES — not on today.
+// days only for the owner's leave window, at the owner's own per-day rate — read
+// straight from the owner's REAL schedule (`itemHoursInRange` in capacityEngine), which
+// already accounts for the owner's other work, calendar events and room-aware
+// distribution. Candidates are weighed against their availability, leave, calendar
+// events and existing scheduled workload (including any coverage already selected
+// elsewhere in this same turnover plan) ON THE LEAVE DATES — not on today.
 
 import type { Employee, Skill } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
@@ -19,6 +21,7 @@ import type { CalendarEvent } from "@/store/calendar-events-store";
 import {
   todayStart,
   parseLooseDate,
+  dateFromKey,
   getDueStatus,
   resolveDueDate,
   formatDisplayDate,
@@ -34,7 +37,7 @@ import {
   leaveWorkingDaysBetween,
   calendarEventHoursBetween,
   computeEmployeeSchedule,
-  computeCoveragePlan,
+  itemHoursInRange,
   scheduledHoursBetween,
   isOnLeaveDate,
   type WorkLogLookup,
@@ -125,7 +128,7 @@ export interface AbsenceImpact {
   deadlinesAtRisk: number;
   candidatesByItem: Map<string, CoverageCandidate[]>;
   /** The frozen coverage plan per affected ticket, ready to store on accept. */
-  coveragePlanByItem: Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number; dailyHours: number }>;
+  coveragePlanByItem: Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number }>;
   primaryCandidateId: string | null;
 }
 
@@ -212,30 +215,38 @@ export function plannedWorkOverlapsAbsence(
   return true;
 }
 
-/** All active work assigned to `employee` whose planned effort overlaps the leave. */
+/** All active work assigned to `employee` whose planned effort overlaps the leave.
+ * Reads planned effort straight off the employee's real schedule (`itemHoursInRange`)
+ * so "what needs covering" always matches what Daily Tasks / Calendar / Workload View
+ * show for those same days. */
 export function computeAffectedWork(
   employee: Employee,
   tickets: AssignedTicket[],
   start: Date,
   end: Date,
-  getEntry: WorkLogLookup
+  getEntry: WorkLogLookup,
+  events: CalendarEvent[] = []
 ): AffectedWorkItem[] {
   const workingDaysAffected = countWorkingDays(start, end);
   const hoursPerDay = (employee.weeklyHours || 40) / 5;
+  const ownerSchedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
+  const scheduledByKey = new Map(ownerSchedule.items.map((i) => [i.key, i] as const));
   const items: AffectedWorkItem[] = [];
 
   tickets
     .filter((t) => (t.assignedEmployeeIds ?? []).includes(employee.id) && t.status !== "Completed")
     .forEach((t) => {
-      const entry = getEntry(`${employee.id}:${t.id}`);
+      const key = `${employee.id}:${t.id}`;
+      const entry = getEntry(key);
       const effort = ticketEffortForEmployee(t, employee.id);
       const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
       const remaining = itemRemainingHours(effort, false, entry.progress, override);
       const due = resolveDueDate(t.expectedResolutionDate, t.priority, t.raisedDate);
       if (!plannedWorkOverlapsAbsence(remaining, itemStartDate(t.raisedDate), due, employee, start, end)) return;
 
-      const plan = computeCoveragePlan(employee, t, getEntry, start, end);
-      const covKeys = plan.allocations.map((a) => a.dateKey).sort();
+      const scheduled = scheduledByKey.get(key);
+      const plan = scheduled ? itemHoursInRange(scheduled, start, end) : { allocations: [], hours: 0 };
+      const covKeys = plan.allocations.map((a) => a.dateKey);
       const dueLabel = ticketDueLabel(t);
       const { risk, explanation } = assessRisk(dueLabel, start, end, remaining, hoursPerDay);
       items.push({
@@ -253,14 +264,15 @@ export function computeAffectedWork(
         riskExplanation: explanation,
         ticketId: t.id,
         coverageHours: plan.hours || Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
-        turnoverStart: covKeys[0] ? formatDisplayDate(parseLooseDate(covKeys[0])!) : null,
-        turnoverEnd: covKeys[covKeys.length - 1] ? formatDisplayDate(parseLooseDate(covKeys[covKeys.length - 1])!) : null,
+        turnoverStart: covKeys[0] ? formatDisplayDate(dateFromKey(covKeys[0])) : null,
+        turnoverEnd: covKeys[covKeys.length - 1] ? formatDisplayDate(dateFromKey(covKeys[covKeys.length - 1])) : null,
         turnoverWorkingDays: covKeys.length || workingDaysAffected,
       });
     });
 
   employee.adhoc.forEach((a) => {
-    const entry = getEntry(`${employee.id}:${a.id}`);
+    const key = `${employee.id}:${a.id}`;
+    const entry = getEntry(key);
     const override = typeof entry.remainingHours === "number" ? entry.remainingHours : null;
     const remaining = itemRemainingHours(a.estimatedHours, false, entry.progress, override);
     const dueDate = a.deadline === "Ongoing" ? null : adhocDueLabel(a);
@@ -270,8 +282,8 @@ export function computeAffectedWork(
         : plannedWorkOverlapsAbsence(remaining, todayStart(), resolveDueDate(a.deadline, a.priority), employee, start, end);
     if (!overlaps) return;
     const { risk, explanation } = assessRisk(dueDate, start, end, remaining, hoursPerDay);
-    // Ad-hoc work spreads evenly across the leave days at the person's per-day share.
-    const perDay = Math.round((remaining / Math.max(1, countWorkingDays(todayStart(), resolveDueDate(a.deadline === "Ongoing" ? null : a.deadline, a.priority)))) * 100) / 100;
+    const scheduled = scheduledByKey.get(key);
+    const plan = scheduled ? itemHoursInRange(scheduled, start, end) : { allocations: [], hours: 0 };
     items.push({
       id: a.id,
       title: a.name,
@@ -285,7 +297,7 @@ export function computeAffectedWork(
       overlapDays: workingDaysAffected,
       risk,
       riskExplanation: explanation,
-      coverageHours: Math.round(Math.min(remaining, perDay * workingDaysAffected) * 10) / 10,
+      coverageHours: plan.hours || Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
       turnoverStart: formatDisplayDate(start),
       turnoverEnd: formatDisplayDate(end),
       turnoverWorkingDays: workingDaysAffected,
@@ -473,14 +485,17 @@ export function computeAbsenceImpact(params: {
   if (!start || !end || start > end) return null;
 
   const peers = unitEmployees.filter((e) => e.id !== employee.id);
-  const affectedWork = computeAffectedWork(employee, tickets, start, end, getEntry);
+  const affectedWork = computeAffectedWork(employee, tickets, start, end, getEntry, events);
+  const ownerSchedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
+  const scheduledByKey = new Map(ownerSchedule.items.map((i) => [i.key, i] as const));
 
   const candidatesByItem = new Map<string, CoverageCandidate[]>();
-  const coveragePlanByItem = new Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number; dailyHours: number }>();
+  const coveragePlanByItem = new Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number }>();
   affectedWork.forEach((item) => {
     const ticket = item.ticketId ? tickets.find((t) => t.id === item.ticketId) : undefined;
     candidatesByItem.set(item.id, coverageCandidatesForItem(item, ticket, employee, peers, tickets, getEntry, events, start, end));
-    if (ticket) coveragePlanByItem.set(item.id, computeCoveragePlan(employee, ticket, getEntry, start, end));
+    const scheduled = scheduledByKey.get(`${employee.id}:${item.id}`);
+    if (ticket && scheduled) coveragePlanByItem.set(item.id, itemHoursInRange(scheduled, start, end));
   });
 
   const urgentItems = affectedWork.filter((i) => i.risk === "Critical" || i.risk === "High");

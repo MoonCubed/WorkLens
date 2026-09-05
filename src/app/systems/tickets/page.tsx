@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, ChevronRight, Plus, Download, X } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
@@ -12,7 +12,8 @@ import { getSourceSystem } from "@/data/systems";
 import type { Department } from "@/data/types";
 import { TICKETS_TOTAL_RECORDS } from "@/data/tickets";
 import { useTickets, type AssignedTicket } from "@/store/tickets-store";
-import { todayLabel, toInputDateValue, formatDisplayDate, slaWindowLabel, SLA_HOURS } from "@/lib/date";
+import { todayLabel, toInputDateValue, formatDisplayDate, slaWindowLabel, SLA_HOURS, parseLooseDate } from "@/lib/date";
+import { withErrorDetail } from "@/lib/errorMessage";
 
 const STATUS_STYLES: Record<string, string> = {
   "In Progress": "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning)]",
@@ -47,12 +48,56 @@ function exportTicketsCsv(tickets: AssignedTicket[]) {
   URL.revokeObjectURL(url);
 }
 
+const PAGE_SIZE = 10;
+type TicketFilter = "active" | "completed" | "all";
+const FILTER_LABEL: Record<TicketFilter, string> = { active: "Active", completed: "Completed", all: "All" };
+
 export default function TicketSystemPage() {
   const system = getSourceSystem("tickets");
   const { tickets, addTicket } = useTickets();
   const [showForm, setShowForm] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [exportNotice, setExportNotice] = useState(false);
+  // Active/incomplete requests only, by default. Completed work is never mixed into
+  // the active list — under "All" it sinks below everything active.
+  const [filter, setFilter] = useState<TicketFilter>("active");
+  const [visible, setVisible] = useState(PAGE_SIZE);
+
+  // Newest first — the most recently raised incident sits at the top. `activityAt`
+  // (an ISO timestamp on tickets created/changed in-app) breaks ties on the same
+  // calendar day; the raised-date label is the primary key.
+  const sortByNewest = (a: AssignedTicket, b: AssignedTicket) => {
+    const ms = (t: AssignedTicket) => parseLooseDate(t.raisedDate)?.getTime() ?? 0;
+    return (
+      ms(b) - ms(a) ||
+      (Date.parse(b.activityAt ?? "") || 0) - (Date.parse(a.activityAt ?? "") || 0) ||
+      b.id.localeCompare(a.id, undefined, { numeric: true })
+    );
+  };
+
+  const filteredTickets = useMemo(() => {
+    const active = tickets.filter((t) => t.status !== "Completed").sort(sortByNewest);
+    const done = tickets.filter((t) => t.status === "Completed").sort(sortByNewest);
+    if (filter === "active") return active;
+    if (filter === "completed") return done;
+    return [...active, ...done];
+  }, [tickets, filter]);
+
+  const counts = useMemo(
+    () => ({
+      active: tickets.filter((t) => t.status !== "Completed").length,
+      completed: tickets.filter((t) => t.status === "Completed").length,
+      all: tickets.length,
+    }),
+    [tickets]
+  );
+
+  const shownTickets = filteredTickets.slice(0, visible);
+
+  function setFilterAndReset(f: TicketFilter) {
+    setFilter(f);
+    setVisible(PAGE_SIZE);
+  }
 
   return (
     <SystemPageShell>
@@ -67,7 +112,7 @@ export default function TicketSystemPage() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => {
-                exportTicketsCsv(tickets);
+                exportTicketsCsv(filteredTickets);
                 setExportNotice(true);
                 window.setTimeout(() => setExportNotice(false), 3500);
               }}
@@ -89,14 +134,29 @@ export default function TicketSystemPage() {
 
       {exportNotice && (
         <div className="rounded-lg border border-[var(--status-good-border)] bg-[var(--status-good-bg)] px-4 py-3 text-sm text-[var(--status-good)]">
-          Exported {tickets.length} incidents to worklens-it-tickets.csv.
+          Exported {filteredTickets.length} incidents to worklens-it-tickets.csv.
         </div>
       )}
 
       <Card>
         <CardHeader
           title="Tickets"
-          subtitle={`Showing ${tickets.length} of ${TICKETS_TOTAL_RECORDS.toLocaleString()} synced records`}
+          subtitle={`${filteredTickets.length} ${filter === "all" ? "" : FILTER_LABEL[filter].toLowerCase() + " "}request${filteredTickets.length === 1 ? "" : "s"} · ${TICKETS_TOTAL_RECORDS.toLocaleString()} synced records`}
+          action={
+            <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1">
+              {(["active", "completed", "all"] as TicketFilter[]).map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setFilterAndReset(f)}
+                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                    filter === f ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+                  }`}
+                >
+                  {FILTER_LABEL[f]} <span className={filter === f ? "text-white/70" : "text-ink-muted"}>{counts[f]}</span>
+                </button>
+              ))}
+            </div>
+          }
         />
         <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full min-w-[880px] border-collapse text-sm">
@@ -113,7 +173,7 @@ export default function TicketSystemPage() {
               </tr>
             </thead>
             <tbody>
-              {tickets.map((t) => (
+              {shownTickets.map((t) => (
                 <ClickableRow key={t.id} href={`/systems/tickets/${t.id}`}>
                   <td className="px-4 py-3 tabular text-ink-secondary whitespace-nowrap">{t.id}</td>
                   <td className="px-4 py-3">
@@ -137,9 +197,40 @@ export default function TicketSystemPage() {
                   </td>
                 </ClickableRow>
               ))}
+              {shownTickets.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="px-4 py-8 text-center text-sm text-ink-muted">
+                    No {filter === "all" ? "" : FILTER_LABEL[filter].toLowerCase() + " "}requests.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
+        {filteredTickets.length > visible && (
+          <div className="mt-3 flex items-center justify-center gap-3">
+            <button
+              onClick={() => setVisible((v) => v + PAGE_SIZE)}
+              className="rounded-lg border border-border-strong bg-surface px-4 py-2 text-xs font-medium text-ink hover:bg-brand-50"
+            >
+              View More ({filteredTickets.length - visible} more)
+            </button>
+            <button
+              onClick={() => setVisible(filteredTickets.length)}
+              className="text-xs font-medium text-brand-700 hover:text-brand-800"
+            >
+              Show all {filteredTickets.length}
+            </button>
+          </div>
+        )}
+        {visible > PAGE_SIZE && filteredTickets.length <= visible && (
+          <button
+            onClick={() => setVisible(PAGE_SIZE)}
+            className="mt-3 w-full rounded-lg border border-border-strong bg-surface px-3 py-2 text-xs font-medium text-ink hover:bg-brand-50"
+          >
+            Show fewer
+          </button>
+        )}
       </Card>
 
       <SourceSystemNotice>
@@ -159,8 +250,9 @@ export default function TicketSystemPage() {
             try {
               await addTicket(input);
               setShowForm(false);
-            } catch {
-              setAddError("Couldn't save this incident — check your connection and try again.");
+            } catch (err) {
+              console.error("Failed to save the incident", err);
+              setAddError(withErrorDetail("Couldn't save this incident", err));
             }
           }}
         />

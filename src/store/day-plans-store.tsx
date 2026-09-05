@@ -15,17 +15,27 @@ import { nowLabel } from "@/lib/date";
 // skills) so a missing table degrades gracefully.
 const TABLE = "day_plans";
 
+export type DayPlanConfirm = "planned" | "partial" | "skipped";
+
 export interface DayPlanAllocation {
   /** The schedule item key ("<employeeId>:<itemId>") this allocation is for, or a
    * synthetic key for a calendar commitment. */
   key: string;
   title: string;
   hours: number;
+  /** Start / end of this block as 24h "HH:MM", on the 30-minute grid. Present on every
+   * plan built by the time-based planner; older rows may only have `hours`. */
+  startTime?: string | null;
+  endTime?: string | null;
   /** "In Progress" | "On Hold" | "Overdue" | "Deadline risk" | "Appointment" */
   status: string;
   ticketId?: string | null;
   /** Short "why this, this much, now" explanation shown next to the row. */
   reason?: string;
+  /** End-of-day confirmation: what actually happened with this block, and the hours
+   * the employee confirmed were worked (added to the task's actual effort). */
+  confirm?: DayPlanConfirm | null;
+  worked?: number | null;
 }
 
 export interface DayPlan {
@@ -37,6 +47,9 @@ export interface DayPlan {
   allocations: DayPlanAllocation[];
   note: string;
   createdAt: string;
+  /** Set once the employee has run the end-of-day "did you work these hours?" check
+   * and the confirmed hours have been written to each task's actual effort. */
+  confirmedAt?: string | null;
 }
 
 function planId(employeeId: string, date: string): string {
@@ -49,6 +62,9 @@ interface DayPlansContextValue {
   error: string | null;
   getPlan: (employeeId: string, date: string) => DayPlan | null;
   savePlan: (input: Omit<DayPlan, "id" | "createdAt">) => Promise<void>;
+  /** Merge a change into an existing plan (keeps `createdAt`) — used by the
+   * end-of-day worked-hours confirmation. */
+  patchPlan: (employeeId: string, date: string, patch: Partial<Omit<DayPlan, "id" | "employeeId" | "date">>) => Promise<void>;
   clearPlan: (employeeId: string, date: string) => Promise<void>;
 }
 
@@ -72,6 +88,19 @@ export function DayPlansProvider({ children }: { children: ReactNode }) {
     [refetch]
   );
 
+  const patchPlan = useCallback(
+    async (employeeId: string, date: string, patch: Partial<Omit<DayPlan, "id" | "employeeId" | "date">>) => {
+      const id = planId(employeeId, date);
+      const current = plans.find((p) => p.id === id);
+      if (!current) throw new Error("No saved plan to update for this day.");
+      const row: DayPlan = { ...current, ...patch, id, employeeId, date };
+      const { error: upsertError } = await supabase.from(TABLE).upsert(row, { onConflict: "id" });
+      if (upsertError) throw upsertError;
+      await refetch();
+    },
+    [plans, refetch]
+  );
+
   const clearPlan = useCallback(
     async (employeeId: string, date: string) => {
       const { error: deleteError } = await supabase.from(TABLE).delete().eq("id", planId(employeeId, date));
@@ -82,8 +111,8 @@ export function DayPlansProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ plans, loading, error, getPlan, savePlan, clearPlan }),
-    [plans, loading, error, getPlan, savePlan, clearPlan]
+    () => ({ plans, loading, error, getPlan, savePlan, patchPlan, clearPlan }),
+    [plans, loading, error, getPlan, savePlan, patchPlan, clearPlan]
   );
 
   return <DayPlansContext.Provider value={value}>{children}</DayPlansContext.Provider>;

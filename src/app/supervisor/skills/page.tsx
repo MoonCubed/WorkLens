@@ -14,6 +14,8 @@ import { useSkillChangeRequests, type SkillChangeRequest } from "@/store/skill-c
 import { getUnitTeam } from "@/lib/hr";
 import type { SkillRecord } from "@/data/skills";
 import type { Skill, SkillLevel } from "@/data/types";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { withErrorDetail } from "@/lib/errorMessage";
 
 const LEVEL_RANK: Record<SkillLevel, number> = { Expert: 0, Advanced: 1, Intermediate: 2, Beginner: 3 };
 const SKILL_LEVELS: SkillLevel[] = ["Beginner", "Intermediate", "Advanced", "Expert"];
@@ -25,6 +27,8 @@ export default function SupervisorSkillsPage() {
   const { unit } = useSupervisorSession();
   const { requests: skillChangeRequests, resolve: resolveSkillChange } = useSkillChangeRequests();
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const [pendingReview, setPendingReview] = useState<{ req: SkillChangeRequest; action: "Approved" | "Rejected" } | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
 
   const unitTeam = useMemo(() => getUnitTeam(unit, employees), [unit, employees]);
   const unitIds = useMemo(() => new Set(unitTeam.map((e) => e.id)), [unitTeam]);
@@ -71,7 +75,6 @@ export default function SupervisorSkillsPage() {
 
   /** Approve → apply the change to the employee's official skills, then mark reviewed. */
   async function approveSkillChange(req: SkillChangeRequest) {
-    setReviewError(null);
     const emp = employees.find((e) => e.id === req.employeeId);
     if (!emp) return;
     const lower = req.skillName.toLowerCase();
@@ -85,20 +88,34 @@ export default function SupervisorSkillsPage() {
         s.name.toLowerCase() === lower ? { ...s, level: (req.skillLevel ?? s.level) as SkillLevel } : s
       );
     }
-    try {
-      if (nextSkills !== emp.skills) await updateEmployee(emp.id, { skills: nextSkills });
-      await resolveSkillChange(req.id, "Approved");
-    } catch {
-      setReviewError("Couldn't apply this skill change — check your connection and try again.");
-    }
+    if (nextSkills !== emp.skills) await updateEmployee(emp.id, { skills: nextSkills });
+    await resolveSkillChange(req.id, "Approved");
   }
 
-  async function rejectSkillChange(req: SkillChangeRequest) {
+  /** Runs the confirmed approve/reject. The confirmation prompt gates this — nothing
+   * is written until the supervisor confirms in the dialog. A rejection must carry a
+   * justification, which is saved on the request and shown to the employee. */
+  async function runReview(reason?: string) {
+    if (!pendingReview) return;
+    const { req, action } = pendingReview;
+    if (action === "Rejected" && (!reason || !reason.trim())) {
+      setReviewError("A justification is required to reject a skill-change request.");
+      return;
+    }
     setReviewError(null);
+    setReviewBusy(true);
     try {
-      await resolveSkillChange(req.id, "Rejected");
-    } catch {
-      setReviewError("Couldn't reject this request — check your connection and try again.");
+      if (action === "Approved") await approveSkillChange(req);
+      else await resolveSkillChange(req.id, "Rejected", reason);
+      setPendingReview(null);
+    } catch (err) {
+      console.error(`Failed to ${action === "Approved" ? "approve" : "reject"} the skill change`, err);
+      setReviewError(
+        withErrorDetail(action === "Approved" ? "Couldn't apply this skill change" : "Couldn't reject this request", err)
+      );
+      setPendingReview(null);
+    } finally {
+      setReviewBusy(false);
     }
   }
 
@@ -245,13 +262,13 @@ export default function SupervisorSkillsPage() {
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <button
-                    onClick={() => rejectSkillChange(r)}
+                    onClick={() => setPendingReview({ req: r, action: "Rejected" })}
                     className="rounded-lg border border-border-strong bg-surface px-3 py-2 text-xs font-medium text-ink hover:bg-brand-50"
                   >
                     Reject
                   </button>
                   <button
-                    onClick={() => approveSkillChange(r)}
+                    onClick={() => setPendingReview({ req: r, action: "Approved" })}
                     className="rounded-lg bg-brand-800 px-3 py-2 text-xs font-semibold text-white hover:bg-brand-700"
                   >
                     Approve
@@ -435,6 +452,29 @@ export default function SupervisorSkillsPage() {
           })}
         </ul>
       </Card>
+
+      {pendingReview && (
+        <ConfirmDialog
+          title={pendingReview.action === "Approved" ? "Approve Skill Change?" : "Reject Skill Update?"}
+          tone={pendingReview.action === "Approved" ? "primary" : "danger"}
+          busy={reviewBusy}
+          confirmLabel={pendingReview.action === "Approved" ? "Approve" : "Reject"}
+          requireReason={pendingReview.action === "Rejected"}
+          reasonLabel="Justification"
+          reasonPlaceholder="e.g. Please provide evidence of the required certification before this skill can be approved."
+          body={
+            <>
+              <span className="font-medium text-ink">{nameFor(pendingReview.req.employeeId)}</span>{" "}
+              {describeChange(pendingReview.req)}.{" "}
+              {pendingReview.action === "Approved"
+                ? "Approving updates the employee's official skill record immediately."
+                : "The reason below is shown to the employee; their skills are not changed."}
+            </>
+          }
+          onConfirm={(reason) => runReview(reason)}
+          onCancel={() => setPendingReview(null)}
+        />
+      )}
     </div>
   );
 }

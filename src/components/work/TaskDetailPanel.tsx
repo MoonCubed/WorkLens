@@ -12,7 +12,9 @@ import { TICKET_STATUS_OPTIONS, type TicketStatus, type TicketPriority } from "@
 import { slaWindowLabel, isSlaDerived, toInputDateValue, formatDisplayDate } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
 import { ticketEffortForEmployee, holdEndPassed } from "@/lib/capacityEngine";
+import { useWorkLog } from "@/store/work-log-store";
 import type { AdjustmentKind } from "@/store/task-adjustments-store";
+import { EmployeeCapacityHover } from "@/components/employee/EmployeeCapacityHover";
 
 const PRIORITY_OPTIONS: TicketPriority[] = ["High", "Medium", "Low"];
 const MAX_ASSIGNEES = 2;
@@ -91,6 +93,21 @@ export function TaskDetailPanel({
 
   const dueLabel = ticketDueLabel(ticket);
   const slaDerived = isSlaDerived(ticket.expectedResolutionDate);
+
+  // Delivery visibility (never a performance score): actual time logged by the
+  // assignee(s) and the resulting remaining effort, distinct from the estimate.
+  const { getEntry } = useWorkLog();
+  const assigneeEntries = assigneeIds.map((id) => getEntry(`${id}:${ticket.id}`));
+  const workedSoFar = Math.round(assigneeEntries.reduce((s, e) => s + (e.actualHours ?? 0), 0) * 10) / 10;
+  const remainingEffort = (() => {
+    if (ticket.status === "Completed") return 0;
+    const overrides = assigneeEntries.filter((e) => typeof e.remainingHours === "number");
+    if (overrides.length > 0) return Math.round(overrides.reduce((s, e) => s + (e.remainingHours ?? 0), 0) * 10) / 10;
+    const progresses = assigneeEntries.map((e) => e.progress ?? 0);
+    const avgProgress = progresses.length ? progresses.reduce((s, p) => s + p, 0) / progresses.length : 0;
+    return Math.round(ticket.estimatedHours * (1 - avgProgress / 100) * 10) / 10;
+  })();
+  const hasEffortData = workedSoFar > 0 || assigneeEntries.some((e) => e.remainingHours != null || e.progress);
 
   function addSkill() {
     const name = skillDraft.trim();
@@ -198,6 +215,8 @@ export function TaskDetailPanel({
         <div className="mt-4 grid grid-cols-2 gap-3 rounded-lg border border-border bg-brand-50/40 p-3.5 text-xs sm:grid-cols-4">
           <Detail label="Raised" value={ticket.raisedDate} />
           <Detail label="Estimated" value={`${ticket.estimatedHours}h`} />
+          {hasEffortData && <Detail label="Worked so far" value={`${workedSoFar}h`} />}
+          {hasEffortData && ticket.status !== "Completed" && <Detail label="Remaining" value={`${remainingEffort}h`} />}
           <Detail label="SLA" value={slaWindowLabel(ticket.priority)} />
           {ticket.status === "Completed" ? (
             <Detail label="Completion Date" value={ticket.resolvedDate ?? "—"} />
@@ -232,7 +251,7 @@ export function TaskDetailPanel({
                 key={e.id}
                 className="inline-flex items-center gap-1.5 rounded-full border border-brand-100 bg-brand-50 pl-2.5 pr-1.5 py-1 text-xs font-medium text-brand-800"
               >
-                {e.name}
+                <EmployeeCapacityHover employee={e}>{e.name}</EmployeeCapacityHover>
                 {assigneeIds.length === 2 && (
                   <span className="text-brand-500">· {ticketEffortForEmployee(ticket, e.id)}h</span>
                 )}

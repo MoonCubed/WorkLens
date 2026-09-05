@@ -12,13 +12,15 @@ import { useTickets, ticketsForUnit } from "@/store/tickets-store";
 import { useSupervisorSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
 import { useWorkLog } from "@/store/work-log-store";
+import { useCalendarEvents } from "@/store/calendar-events-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
 import { getDepartmentSupervisor, getUnitTeam } from "@/lib/hr";
-import { projectedUtilizationForTicket } from "@/lib/capacityEngine";
+import { projectedWeeklyTrajectoryForTicket } from "@/lib/capacityEngine";
 import { completionSortKey } from "@/lib/dashboardSummary";
 import { slaWindowLabel } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
-import { rankCandidatesForTicket, type TicketCandidate } from "@/lib/ticketMatch";
+import { rankCandidatesForTicket, PRIMARY_SKILL_MATCH, type TicketCandidate } from "@/lib/ticketMatch";
+import { EmployeeCapacityHover } from "@/components/employee/EmployeeCapacityHover";
 import { OVERLOAD_THRESHOLD } from "@/data/config";
 import type { Employee } from "@/data/types";
 
@@ -44,12 +46,17 @@ export default function SupervisorWorkPage() {
   } = useTickets();
   const { employees } = useEmployees();
   const { getEntry } = useWorkLog();
+  const { events } = useCalendarEvents();
   const { requests: adjustmentRequests, resolve: resolveAdjustment } = useTaskAdjustments();
 
   const [openCandidates, setOpenCandidates] = useState<AssignedTicket | null>(null);
   const [openDetail, setOpenDetail] = useState<AssignedTicket | null>(null);
   const [assignError, setAssignError] = useState<string | null>(null);
-  const [pendingAssign, setPendingAssign] = useState<{ ticket: AssignedTicket; employee: Employee; projected: number } | null>(null);
+  const [pendingAssign, setPendingAssign] = useState<{
+    ticket: AssignedTicket;
+    employee: Employee;
+    trajectory: { label: string; rangeLabel: string; before: number; after: number }[];
+  } | null>(null);
   const [showAllAssigned, setShowAllAssigned] = useState(false);
   const [showAllCompleted, setShowAllCompleted] = useState(false);
   const [dismissedCompletion, setDismissedCompletion] = useState<string | null>(null);
@@ -74,9 +81,11 @@ export default function SupervisorWorkPage() {
   // open the same picker.
   const candidatesByTicket = useMemo(() => {
     const map = new Map<string, TicketCandidate[]>();
-    unitTickets.forEach((t) => map.set(t.id, rankCandidatesForTicket(unitEmployees, t, unitEmployees.length)));
+    unitTickets.forEach((t) =>
+      map.set(t.id, rankCandidatesForTicket(unitEmployees, t, tickets, getEntry, events, unitEmployees.length))
+    );
     return map;
-  }, [unitTickets, unitEmployees]);
+  }, [unitTickets, unitEmployees, tickets, getEntry, events]);
 
   const detailTicket = openDetail ? unitTickets.find((t) => t.id === openDetail.id) ?? openDetail : null;
   const candidateTicket = openCandidates ? unitTickets.find((t) => t.id === openCandidates.id) ?? openCandidates : null;
@@ -99,17 +108,21 @@ export default function SupervisorWorkPage() {
     }
   }
 
-  /** Assign, but first work out the employee's resulting capacity. Over the warning
-   * threshold, pause for a confirmation showing the actual resulting percentage. */
+  /** Assign, but first work out the employee's resulting capacity WEEK BY WEEK through
+   * the ticket's own deadline. Over the warning threshold in any of those weeks, pause
+   * for a confirmation showing the actual trajectory — not just today's snapshot, so a
+   * candidate busy this week but free later isn't wrongly flagged. */
   function requestAssign(ticketId: string, employeeId: string) {
     if (!employeeId) return;
     const ticket = tickets.find((t) => t.id === ticketId);
     const employee = unitEmployees.find((e) => e.id === employeeId);
     if (!ticket || !employee) return;
     const alreadyOwns = (ticket.assignedEmployeeIds ?? []).includes(employeeId);
-    const projected = projectedUtilizationForTicket(employee, tickets, getEntry, ticket);
-    if (projected > CAPACITY_WARN_THRESHOLD && !alreadyOwns) {
-      setPendingAssign({ ticket, employee, projected });
+    const { before, after } = projectedWeeklyTrajectoryForTicket(employee, tickets, getEntry, ticket, events, 6);
+    const trajectory = after.map((w, i) => ({ label: w.label, rangeLabel: w.rangeLabel, before: before[i]?.utilization ?? w.utilization, after: w.utilization }));
+    const peak = Math.max(...trajectory.map((w) => w.after));
+    if (peak > CAPACITY_WARN_THRESHOLD && !alreadyOwns) {
+      setPendingAssign({ ticket, employee, trajectory });
       return;
     }
     commitAssign(ticketId, employeeId);
@@ -438,13 +451,24 @@ export default function SupervisorWorkPage() {
           <div className="w-full max-w-md rounded-xl border border-border bg-surface p-6 shadow-lg" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-start gap-3">
               <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-[var(--status-warning)]" strokeWidth={2} />
-              <div>
+              <div className="min-w-0 flex-1">
                 <h2 className="text-base font-semibold text-ink">Check capacity before assigning</h2>
                 <p className="mt-1.5 text-sm text-ink-secondary">
-                  Warning: this assignment will increase{" "}
-                  <span className="font-semibold text-ink">{pendingAssign.employee.name}</span>&rsquo;s capacity to{" "}
-                  <span className="font-semibold text-ink">{pendingAssign.projected}%</span>.
+                  This would take <span className="font-semibold text-ink">{pendingAssign.employee.name}</span> over{" "}
+                  {CAPACITY_WARN_THRESHOLD}% in at least one week before the deadline:
                 </p>
+                <ul className="mt-2.5 space-y-1 text-xs">
+                  {pendingAssign.trajectory.map((w) => (
+                    <li key={w.label} className="flex items-center justify-between gap-3 rounded-md border border-border bg-brand-50/40 px-2.5 py-1.5">
+                      <span className="text-ink-secondary">
+                        {w.label} <span className="text-ink-muted">({w.rangeLabel})</span>
+                      </span>
+                      <span className={`tabular font-semibold ${w.after > CAPACITY_WARN_THRESHOLD ? "text-[var(--status-critical)]" : "text-ink"}`}>
+                        {w.before}% → {w.after}%
+                      </span>
+                    </li>
+                  ))}
+                </ul>
                 <p className="mt-2 text-xs text-ink-muted">You can still go ahead — this is a heads-up, not a block.</p>
               </div>
             </div>
@@ -482,8 +506,11 @@ function CandidatesModal({
 }) {
   const [showAll, setShowAll] = useState(false);
   const assigneeIds = ticket.assignedEmployeeIds ?? [];
-  const visible = showAll ? candidates : candidates.slice(0, 3);
-  const remaining = candidates.length - visible.length;
+  // Primary recommendations = a real skill match (≥50%). Everyone else stays available
+  // behind "Show all employees" — nobody is hidden permanently.
+  const primary = candidates.filter((c) => c.skillMatch >= PRIMARY_SKILL_MATCH);
+  const rest = candidates.filter((c) => c.skillMatch < PRIMARY_SKILL_MATCH);
+  const visible = showAll ? candidates : primary;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 py-8" onClick={onClose}>
@@ -520,27 +547,37 @@ function CandidatesModal({
           </div>
 
           {candidates.length === 0 ? (
-            <p className="text-sm text-ink-muted py-4">No employees available in this unit to suggest.</p>
+            <p className="text-sm text-ink-muted py-4">No employees in this unit to suggest.</p>
           ) : (
             <>
+              {!showAll && primary.length === 0 && (
+                <p className="mb-3 text-xs text-ink-muted">
+                  No employee has a 50%+ skill match for this ticket. Use “Show all employees” to assign anyway.
+                </p>
+              )}
               <div className="space-y-3">
                 {visible.map((c, idx) => (
                   <CandidateCard
                     key={c.employee.id}
                     candidate={c}
-                    best={idx === 0}
+                    best={idx === 0 && c.skillMatch >= PRIMARY_SKILL_MATCH && !c.unavailableForDeadline}
                     alreadyAssigned={assigneeIds.includes(c.employee.id)}
                     onAssign={() => onAssign(c.employee.id)}
                   />
                 ))}
               </div>
-              {remaining > 0 && (
+              {!showAll && rest.length > 0 && (
                 <button
                   onClick={() => setShowAll(true)}
                   className="mt-3 w-full rounded-lg border border-border-strong bg-surface px-3 py-2 text-xs font-medium text-ink hover:bg-brand-50"
                 >
-                  Show {remaining} more
+                  Show all employees ({rest.length} more, below 50% skill match)
                 </button>
+              )}
+              {showAll && rest.length > 0 && (
+                <p className="mt-3 text-xs text-ink-muted">
+                  Showing all {candidates.length} employees — {rest.length} below the 50% skill-match line.
+                </p>
               )}
             </>
           )}
@@ -579,18 +616,34 @@ function CandidateCard({
             {e.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
           </div>
           <div className="min-w-0 leading-tight">
-            <p className="truncate text-sm font-medium text-ink">{e.name}</p>
+            <EmployeeCapacityHover employee={e}>
+              <p className="truncate text-sm font-medium text-ink">{e.name}</p>
+            </EmployeeCapacityHover>
             <p className="truncate text-xs text-ink-muted">
               {candidate.currentUtilization}% capacity{skillLine ? ` · ${skillLine}` : ""}
             </p>
           </div>
         </div>
-        {best && (
-          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-brand-800 px-2.5 py-1 text-[11px] font-semibold text-white">
-            <Award className="h-3 w-3" />
-            Best Match
-          </span>
-        )}
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          {best && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-brand-800 px-2.5 py-1 text-[11px] font-semibold text-white">
+              <Award className="h-3 w-3" />
+              Best Match
+            </span>
+          )}
+          {candidate.onLeaveNow && (
+            <span
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+                candidate.unavailableForDeadline
+                  ? "border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] text-[var(--status-critical)]"
+                  : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning)]"
+              }`}
+            >
+              <CalendarClock className="h-3 w-3" />
+              {candidate.unavailableForDeadline ? "On leave — can't meet deadline" : "On leave now"}
+            </span>
+          )}
+        </div>
       </div>
 
       <div className="mt-3 grid grid-cols-3 gap-3 text-xs">

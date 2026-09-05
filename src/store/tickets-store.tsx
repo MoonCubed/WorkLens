@@ -159,11 +159,18 @@ export function TicketsProvider({ children }: { children: ReactNode }) {
         effortSplit: deduped.length === 2 ? (effortSplit ?? null) : null,
         activityAt: nowIso(),
       };
+      // A turnover coverage plan only makes sense while its owner still actually owns
+      // this ticket — if the assignment changes out from under it, clear the (now
+      // stale) coverage rather than leaving it pointing at someone no longer assigned.
+      const current = tickets.find((t) => t.id === id);
+      if (current?.coverage && !deduped.includes(current.coverage.ownerId)) {
+        patch.coverage = null;
+      }
       const { error: updateError } = await supabase.from(TABLE).update(patch).eq("id", id);
       if (updateError) throw updateError;
       await refetch();
     },
-    [refetch]
+    [tickets, refetch]
   );
 
   const setTicketEffortSplit = useCallback(

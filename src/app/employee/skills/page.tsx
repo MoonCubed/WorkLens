@@ -1,16 +1,24 @@
 "use client";
 
 import { useState } from "react";
-import { Plus, X, Clock } from "lucide-react";
+import { Plus, X, Clock, CheckCircle2, XCircle } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { SkillLevelBar } from "@/components/ui/ProgressBar";
 import { SkillSelect } from "@/components/skills/SkillSelect";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
-import { useSkillChangeRequests } from "@/store/skill-change-requests-store";
+import { useSkillChangeRequests, type SkillChangeRequest } from "@/store/skill-change-requests-store";
 import type { SkillLevel } from "@/data/types";
 
 const SKILL_LEVELS: SkillLevel[] = ["Beginner", "Intermediate", "Advanced", "Expert"];
+
+function describeSkillChange(r: SkillChangeRequest): string {
+  return r.kind === "add"
+    ? `Add “${r.skillName}”${r.skillLevel ? ` · ${r.skillLevel}` : ""}`
+    : r.kind === "remove"
+      ? `Remove “${r.skillName}”`
+      : `Change “${r.skillName}” · ${r.previousLevel} → ${r.skillLevel}`;
+}
 
 export default function MySkillsPage() {
   const { employeeId } = useEmployeeSession();
@@ -24,6 +32,9 @@ export default function MySkillsPage() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const myPending = requests.filter((r) => r.employeeId === me.id && r.status === "Pending");
+  const myDecided = requests
+    .filter((r) => r.employeeId === me.id && (r.status === "Approved" || r.status === "Rejected"))
+    .sort((a, b) => (b.reviewedAt ?? "").localeCompare(a.reviewedAt ?? ""));
   const pendingFor = (name: string) => myPending.find((r) => r.skillName.toLowerCase() === name.toLowerCase());
 
   async function raise(input: Parameters<typeof submit>[0], message: string) {
@@ -208,22 +219,53 @@ export default function MySkillsPage() {
             {myPending.map((r) => (
               <li key={r.id} className="flex items-center justify-between gap-3 py-3">
                 <div>
-                  <p className="text-sm font-medium text-ink">
-                    {r.kind === "add"
-                      ? `Add “${r.skillName}”${r.skillLevel ? ` · ${r.skillLevel}` : ""}`
-                      : r.kind === "remove"
-                        ? `Remove “${r.skillName}”`
-                        : `Change “${r.skillName}” · ${r.previousLevel} → ${r.skillLevel}`}
-                  </p>
+                  <p className="text-sm font-medium text-ink">{describeSkillChange(r)}</p>
                   {r.justification && <p className="mt-0.5 text-xs italic text-ink-secondary">&ldquo;{r.justification}&rdquo;</p>}
                   <p className="text-xs text-ink-muted mt-0.5">Submitted {r.submittedAt}</p>
                 </div>
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-xs font-medium text-[var(--status-warning)]">
                   <Clock className="h-3 w-3" />
-                  Pending
+                  Pending Review
                 </span>
               </li>
             ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card>
+        <CardHeader title="Decided Requests" subtitle="Your supervisor's decisions on skill changes you've requested" />
+        {myDecided.length === 0 ? (
+          <p className="text-sm text-ink-muted py-2">No decisions yet.</p>
+        ) : (
+          <ul className="divide-y divide-border">
+            {myDecided.map((r) => {
+              const rejected = r.status === "Rejected";
+              return (
+                <li key={r.id} className="py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium text-ink">{describeSkillChange(r)}</p>
+                    <span
+                      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${
+                        rejected
+                          ? "border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] text-[var(--status-critical)]"
+                          : "border-[var(--status-good-border)] bg-[var(--status-good-bg)] text-[var(--status-good)]"
+                      }`}
+                    >
+                      {rejected ? <XCircle className="h-3 w-3" /> : <CheckCircle2 className="h-3 w-3" />}
+                      {r.status}
+                    </span>
+                  </div>
+                  {rejected && r.decisionNote && (
+                    <p className="mt-1.5 rounded-md border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-2.5 py-1.5 text-xs text-[var(--status-critical)]">
+                      <span className="font-medium">Reason: </span>
+                      {r.decisionNote}
+                    </p>
+                  )}
+                  <p className="mt-0.5 text-xs text-ink-muted">{r.reviewedAt ? `Decided ${r.reviewedAt}` : `Submitted ${r.submittedAt}`}</p>
+                </li>
+              );
+            })}
           </ul>
         )}
       </Card>

@@ -12,6 +12,9 @@ import type { WorkLogLookup } from "@/lib/capacityEngine";
 import { computeEmployeeSchedule } from "@/lib/capacityEngine";
 import { prioritiseWork, recommendationReason } from "@/lib/prioritize";
 import { dateKey, getDueStatus, daysBetween, todayStart } from "@/lib/date";
+import { workingWindow } from "@/lib/workingDay";
+import { LUNCH_START_MIN, LUNCH_END_MIN } from "@/lib/dayTimeline";
+import { SLOT_MINUTES, snapHours } from "@/lib/increments";
 import type { EmployeeSchedule, EmployeeCapacity } from "@/lib/capacityEngine";
 
 export interface DayPlanRow {
@@ -100,8 +103,9 @@ export function buildDayPlan(
     const urgent = item.overdue || item.deadlineUnreachable || getDueStatus(item.deadline.toISOString()) === "Due Soon";
     const naturalShare = item.dailyHours > 0 ? item.dailyHours : item.remainingHours;
     let alloc = Math.min(item.remainingHours, urgent ? left : Math.max(naturalShare, 0), left);
-    alloc = Math.round(alloc * 10) / 10;
-    if (alloc < 0.25) continue;
+    // Everything the employee plans is on the 30-minute grid.
+    alloc = snapHours(alloc);
+    if (alloc < 0.5) continue;
     rows.push({
       key: item.key,
       title: item.title,
@@ -233,4 +237,148 @@ export function buildPlanRecommendations(
   });
 
   return recs.slice(0, 5);
+}
+
+// ---------------------------------------------------------------------------------
+// Time-based planning — the day's fixed commitments and the free intervals left for
+// task work. The employee places (or auto-arranges) their chosen tasks into these
+// intervals in 30-minute steps; nothing here is written until they confirm the plan.
+// ---------------------------------------------------------------------------------
+
+export interface DayFixedBlock {
+  startMin: number;
+  endMin: number;
+  kind: "event" | "lunch";
+  title: string;
+}
+
+export interface DayFreeInterval {
+  startMin: number;
+  endMin: number;
+}
+
+export interface DayFrame {
+  workStartMin: number;
+  workEndMin: number;
+  onLeave: boolean;
+  isWorkingDay: boolean;
+  /** Timed calendar events + the lunch break, clamped to the working window, sorted. */
+  fixed: DayFixedBlock[];
+  /** Gaps between the fixed blocks — the time available for task work, on the 30-min grid. */
+  free: DayFreeInterval[];
+  availableHours: number;
+  calendarEvents: { title: string; startTime: string; endTime: string }[];
+}
+
+function clockToMin(t: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((t ?? "").trim());
+  return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
+}
+
+/** The fixed commitments and free intervals for `date`, used by the Plan My Day
+ * time planner. Free intervals never overlap the working-window edges, lunch, or a
+ * timed calendar event, and their bounds are aligned to the 30-minute grid. */
+export function buildDayFrame(
+  employee: Employee,
+  tickets: AssignedTicket[],
+  getEntry: WorkLogLookup,
+  events: CalendarEvent[],
+  date: Date
+): DayFrame {
+  const { startMin: workStartMin, endMin: workEndMin } = workingWindow(employee);
+  const schedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
+  const plan = schedule.planForRange(date, 1)[0];
+  const sameDay =
+    plan && plan.date.getFullYear() === date.getFullYear() && plan.date.getMonth() === date.getMonth() && plan.date.getDate() === date.getDate();
+
+  if (!plan || !sameDay || plan.onLeave) {
+    return {
+      workStartMin,
+      workEndMin,
+      onLeave: !!plan?.onLeave,
+      isWorkingDay: false,
+      fixed: [],
+      free: [],
+      availableHours: 0,
+      calendarEvents: [],
+    };
+  }
+
+  const fixed: DayFixedBlock[] = [];
+  plan.calendarEvents.forEach((ev) => {
+    const s = Math.max(workStartMin, clockToMin(ev.startTime));
+    const e = Math.min(workEndMin, clockToMin(ev.endTime));
+    if (e > s) fixed.push({ startMin: s, endMin: e, kind: "event", title: ev.title });
+  });
+  if (LUNCH_END_MIN > workStartMin && LUNCH_START_MIN < workEndMin) {
+    fixed.push({
+      startMin: Math.max(workStartMin, LUNCH_START_MIN),
+      endMin: Math.min(workEndMin, LUNCH_END_MIN),
+      kind: "lunch",
+      title: "Lunch",
+    });
+  }
+  fixed.sort((a, b) => a.startMin - b.startMin);
+
+  const free: DayFreeInterval[] = [];
+  let cursor = workStartMin;
+  for (const f of fixed) {
+    const gapStart = Math.ceil(cursor / SLOT_MINUTES) * SLOT_MINUTES;
+    const gapEnd = Math.floor(f.startMin / SLOT_MINUTES) * SLOT_MINUTES;
+    if (gapEnd - gapStart >= SLOT_MINUTES) free.push({ startMin: gapStart, endMin: gapEnd });
+    cursor = Math.max(cursor, f.endMin);
+  }
+  const tailStart = Math.ceil(cursor / SLOT_MINUTES) * SLOT_MINUTES;
+  const tailEnd = Math.floor(workEndMin / SLOT_MINUTES) * SLOT_MINUTES;
+  if (tailEnd - tailStart >= SLOT_MINUTES) free.push({ startMin: tailStart, endMin: tailEnd });
+
+  return {
+    workStartMin,
+    workEndMin,
+    onLeave: false,
+    isWorkingDay: true,
+    fixed,
+    free,
+    availableHours: plan.availableHours,
+    calendarEvents: plan.calendarEvents.map((e) => ({ title: e.title, startTime: e.startTime, endTime: e.endTime })),
+  };
+}
+
+export interface PlacedBlock {
+  key: string;
+  startMin: number;
+  endMin: number;
+}
+
+/** Lay an ordered list of {key, minutes} requests into the day's free intervals as
+ * ONE contiguous block each, left to right in 30-minute steps: first gap that fits
+ * the whole block, otherwise the largest remaining gap (truncated). Requested minutes
+ * are rounded up to the 30-minute grid. Keys with no room left are returned as
+ * overflow. */
+export function autoArrange(
+  frame: DayFrame,
+  items: { key: string; minutes: number }[]
+): { placed: PlacedBlock[]; overflowKeys: string[] } {
+  const gaps = frame.free.map((g) => ({ ...g }));
+  const placed: PlacedBlock[] = [];
+  const overflowKeys: string[] = [];
+
+  for (const it of items) {
+    const need = Math.max(SLOT_MINUTES, Math.ceil(it.minutes / SLOT_MINUTES) * SLOT_MINUTES);
+    let target = gaps.find((g) => g.endMin - g.startMin >= need);
+    if (!target) {
+      // Largest gap with any usable room.
+      target = gaps
+        .filter((g) => g.endMin - g.startMin >= SLOT_MINUTES)
+        .sort((a, b) => b.endMin - b.startMin - (a.endMin - a.startMin))[0];
+    }
+    if (!target) {
+      overflowKeys.push(it.key);
+      continue;
+    }
+    const take = Math.min(need, target.endMin - target.startMin);
+    placed.push({ key: it.key, startMin: target.startMin, endMin: target.startMin + take });
+    target.startMin += take;
+  }
+  return { placed, overflowKeys };
 }

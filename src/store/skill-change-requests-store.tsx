@@ -31,6 +31,8 @@ export interface SkillChangeRequest {
   status: SkillChangeStatus;
   submittedAt: string;
   reviewedAt?: string | null;
+  /** The supervisor's justification — required on a rejection, shown to the employee. */
+  decisionNote?: string | null;
 }
 
 // One pending skill-change request seeded for the demo, with a certification-backed
@@ -55,8 +57,9 @@ interface SkillChangeRequestsContextValue {
   error: string | null;
   /** Employee raises a pending change to their own skills. */
   submit: (input: Omit<SkillChangeRequest, "id" | "status" | "submittedAt" | "reviewedAt">) => Promise<void>;
-  /** Supervisor decision — the caller applies an approved change to the employee record. */
-  resolve: (id: string, status: "Approved" | "Rejected") => Promise<void>;
+  /** Supervisor decision — the caller applies an approved change to the employee
+   * record. A rejection must carry a justification, stored and shown to the employee. */
+  resolve: (id: string, status: "Approved" | "Rejected", decisionNote?: string) => Promise<void>;
 }
 
 const SkillChangeRequestsContext = createContext<SkillChangeRequestsContextValue | null>(null);
@@ -82,10 +85,10 @@ export function SkillChangeRequestsProvider({ children }: { children: ReactNode 
   );
 
   const resolve = useCallback(
-    async (id: string, status: "Approved" | "Rejected") => {
+    async (id: string, status: "Approved" | "Rejected", decisionNote?: string) => {
       const { error: updateError } = await supabase
         .from(TABLE)
-        .update({ status, reviewedAt: todayLabel() })
+        .update({ status, reviewedAt: todayLabel(), decisionNote: decisionNote?.trim() || null })
         .eq("id", id);
       if (updateError) throw updateError;
       await refetch();

@@ -23,9 +23,13 @@ import { todayStart, startOfWeek, addDays, isWorkingDay, weekOfYear, weekRangeLa
 export function DailyTasks({
   employee,
   onOpenTicket,
+  todayOnly = false,
 }: {
   employee: Employee;
   onOpenTicket?: (ticketId: string) => void;
+  /** My Work embeds this to show *only* today — no day/week navigation, no future
+   * days. The dedicated Calendar / Workload views keep the full navigation. */
+  todayOnly?: boolean;
 }) {
   const { tickets } = useTickets();
   const { getEntry } = useWorkLog();
@@ -70,6 +74,7 @@ export function DailyTasks({
 
   return (
     <div className="space-y-3">
+      {!todayOnly && (
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <button
@@ -113,6 +118,7 @@ export function DailyTasks({
           </button>
         </div>
       </div>
+      )}
 
       {plan ? (
         <DayCard
@@ -122,6 +128,7 @@ export function DailyTasks({
               ? {
                   rows: savedPlan.allocations,
                   createdAt: savedPlan.createdAt,
+                  confirmedAt: savedPlan.confirmedAt,
                   onReset: () => clearPlan(employee.id, plan.key).catch(() => {}),
                 }
               : null
@@ -156,8 +163,18 @@ export function DailyTasks({
 }
 
 interface SavedPlanView {
-  rows: { key: string; title: string; hours: number; status: string; ticketId?: string | null; reason?: string }[];
+  rows: {
+    key: string;
+    title: string;
+    hours: number;
+    status: string;
+    ticketId?: string | null;
+    reason?: string;
+    startTime?: string | null;
+    endTime?: string | null;
+  }[];
   createdAt: string;
+  confirmedAt?: string | null;
   onReset: () => void;
 }
 
@@ -238,7 +255,14 @@ function DayCard({
                 className={`rounded-md px-2 py-1.5 text-xs ${r.ticketId && onOpenTicket ? "cursor-pointer hover:bg-brand-50/70" : ""}`}
               >
                 <div className="flex items-center justify-between gap-3">
-                  <span className="min-w-0 truncate text-ink">{r.title}</span>
+                  <span className="flex min-w-0 items-center gap-2">
+                    {r.startTime && r.endTime && (
+                      <span className="shrink-0 tabular font-medium text-brand-700">
+                        {r.startTime}–{r.endTime}
+                      </span>
+                    )}
+                    <span className="min-w-0 truncate text-ink">{r.title}</span>
+                  </span>
                   <span className="flex shrink-0 items-center gap-2">
                     <span className="tabular font-medium text-ink">{r.hours}h</span>
                     <StatusChip label={r.status} />
@@ -248,6 +272,11 @@ function DayCard({
               </li>
             ))}
           </ul>
+          {savedPlan.confirmedAt && (
+            <p className="mt-1.5 text-[11px] font-medium text-[var(--status-good)]">
+              Worked hours confirmed {savedPlan.confirmedAt} — added to actual effort.
+            </p>
+          )}
         </div>
       ) : (
         <>

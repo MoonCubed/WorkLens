@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { CheckCircle2, Clock } from "lucide-react";
+import { CheckCircle2, Clock, XCircle } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { useEmployeeSession } from "@/store/session-store";
 import { useEmployees } from "@/store/employees-store";
@@ -197,32 +197,46 @@ export default function HandoverRequestsPage() {
           <p className="text-sm text-ink-muted py-4">No handover requests submitted yet.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {myRequests.map((r) => (
-              <li key={r.id} className="py-3.5">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-sm font-medium text-ink">
-                    {r.leaveType} · {r.startDate} – {r.endDate}
-                  </p>
-                  <span
-                    className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${
-                      r.status === "Pending Supervisor Review"
-                        ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning)]"
-                        : "border-[var(--status-good-border)] bg-[var(--status-good-bg)] text-[var(--status-good)]"
-                    }`}
-                  >
-                    <Clock className="h-3 w-3" />
-                    {r.status}
-                  </span>
-                </div>
-                {r.note && <p className="mt-1 text-xs text-ink-secondary italic">&ldquo;{r.note}&rdquo;</p>}
-                {r.preferredEmployeeId && (
-                  <p className="mt-1 text-xs text-ink-muted">Preferred cover: {nameFor(r.preferredEmployeeId)}</p>
-                )}
-                {r.affectedWork.length > 0 && (
-                  <p className="mt-1 text-xs text-ink-muted">Affected: {r.affectedWork.join(", ")}</p>
-                )}
-              </li>
-            ))}
+            {myRequests.map((r) => {
+              const rejected = r.status === "Rejected";
+              const approved = r.status === "Approved";
+              const pending = r.status === "Pending Supervisor Review";
+              const statusLabel = pending ? "Pending Review" : approved ? "Approved" : rejected ? "Rejected" : "Reviewed";
+              return (
+                <li key={r.id} className="py-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-medium text-ink">
+                      {r.leaveType} · {r.startDate} – {r.endDate}
+                    </p>
+                    <span
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${
+                        pending
+                          ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning)]"
+                          : rejected
+                            ? "border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] text-[var(--status-critical)]"
+                            : "border-[var(--status-good-border)] bg-[var(--status-good-bg)] text-[var(--status-good)]"
+                      }`}
+                    >
+                      {pending ? <Clock className="h-3 w-3" /> : rejected ? <XCircle className="h-3 w-3" /> : <CheckCircle2 className="h-3 w-3" />}
+                      {statusLabel}
+                    </span>
+                  </div>
+                  {r.note && <p className="mt-1 text-xs text-ink-secondary italic">&ldquo;{r.note}&rdquo;</p>}
+                  {rejected && r.decisionNote && (
+                    <p className="mt-1.5 rounded-md border border-[var(--status-critical-border)] bg-[var(--status-critical-bg)] px-2.5 py-1.5 text-xs text-[var(--status-critical)]">
+                      <span className="font-medium">Reason: </span>
+                      {r.decisionNote}
+                    </p>
+                  )}
+                  {r.preferredEmployeeId && (
+                    <p className="mt-1 text-xs text-ink-muted">Preferred cover: {nameFor(r.preferredEmployeeId)}</p>
+                  )}
+                  {r.affectedWork.length > 0 && (
+                    <p className="mt-1 text-xs text-ink-muted">Affected: {r.affectedWork.join(", ")}</p>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </Card>

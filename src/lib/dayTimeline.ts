@@ -2,11 +2,16 @@
 // Calendar's Daily View. It adds no scheduling maths: the task hours come from
 // `computeEmployeeSchedule().planForRange`, the calendar events from the same store
 // everything else reads, and a fixed lunch hour rounds out the working day. Tasks are
-// laid into whatever time the fixed commitments leave, in priority order.
+// laid into whatever time the fixed commitments leave, in priority order — UNLESS the
+// employee has confirmed a Plan My Day for the date, in which case their own timed
+// blocks are shown exactly as planned (this is what makes a confirmed plan appear,
+// unchanged, on both the employee's and the supervisor's Workload calendar).
 
 import type { Employee } from "@/data/types";
 import type { EmployeeSchedule, ScheduledWorkItem } from "@/lib/capacityEngine";
+import type { DayPlan } from "@/store/day-plans-store";
 import { prioritiseWork } from "@/lib/prioritize";
+import { workingWindow } from "@/lib/workingDay";
 
 export type SegmentKind = "event" | "lunch" | "task" | "coverage" | "idle";
 
@@ -32,21 +37,26 @@ export interface DayTimeline {
   availableHours: number;
   /** Task hours that didn't fit the day's remaining time. */
   unplacedHours: number;
+  /** True when the segments come from an employee-confirmed Plan My Day rather than
+   * the automatic even-spread layout. */
+  fromConfirmedPlan: boolean;
 }
 
-const LUNCH_START = 13 * 60; // 13:00
-const LUNCH_END = 14 * 60; // 14:00 — matches the day-plan example
-
-function parseClock(text: string, fallback: number): number {
-  const m = /(\d{1,2}):(\d{2})\s*(AM|PM)?/i.exec(text);
-  if (!m) return fallback;
-  let h = Number(m[1]) % 12;
-  if (m[3] && m[3].toUpperCase() === "PM") h += 12;
-  return h * 60 + Number(m[2]);
-}
+// The one shared lunch break for all of WorkLens — 11:30–12:30, unavailable working
+// time. Every hour-precision view (Daily View / Workload day timeline) reads these
+// two constants rather than hardcoding the window, so the break can never drift
+// between components. Whole-day hour TOTALS (Daily Tasks, weekly/monthly capacity,
+// Team Capacity, …) don't need a separate lunch deduction: `employee.weeklyHours`
+// (contracted, e.g. 40 = 8h/day) is already net of lunch — a 7:00–16:00 day minus this
+// 1h break is exactly 8 working hours — so lunch only has to be enforced here, where
+// clock time is actually rendered.
+export const LUNCH_START_MIN = 11 * 60 + 30; // 11:30
+export const LUNCH_END_MIN = 12 * 60 + 30; // 12:30
+const LUNCH_START = LUNCH_START_MIN;
+const LUNCH_END = LUNCH_END_MIN;
 
 function timeToMin(t: string): number {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(t.trim());
+  const m = /^(\d{1,2}):(\d{2})$/.exec((t ?? "").trim());
   return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
 }
 
@@ -57,17 +67,21 @@ export function minLabel(min: number): string {
 }
 
 /** Build the timeline for `date`. `schedule` must be the employee's own schedule for
- * the surrounding window (so `planForRange` covers this day). */
-export function buildDayTimeline(schedule: EmployeeSchedule, employee: Employee, date: Date): DayTimeline {
-  const [startText, endText] = (employee.workingSchedule || "").split("–").slice(-2);
-  const dayStartMin = parseClock(startText ?? "", 7 * 60);
-  const dayEndMin = Math.max(dayStartMin + 60, parseClock(endText ?? "", 16 * 60));
+ * the surrounding window (so `planForRange` covers this day). When `confirmedPlan` is
+ * given (a saved Plan My Day for this exact date), its timed blocks are shown as-is. */
+export function buildDayTimeline(
+  schedule: EmployeeSchedule,
+  employee: Employee,
+  date: Date,
+  confirmedPlan?: DayPlan | null
+): DayTimeline {
+  const { startMin: dayStartMin, endMin: dayEndMin } = workingWindow(employee);
 
   const plan = schedule.planForRange(date, 1)[0];
   const sameDay = plan && plan.date.getFullYear() === date.getFullYear() && plan.date.getMonth() === date.getMonth() && plan.date.getDate() === date.getDate();
 
   if (!plan || !sameDay) {
-    return { dayStartMin, dayEndMin, onLeave: false, isWorkingDay: false, segments: [], plannedHours: 0, eventHours: 0, availableHours: 0, unplacedHours: 0 };
+    return { dayStartMin, dayEndMin, onLeave: false, isWorkingDay: false, segments: [], plannedHours: 0, eventHours: 0, availableHours: 0, unplacedHours: 0, fromConfirmedPlan: false };
   }
   if (plan.onLeave) {
     return {
@@ -80,6 +94,7 @@ export function buildDayTimeline(schedule: EmployeeSchedule, employee: Employee,
       eventHours: plan.eventHours,
       availableHours: 0,
       unplacedHours: 0,
+      fromConfirmedPlan: false,
     };
   }
 
@@ -101,6 +116,41 @@ export function buildDayTimeline(schedule: EmployeeSchedule, employee: Employee,
   }
   fixed.sort((a, b) => a.startMin - b.startMin);
 
+  const byKey = new Map(schedule.items.map((i) => [i.key, i] as const));
+
+  // --- Confirmed Plan My Day: show the employee's own timed blocks verbatim ---------
+  const timedRows = (confirmedPlan?.allocations ?? []).filter((a) => a.startTime && a.endTime);
+  if (confirmedPlan && timedRows.length > 0) {
+    const planSegs: TimelineSegment[] = timedRows.map((a) => {
+      const item = a.key ? byKey.get(a.key) : undefined;
+      const isCoverage = !!item?.isCoverage;
+      return {
+        startMin: Math.max(dayStartMin, timeToMin(a.startTime!)),
+        endMin: Math.min(dayEndMin, timeToMin(a.endTime!)),
+        kind: isCoverage ? "coverage" : "task",
+        title: isCoverage && item?.coverageOwnerName ? `${a.title} (covering ${item.coverageOwnerName})` : a.title,
+        hours: a.hours,
+        ticketId: a.ticketId ?? null,
+        status: a.status,
+      };
+    });
+    const planned = Math.round(planSegs.reduce((s, x) => s + Math.max(0, (x.endMin - x.startMin) / 60), 0) * 10) / 10;
+    const segments = [...fixed, ...planSegs].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
+    return {
+      dayStartMin,
+      dayEndMin,
+      onLeave: false,
+      isWorkingDay: true,
+      segments,
+      plannedHours: planned,
+      eventHours: plan.eventHours,
+      availableHours: plan.availableHours,
+      unplacedHours: 0,
+      fromConfirmedPlan: true,
+    };
+  }
+
+  // --- Automatic layout: pack the day's task allocations into the free gaps ---------
   // Free gaps between fixed blocks.
   const gaps: { start: number; end: number }[] = [];
   let cursor = dayStartMin;
@@ -111,7 +161,6 @@ export function buildDayTimeline(schedule: EmployeeSchedule, employee: Employee,
   if (cursor < dayEndMin) gaps.push({ start: cursor, end: dayEndMin });
 
   // Task allocations for the day, ordered by priority so the day reads sensibly.
-  const byKey = new Map(schedule.items.map((i) => [i.key, i] as const));
   const ranked = prioritiseWork(
     plan.allocations.map((a) => a.item).filter((i): i is ScheduledWorkItem => !!i),
     plan.availableHours
@@ -160,7 +209,6 @@ export function buildDayTimeline(schedule: EmployeeSchedule, employee: Employee,
     const g = gaps[i];
     if (g.end > g.start) idleSegs.push({ startMin: g.start, endMin: g.end, kind: "idle", title: "Available", hours: Math.round(((g.end - g.start) / 60) * 10) / 10 });
   }
-  // Also any leftover slivers inside partially-filled gaps handled above by g.start advance.
 
   const segments = [...fixed, ...taskSegs, ...idleSegs].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
 
@@ -174,5 +222,6 @@ export function buildDayTimeline(schedule: EmployeeSchedule, employee: Employee,
     eventHours: plan.eventHours,
     availableHours: plan.availableHours,
     unplacedHours: Math.round(((totalTaskMin - placed) / 60) * 10) / 10,
+    fromConfirmedPlan: false,
   };
 }

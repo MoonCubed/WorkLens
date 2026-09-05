@@ -16,6 +16,7 @@ import { useCalendarEvents } from "@/store/calendar-events-store";
 import { computeDashboardSummary, type AttentionTone, type DashboardSummary } from "@/lib/dashboardSummary";
 import { computeTeamWeeklyCapacity } from "@/lib/capacityEngine";
 import { WeeklyCapacityChart } from "@/components/charts/WeeklyCapacityChart";
+import { EmployeeCapacityHover } from "@/components/employee/EmployeeCapacityHover";
 import { todayLabel } from "@/lib/date";
 
 const ATTENTION_STYLES: Record<AttentionTone, { icon: typeof AlertTriangle; text: string; bg: string; border: string; label: string }> = {
@@ -186,7 +187,9 @@ export default function SupervisorDashboardPage() {
                       {row.employee.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
                     </div>
                     <div className="min-w-0 leading-tight">
-                      <p className="truncate text-sm font-medium text-ink">{row.employee.name}</p>
+                      <EmployeeCapacityHover employee={row.employee}>
+                        <p className="truncate text-sm font-medium text-ink">{row.employee.name}</p>
+                      </EmployeeCapacityHover>
                       <p className="truncate text-xs text-ink-muted">{row.activeItems} active item{row.activeItems === 1 ? "" : "s"}</p>
                     </div>
                   </div>

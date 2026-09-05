@@ -11,6 +11,7 @@ import { getEmployeeWorkCounts, getEmployeeTasks } from "@/lib/unit-summary";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { CapacityBar } from "@/components/ui/ProgressBar";
 import { useSkills } from "@/store/skills-store";
+import { EmployeeCapacityHover } from "@/components/employee/EmployeeCapacityHover";
 
 const STATUS_OPTIONS = ["Healthy", "At Risk", "Overloaded", "Critical", "On Leave"];
 
@@ -163,9 +164,11 @@ function TableView({
                       {e.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
                     </div>
                     <div className="leading-tight">
-                      <p className="font-medium text-ink group-hover:text-brand-700 group-hover:underline underline-offset-2">
-                        {e.name}
-                      </p>
+                      <EmployeeCapacityHover employee={e}>
+                        <p className="font-medium text-ink group-hover:text-brand-700 group-hover:underline underline-offset-2">
+                          {e.name}
+                        </p>
+                      </EmployeeCapacityHover>
                     </div>
                   </Link>
                 </td>
@@ -242,9 +245,11 @@ function CardGridView({
                 {e.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
               </div>
               <div className="min-w-0 leading-tight">
-                <p className="truncate font-medium text-ink group-hover:text-brand-700 group-hover:underline underline-offset-2">
-                  {e.name}
-                </p>
+                <EmployeeCapacityHover employee={e}>
+                  <p className="truncate font-medium text-ink group-hover:text-brand-700 group-hover:underline underline-offset-2">
+                    {e.name}
+                  </p>
+                </EmployeeCapacityHover>
                 <p className="truncate text-xs text-ink-muted">{e.department}</p>
               </div>
             </Link>

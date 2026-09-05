@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { CalendarClock, CalendarRange, LayoutGrid } from "lucide-react";
+import { CalendarClock, CalendarRange, LayoutGrid, Plus } from "lucide-react";
 import { CalendarView, type CalendarItem, type TicketDeadlineState } from "@/components/calendar/CalendarView";
 import { WorkloadView } from "@/components/calendar/WorkloadView";
 import { AppointmentsManager } from "@/components/employee/AppointmentsManager";
@@ -13,6 +13,7 @@ import { useTickets, type AssignedTicket } from "@/store/tickets-store";
 import { useCalendarEvents, isTimedEvent } from "@/store/calendar-events-store";
 import { useTaskAdjustments } from "@/store/task-adjustments-store";
 import { useWorkLog } from "@/store/work-log-store";
+import { useDayPlans } from "@/store/day-plans-store";
 import { parseLooseDate, getDueStatus, todayStart, dateFromKey } from "@/lib/date";
 import { ticketDueLabel } from "@/lib/due";
 import { computeEmployeeSchedule } from "@/lib/capacityEngine";
@@ -30,9 +31,15 @@ export default function EmployeeCalendarPage() {
   const { events, addEvent } = useCalendarEvents();
   const { submit: submitAdjustment } = useTaskAdjustments();
   const { getEntry } = useWorkLog();
+  const { plans } = useDayPlans();
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
-  const [view, setView] = useState<"calendar" | "workload">("calendar");
+  // Workload View opens by default (Float-style, hour-by-hour) — the Calendar (month/
+  // week/day) view stays one click away via the toggle.
+  const [view, setView] = useState<"workload" | "calendar">("workload");
+  // Bumped by the header "Add" button — pops the calendar-event form open inside the
+  // AppointmentsManager for whichever view is showing.
+  const [addEventNonce, setAddEventNonce] = useState(0);
 
   const myTickets = useMemo(() => tickets.filter((t) => (t.assignedEmployeeIds ?? []).includes(me.id)), [tickets, me]);
   const detailTicket = openTicketId ? myTickets.find((t) => t.id === openTicketId) ?? null : null;
@@ -40,10 +47,29 @@ export default function EmployeeCalendarPage() {
   const items = useMemo(() => {
     const list: CalendarItem[] = [];
 
-    // Planned daily work — each task's estimated effort spread evenly across the
-    // working days until its deadline (the same schedule the capacity numbers use).
+    // Planned daily work. Where the employee has confirmed a Plan My Day for the date,
+    // that timed plan is shown (08:00–10:00 — Task A); otherwise the even-spread
+    // schedule the capacity numbers use.
+    const planByDate = new Map(plans.filter((p) => p.employeeId === me.id).map((p) => [p.date, p]));
     const schedule = computeEmployeeSchedule(me, tickets, getEntry, events);
     schedule.planForRange(todayStart(), 40).forEach((plan) => {
+      const saved = planByDate.get(plan.key);
+      if (saved && saved.allocations.length > 0) {
+        const timed = saved.allocations
+          .slice()
+          .sort((a, b) => (a.startTime ?? "").localeCompare(b.startTime ?? ""))
+          .map((a) => (a.startTime && a.endTime ? `${a.startTime}–${a.endTime}  ${a.title}` : `${a.title} — ${a.hours}h`))
+          .join("\n");
+        list.push({
+          key: `plan-${plan.key}`,
+          label: `My plan: ${saved.allocations.reduce((s, a) => s + a.hours, 0)}h`,
+          sublabel: `${saved.allocations.length} block${saved.allocations.length === 1 ? "" : "s"}${saved.confirmedAt ? " · worked hours confirmed" : ""}`,
+          kind: "Planned",
+          date: dateFromKey(plan.key),
+          note: `Lunch 11:30–12:30\n${timed}`,
+        });
+        return;
+      }
       if (plan.allocations.length === 0) return;
       const breakdown = plan.allocations
         .slice()
@@ -138,19 +164,28 @@ export default function EmployeeCalendarPage() {
       });
 
     return list;
-  }, [myTickets, me, events, tickets, getEntry]);
+  }, [myTickets, me, events, tickets, getEntry, plans]);
 
   return (
     <>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <ViewToggle view={view} onChange={setView} />
-        <Link
-          href="/employee/handover-requests"
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-3.5 py-2 text-sm font-medium text-ink hover:bg-brand-50"
-        >
-          <CalendarClock className="h-4 w-4" strokeWidth={1.75} />
-          Request Leave
-        </Link>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setAddEventNonce((n) => n + 1)}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-brand-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
+          >
+            <Plus className="h-4 w-4" strokeWidth={2} />
+            Add
+          </button>
+          <Link
+            href="/employee/handover-requests"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-3.5 py-2 text-sm font-medium text-ink hover:bg-brand-50"
+          >
+            <CalendarClock className="h-4 w-4" strokeWidth={1.75} />
+            Request Leave
+          </Link>
+        </div>
       </div>
 
       <div className="mt-3 space-y-6">
@@ -163,7 +198,7 @@ export default function EmployeeCalendarPage() {
               </p>
             </div>
             <WorkloadView employees={[me]} revealEventTitlesFor={me.id} />
-            <AppointmentsManager employee={me} />
+            <AppointmentsManager employee={me} openNonce={addEventNonce} />
           </>
         ) : (
           <>
@@ -185,7 +220,7 @@ export default function EmployeeCalendarPage() {
                 });
               }}
             />
-            <AppointmentsManager employee={me} />
+            <AppointmentsManager employee={me} openNonce={addEventNonce} />
           </>
         )}
       </div>
@@ -225,18 +260,9 @@ export default function EmployeeCalendarPage() {
   );
 }
 
-function ViewToggle({ view, onChange }: { view: "calendar" | "workload"; onChange: (v: "calendar" | "workload") => void }) {
+function ViewToggle({ view, onChange }: { view: "workload" | "calendar"; onChange: (v: "workload" | "calendar") => void }) {
   return (
     <div className="flex items-center gap-1 rounded-lg border border-border-strong bg-surface p-1">
-      <button
-        onClick={() => onChange("calendar")}
-        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-          view === "calendar" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
-        }`}
-      >
-        <CalendarRange className="h-3.5 w-3.5" />
-        Calendar
-      </button>
       <button
         onClick={() => onChange("workload")}
         className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
@@ -245,6 +271,15 @@ function ViewToggle({ view, onChange }: { view: "calendar" | "workload"; onChang
       >
         <LayoutGrid className="h-3.5 w-3.5" />
         Workload
+      </button>
+      <button
+        onClick={() => onChange("calendar")}
+        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+          view === "calendar" ? "bg-brand-800 text-white" : "text-ink-secondary hover:bg-brand-50"
+        }`}
+      >
+        <CalendarRange className="h-3.5 w-3.5" />
+        Calendar
       </button>
     </div>
   );
