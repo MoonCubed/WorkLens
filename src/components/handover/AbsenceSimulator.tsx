@@ -8,7 +8,7 @@ import { useWorkLog } from "@/store/work-log-store";
 import { useCalendarEvents } from "@/store/calendar-events-store";
 import { computeAbsenceImpact, type AbsenceImpact, type AffectedWorkItem, type CoverageCandidate, type RiskLevel } from "@/lib/absenceImpact";
 import { OVERLOAD_THRESHOLD } from "@/data/config";
-import { formatDisplayDate, toInputDateValue, todayLabel } from "@/lib/date";
+import { formatDisplayDate, toInputDateValue, todayLabel, addDays, isWorkingDay } from "@/lib/date";
 import { withErrorDetail } from "@/lib/errorMessage";
 import type { Employee } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
@@ -23,6 +23,23 @@ const RISK_STYLES: Record<RiskLevel, { symbol: string; label: string; text: stri
   Medium: { symbol: "◆", label: "Medium", text: "text-[var(--status-warning)]" },
   Low: { symbol: "○", label: "Safe", text: "text-[var(--status-good)]" },
 };
+
+/** The nearest working day `dir` steps away from `d` (−1 = the day before, 1 = after). */
+function shiftToWorkingDay(d: Date, dir: 1 | -1): Date {
+  let x = addDays(d, dir);
+  while (!isWorkingDay(x)) x = addDays(x, dir);
+  return x;
+}
+
+/** Coverage already applied to `employeeId`'s tickets — so reopening a reviewed
+ * turnover shows the plan currently in force as the starting proposal. */
+function existingCoverageFor(tickets: AssignedTicket[], employeeId: string): Record<string, TicketCoverage> {
+  const out: Record<string, TicketCoverage> = {};
+  tickets.forEach((t) => {
+    if (t.coverage && t.coverage.ownerId === employeeId) out[t.id] = t.coverage;
+  });
+  return out;
+}
 
 export function AbsenceSimulator({
   unitEmployees,
@@ -65,11 +82,16 @@ export function AbsenceSimulator({
   );
   const [showAlternatives, setShowAlternatives] = useState<Record<string, boolean>>({});
   const [showNotes, setShowNotes] = useState<Record<string, boolean>>({});
-  /** ticketId -> the PROPOSED coverage plan for this session. Purely local: merged onto
-   * `tickets` so every other affected item's projected capacity reflects it live, but
-   * NOTHING is written to the database and no real assignment changes until the
-   * supervisor clicks "Apply Coverage Plan". */
-  const [coverageOverrides, setCoverageOverrides] = useState<Record<string, TicketCoverage>>({});
+  /** ticketId -> the PROPOSED coverage plan for this session. Purely local: passed to
+   * `computeAbsenceImpact` as `stagedCoverage` so each candidate's projected capacity
+   * reflects the OTHER coverage they've been proposed for — but it never changes a
+   * task's owner, its remaining effort, or how much of it falls inside the absence
+   * window. Nothing is written to the database until "Apply Coverage Plan". Seeded
+   * from any coverage already applied to the absent employee's tickets, so reopening
+   * a reviewed request shows the plan that is in force. */
+  const [coverageOverrides, setCoverageOverrides] = useState<Record<string, TicketCoverage>>(() =>
+    initialEmployeeId ? existingCoverageFor(tickets, initialEmployeeId) : {}
+  );
   const [showApplyConfirm, setShowApplyConfirm] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -78,19 +100,29 @@ export function AbsenceSimulator({
 
   const employee = unitEmployees.find((e) => e.id === employeeId);
 
-  const patchedTickets = useMemo(() => {
-    if (Object.keys(coverageOverrides).length === 0) return tickets;
-    return tickets.map((t) => (coverageOverrides[t.id] ? { ...t, coverage: coverageOverrides[t.id] } : t));
-  }, [tickets, coverageOverrides]);
-
-  // Recomputed live off `patchedTickets` — so it always reflects every coverage
-  // selection made so far in this session, not just what's already saved.
+  // Recomputed live: the affected work + coverage requirement come from the OWNER's
+  // real schedule (unchanged by any proposal); `stagedCoverage` only lets a candidate's
+  // projection account for the OTHER tasks they've been proposed to cover.
   const impact = useMemo<AbsenceImpact | null>(() => {
     if (!committed) return null;
     const emp = unitEmployees.find((e) => e.id === committed.employeeId);
     if (!emp) return null;
-    return computeAbsenceImpact({ employee: emp, unitEmployees, tickets: patchedTickets, startLabel: committed.start, endLabel: committed.end, getEntry, events });
-  }, [committed, unitEmployees, patchedTickets, getEntry, events]);
+    return computeAbsenceImpact({
+      employee: emp,
+      unitEmployees,
+      tickets,
+      startLabel: committed.start,
+      endLabel: committed.end,
+      getEntry,
+      events,
+      stagedCoverage: coverageOverrides,
+    });
+  }, [committed, unitEmployees, tickets, coverageOverrides, getEntry, events]);
+
+  /** Last Working Day (the working day before the absence starts) and Return to Work
+   * Day (the working day after it ends) — the clear business framing for a turnover. */
+  const lwd = useMemo(() => (impact ? shiftToWorkingDay(impact.start, -1) : null), [impact]);
+  const rwd = useMemo(() => (impact ? shiftToWorkingDay(impact.end, 1) : null), [impact]);
 
   function coveringIdFor(item: AffectedWorkItem): string | null {
     return (item.ticketId && coverageOverrides[item.ticketId]?.coveringEmployeeId) || null;
@@ -101,7 +133,7 @@ export function AbsenceSimulator({
     setLoading(true);
     setConfirmed(false);
     setConfirmedCount(0);
-    setCoverageOverrides({});
+    setCoverageOverrides(existingCoverageFor(tickets, employee.id));
     setShowAlternatives({});
     setShowNotes({});
     setActionError(null);
@@ -232,7 +264,10 @@ export function AbsenceSimulator({
         {impact && !loading && (
           <div className="mt-5">
             <p className="mb-2.5 text-xs text-ink-muted">
-              <span className="font-medium text-ink">{impact.employee.name}</span> · leave {formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)} ·{" "}
+              <span className="font-medium text-ink">{impact.employee.name}</span> ·{" "}
+              <span className="font-medium text-ink">LWD</span> {lwd ? formatDisplayDate(lwd) : "—"} →{" "}
+              <span className="font-medium text-ink">RWD</span> {rwd ? formatDisplayDate(rwd) : "—"} ·{" "}
+              absent {formatDisplayDate(impact.start)} – {formatDisplayDate(impact.end)} ·{" "}
               {impact.turnoverWorkingDays} working day{impact.turnoverWorkingDays === 1 ? "" : "s"} to cover
             </p>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -290,8 +325,9 @@ export function AbsenceSimulator({
           <div>
             <h3 className="text-sm font-semibold text-ink mb-1">Affected Work</h3>
             <p className="mb-3 text-xs text-ink-muted">
-              Coverage is time-boxed to the leave window and keeps the task&rsquo;s existing per-day plan — ownership does
-              not transfer.
+              A proposal is a temporary coverage plan for the window between LWD and RWD — it covers only the effort the
+              owner already had planned for those days, at the owner&rsquo;s own rate. The owner keeps the task and every
+              hour outside that window.
             </p>
             {impact.affectedWork.length === 0 ? (
               <Card>
@@ -342,22 +378,33 @@ export function AbsenceSimulator({
                         )}
                       </div>
 
-                      {/* The turnover at a glance — everything the supervisor needs to decide. */}
+                      {/* The turnover at a glance — everything the supervisor needs to decide.
+                          Ownership never transfers on a proposal: the task stays with the
+                          original owner; the cover carries only the planned effort that falls
+                          between LWD and RWD. */}
                       <div className="mt-3 grid gap-x-4 gap-y-1.5 rounded-lg border border-border bg-brand-50/40 p-3 text-xs sm:grid-cols-2">
-                        <Row label="Original owner" value={impact.employee.name} />
-                        <Row label="Coverage employee" value={coveringId ? `${nameFor(coveringId)} (proposed)` : "— not selected"} />
-                        <Row label="Leave period" value={`${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)}`} />
+                        <Row label="Original owner" value={`${impact.employee.name} (stays owner)`} />
                         <Row
-                          label="Turnover period"
+                          label="Proposed coverage"
+                          value={coveringId ? nameFor(coveringId) : "— none proposed"}
+                        />
+                        <Row label="Last working day (LWD)" value={lwd ? formatDisplayDate(lwd) : "—"} />
+                        <Row label="Return to work day (RWD)" value={rwd ? formatDisplayDate(rwd) : "—"} />
+                        <Row
+                          label="Absence covered"
                           value={
                             item.turnoverStart
-                              ? `${item.turnoverStart} – ${item.turnoverEnd} · ${item.turnoverWorkingDays} day${item.turnoverWorkingDays === 1 ? "" : "s"}`
+                              ? `${item.turnoverStart} – ${item.turnoverEnd} · ${item.turnoverWorkingDays} working day${item.turnoverWorkingDays === 1 ? "" : "s"}`
                               : `${item.turnoverWorkingDays} working day${item.turnoverWorkingDays === 1 ? "" : "s"}`
                           }
                         />
                         <Row label="Deadline" value={item.dueDate ?? "No deadline"} />
-                        <Row label="Remaining effort" value={`${item.remainingHours}h`} />
-                        <Row label="Planned effort during leave" value={`${item.coverageHours}h (owner's rate, unchanged)`} />
+                        <Row label="Remaining effort (total)" value={`${item.remainingHours}h`} />
+                        <Row label="Planned effort during absence" value={`${item.coverageHours}h`} />
+                        <Row
+                          label="Coverage required"
+                          value={`${item.coverageHours}h · ${Math.round((item.remainingHours - item.coverageHours) * 10) / 10}h stays with ${impact.employee.name.split(" ")[0]} after RWD`}
+                        />
                         <Row label="Status" value={item.status} />
                       </div>
 
@@ -479,11 +526,11 @@ export function AbsenceSimulator({
           <Card>
             <CardHeader
               title="Continuity Plan"
-              subtitle={`${impact.employee.name} · ${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)}`}
+              subtitle={`${impact.employee.name} · LWD ${lwd ? formatDisplayDate(lwd) : "—"} → RWD ${rwd ? formatDisplayDate(rwd) : "—"}`}
             />
             <div className="space-y-3 text-xs">
               <PlanLine
-                label="During the leave"
+                label={`During the absence (${formatDisplayDate(impact.start)} – ${formatDisplayDate(impact.end)})`}
                 body={
                   primaryCandidate || Object.keys(coverageOverrides).length > 0 ? (
                     <ul className="mt-1 space-y-0.5 text-ink-secondary">
@@ -494,7 +541,7 @@ export function AbsenceSimulator({
                           return (
                             <li key={i.id}>
                               <span className="font-medium text-ink">{cid ? nameFor(cid).split(" ")[0] : "— unassigned"}</span> covers{" "}
-                              {i.title} ({i.coverageHours}h across {i.turnoverWorkingDays} day{i.turnoverWorkingDays === 1 ? "" : "s"})
+                              {i.title} — {i.coverageHours}h of the {i.remainingHours}h remaining, across {i.turnoverWorkingDays} working day{i.turnoverWorkingDays === 1 ? "" : "s"}
                             </li>
                           );
                         })}
@@ -505,12 +552,12 @@ export function AbsenceSimulator({
                 }
               />
               <PlanLine
-                label="After return"
+                label={`From RWD (${rwd ? formatDisplayDate(rwd) : "return"})`}
                 body={
                   <span className="text-ink-secondary">
                     {" "}
-                    All tasks stay owned by <span className="font-medium text-ink">{impact.employee.name}</span>; coverage
-                    ends automatically on {formatDisplayDate(impact.end)}.
+                    Every task stays owned by <span className="font-medium text-ink">{impact.employee.name}</span>, who
+                    resumes the remaining effort. Coverage ends automatically on {formatDisplayDate(impact.end)}.
                   </span>
                 }
               />

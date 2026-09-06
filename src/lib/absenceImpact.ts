@@ -17,6 +17,7 @@
 
 import type { Employee, Skill } from "@/data/types";
 import type { AssignedTicket } from "@/store/tickets-store";
+import type { TicketCoverage } from "@/data/tickets";
 import type { CalendarEvent } from "@/store/calendar-events-store";
 import {
   todayStart,
@@ -263,7 +264,12 @@ export function computeAffectedWork(
         risk,
         riskExplanation: explanation,
         ticketId: t.id,
-        coverageHours: plan.hours || Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
+        // Coverage Required = the planned effort that falls INSIDE the absence window,
+        // read straight off the owner's real schedule (`itemHoursInRange`). Never the
+        // whole remaining effort — the rest stays with the owner for after they return.
+        // The `Math.min` is only a defensive fallback for the impossible case where an
+        // active assigned ticket has no scheduled item at all.
+        coverageHours: scheduled ? plan.hours : Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
         turnoverStart: covKeys[0] ? formatDisplayDate(dateFromKey(covKeys[0])) : null,
         turnoverEnd: covKeys[covKeys.length - 1] ? formatDisplayDate(dateFromKey(covKeys[covKeys.length - 1])) : null,
         turnoverWorkingDays: covKeys.length || workingDaysAffected,
@@ -297,7 +303,8 @@ export function computeAffectedWork(
       overlapDays: workingDaysAffected,
       risk,
       riskExplanation: explanation,
-      coverageHours: plan.hours || Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
+      // See the ticket branch: covered = planned effort inside the window only.
+      coverageHours: scheduled ? plan.hours : Math.round(Math.min(remaining, hoursPerDay * workingDaysAffected) * 10) / 10,
       turnoverStart: formatDisplayDate(start),
       turnoverEnd: formatDisplayDate(end),
       turnoverWorkingDays: workingDaysAffected,
@@ -478,22 +485,50 @@ export function computeAbsenceImpact(params: {
   endLabel: string;
   getEntry: WorkLogLookup;
   events?: CalendarEvent[];
+  /** Coverage the supervisor has PROPOSED but not yet applied, keyed by ticketId.
+   * Used only to project a candidate's own capacity against the OTHER work they've
+   * been proposed to cover in the same plan — it never touches the affected-work
+   * analysis or the coverage requirement, which are read from the OWNER's baseline
+   * schedule with any coverage on the owner's own tickets stripped out. */
+  stagedCoverage?: Record<string, TicketCoverage>;
 }): AbsenceImpact | null {
-  const { employee, unitEmployees, tickets, startLabel, endLabel, getEntry, events = [] } = params;
+  const { employee, unitEmployees, tickets, startLabel, endLabel, getEntry, events = [], stagedCoverage = {} } = params;
   const start = parseLooseDate(startLabel);
   const end = parseLooseDate(endLabel);
   if (!start || !end || start > end) return null;
 
   const peers = unitEmployees.filter((e) => e.id !== employee.id);
-  const affectedWork = computeAffectedWork(employee, tickets, start, end, getEntry, events);
-  const ownerSchedule = computeEmployeeSchedule(employee, tickets, getEntry, events);
+
+  // "Affected work" and "planned effort during absence" describe the OWNER'S baseline
+  // schedule. Strip any coverage on the owner's own tickets first — staged OR already
+  // applied — so proposing (or reopening) a coverage plan can never inflate the
+  // covered slice back up to the task's whole remaining effort. The remaining effort
+  // outside the window always stays scheduled on the owner.
+  const ownerBaselineTickets = tickets.map((t) =>
+    t.coverage && t.coverage.ownerId === employee.id ? { ...t, coverage: null } : t
+  );
+  const affectedWork = computeAffectedWork(employee, ownerBaselineTickets, start, end, getEntry, events);
+  const ownerSchedule = computeEmployeeSchedule(employee, ownerBaselineTickets, getEntry, events);
   const scheduledByKey = new Map(ownerSchedule.items.map((i) => [i.key, i] as const));
 
   const candidatesByItem = new Map<string, CoverageCandidate[]>();
   const coveragePlanByItem = new Map<string, { allocations: { dateKey: string; hours: number }[]; hours: number }>();
   affectedWork.forEach((item) => {
     const ticket = item.ticketId ? tickets.find((t) => t.id === item.ticketId) : undefined;
-    candidatesByItem.set(item.id, coverageCandidatesForItem(item, ticket, employee, peers, tickets, getEntry, events, start, end));
+    // For THIS item's candidate ranking, project each peer against every OTHER
+    // staged/applied coverage but NOT this item's own — otherwise proposing someone
+    // here would double-count this task's hours against its own candidate list.
+    const candidateTickets = tickets.map((t) => {
+      if (t.id === item.ticketId) {
+        return t.coverage && t.coverage.ownerId === employee.id ? { ...t, coverage: null } : t;
+      }
+      const staged = stagedCoverage[t.id];
+      return staged ? { ...t, coverage: staged } : t;
+    });
+    candidatesByItem.set(
+      item.id,
+      coverageCandidatesForItem(item, ticket, employee, peers, candidateTickets, getEntry, events, start, end)
+    );
     const scheduled = scheduledByKey.get(`${employee.id}:${item.id}`);
     if (ticket && scheduled) coveragePlanByItem.set(item.id, itemHoursInRange(scheduled, start, end));
   });
